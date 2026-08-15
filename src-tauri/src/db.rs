@@ -577,12 +577,13 @@ pub const PERMISSION_CATALOG: &[(&str, &str, &str, &str)] = &[
     ("perm-manage-integrations", "manage_integrations", "password", "Connect and manage external integrations"),
     ("perm-manage-anpr-config", "manage_anpr_config", "password", "Configure the ANPR engine, models, camera sources and thresholds"),
     ("perm-view-audit-log", "view_audit_log", "password", "View the audit log"),
+    ("perm-edit-existing-vehicles", "edit_existing_vehicles", "pin", "Edit existing vehicles in the reference database"),
     ("perm-acknowledge-health-alerts", "acknowledge_health_alerts", "pin", "Acknowledge system health alerts"),
     ("perm-view-health-history", "view_health_history", "pin", "View system health incident history"),
 ];
 
 pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
-    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue"]),
+    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles"]),
     (
         "preset-admin",
         "Admin",

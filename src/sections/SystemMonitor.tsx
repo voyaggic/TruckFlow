@@ -47,7 +47,7 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const canAck = hasPerm(user, "acknowledge_health_alerts");
-  const canDelete = hasPerm(user, "view_system_health");
+  const canDelete = canAck; // only System Monitor role can delete incidents
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));

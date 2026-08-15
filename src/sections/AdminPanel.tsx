@@ -51,12 +51,14 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
 
   const canManageUsers = user.permissions.some((p) => p.key === "manage_users");
   const canManageReference = user.permissions.some((p) => p.key === "manage_reference_database");
+  const canEditVehicles = user.permissions.some((p) => p.key === "edit_existing_vehicles");
+  const canAccessReference = canManageReference || canEditVehicles;
   const canManageIntegrations = user.permissions.some((p) => p.key === "manage_integrations");
   const canViewAudit = user.permissions.some((p) => p.key === "view_audit_log");
 
   const tabs: AdminTab[] = [];
   if (canManageUsers) tabs.push({ id: "users", label: "Users" });
-  if (canManageReference) tabs.push({ id: "reference", label: "Reference Database" });
+  if (canAccessReference) tabs.push({ id: "reference", label: "Reference Database" });
   if (canManageUsers) tabs.push({ id: "trips", label: "Trip Archive" });
   if (canManageIntegrations) tabs.push({ id: "sync", label: "Sync & Integrations" });
   if (canViewAudit) tabs.push({ id: "oversight", label: "Oversight & Audit" });
@@ -95,7 +97,7 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
 
       {activeTab === "trips" && canManageUsers && <TripArchive actor={user} />}
 
-      {activeTab === "reference" && canManageReference && <ReferenceDatabase actor={user} onNotice={setNotice} />}
+      {activeTab === "reference" && canAccessReference && <ReferenceDatabase actor={user} onNotice={setNotice} canRegister={canManageReference} />}
 
       {activeTab === "sync" && canManageIntegrations && <SyncPanel user={user} />}
 
@@ -1079,7 +1081,7 @@ function EditUserForm({
 // 6b. Reference Database Management — companies / drivers / vehicles
 // ---------------------------------------------------------------------------
 
-function ReferenceDatabase({ actor, onNotice }: { actor: SessionUser; onNotice: (msg: string) => void }) {
+function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUser; onNotice: (msg: string) => void; canRegister: boolean }) {
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
   const [vehicles, setVehicles] = useState<VehicleView[]>([]);
@@ -1176,6 +1178,7 @@ function ReferenceDatabase({ actor, onNotice }: { actor: SessionUser; onNotice: 
           drivers={drivers}
           fieldDefs={vehicleFields}
           actor={actor}
+          canRegister={canRegister}
           onSave={(v, id) =>
             run(
               () =>
@@ -1194,6 +1197,7 @@ function ReferenceDatabase({ actor, onNotice }: { actor: SessionUser; onNotice: 
         <CompanyTable
           companies={cq}
           fieldDefs={companyFields}
+          canRegister={canRegister}
           onSave={(name, extraFields, id) =>
             run(
               () => id ? api.updateCompany(actor.id, id, name, extraFields) : api.createCompany(actor.id, name, extraFields).then(() => undefined),
@@ -1209,6 +1213,7 @@ function ReferenceDatabase({ actor, onNotice }: { actor: SessionUser; onNotice: 
         <DriverTable
           drivers={dq}
           fieldDefs={driverFields}
+          canRegister={canRegister}
           onSave={(name, extraFields, id) =>
             run(
               () => id ? api.updateDriver(actor.id, id, name, extraFields) : api.createDriver(actor.id, name, extraFields).then(() => undefined),
@@ -1242,6 +1247,7 @@ function VehicleTable({
   drivers,
   fieldDefs,
   actor,
+  canRegister,
   onSave,
   onStatus,
 }: {
@@ -1250,6 +1256,7 @@ function VehicleTable({
   drivers: DriverView[];
   fieldDefs: FieldDefinition[];
   actor: SessionUser;
+  canRegister: boolean;
   onSave: (v: VehicleDraft, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
 }) {
@@ -1426,9 +1433,11 @@ function VehicleTable({
         </div>
       )}
 
-      <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
-        + Register vehicle
-      </button>
+      {canRegister && (
+        <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
+          + Register vehicle
+        </button>
+      )}
 
       {vehicles.length === 0 ? (
         <p className="muted small">No vehicles yet — register the first one above.</p>
@@ -1490,11 +1499,13 @@ function VehicleTable({
 function CompanyTable({
   companies,
   fieldDefs,
+  canRegister,
   onSave,
   onStatus,
 }: {
   companies: CompanyView[];
   fieldDefs: FieldDefinition[];
+  canRegister: boolean;
   onSave: (name: string, extraFields: Record<string, unknown>, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
 }) {
@@ -1527,9 +1538,11 @@ function CompanyTable({
 
   return (
     <div className="stack">
-      <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
-        + Add company
-      </button>
+      {canRegister && (
+        <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
+          + Add company
+        </button>
+      )}
 
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
@@ -1607,11 +1620,13 @@ function CompanyTable({
 function DriverTable({
   drivers,
   fieldDefs,
+  canRegister,
   onSave,
   onStatus,
 }: {
   drivers: DriverView[];
   fieldDefs: FieldDefinition[];
+  canRegister: boolean;
   onSave: (name: string, extraFields: Record<string, unknown>, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
 }) {
@@ -1644,9 +1659,11 @@ function DriverTable({
 
   return (
     <div className="stack">
-      <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
-        + Add driver
-      </button>
+      {canRegister && (
+        <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
+          + Add driver
+        </button>
+      )}
 
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
