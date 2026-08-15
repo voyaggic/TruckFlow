@@ -9,6 +9,19 @@ import type {
   TrainingCandidateView,
 } from "../lib/types";
 
+/** Live status from the ANPR service /status endpoint. */
+interface AnprServiceStatus {
+  running: boolean;
+  source_type: string;
+  source_url: string;
+  models_loaded: boolean;
+  plates_detected: number;
+  frames_processed: number;
+  fps: number;
+  last_plate_time: number | null;
+  uptime_seconds: number;
+}
+
 const SOURCE_TYPES = ["rtsp", "nvr_export", "usb", "video_file", "live_test"] as const;
 
 export default function AnprConfig({ user }: { user: SessionUser }) {
@@ -56,6 +69,8 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
 
       {error && <div className="error-banner">{error}</div>}
       {notice && <div className="success-banner">{notice}</div>}
+
+      <CameraPreview />
 
       {config && <EnginePanel config={config} onSave={(changes) => run(() => api.updateAnprConfig(user.id, changes), "Engine settings saved.")} />}
 
@@ -589,6 +604,153 @@ function CandidatePanel({ candidates }: { candidates: TrainingCandidateView[] })
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Live camera preview + ANPR service status
+// ---------------------------------------------------------------------------
+
+const ANPR_SERVICE_URL = "http://127.0.0.1:9800";
+
+function CameraPreview() {
+  const [status, setStatus] = useState<AnprServiceStatus | null>(null);
+  const [lastPlate, setLastPlate] = useState<{ plate: string; confidence: number; timestamp: string } | null>(null);
+  const [previewKey, setPreviewKey] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${ANPR_SERVICE_URL}/status`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setStatus(data);
+        setError(null);
+      } else {
+        setStatus(null);
+      }
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  const fetchLatest = useCallback(async () => {
+    try {
+      const resp = await fetch(`${ANPR_SERVICE_URL}/latest`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setLastPlate({ plate: data.plate, confidence: data.confidence, timestamp: data.timestamp });
+      }
+    } catch {
+      // Service not running — ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshStatus();
+    fetchLatest();
+    const t = setInterval(() => {
+      refreshStatus();
+      fetchLatest();
+      setPreviewKey((k) => k + 1); // refresh preview image
+    }, 2000);
+    return () => clearInterval(t);
+  }, [refreshStatus, fetchLatest]);
+
+  const isRunning = status?.running ?? false;
+  const uptime = status?.uptime_seconds ?? 0;
+  const uptimeStr = uptime > 3600
+    ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
+    : uptime > 60
+      ? `${Math.floor(uptime / 60)}m ${uptime % 60}s`
+      : `${uptime}s`;
+
+  return (
+    <div className="card stack" style={{ marginBottom: 16 }}>
+      <div className="section-title" style={{ fontSize: 15 }}>
+        Live Camera Preview
+      </div>
+      <p className="muted small" style={{ marginTop: -6 }}>
+        See what the ANPR service sees in real-time. Start the service with a camera source, then watch plates being
+        detected below.
+      </p>
+
+      {/* Status bar */}
+      <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+        <span className={`badge ${isRunning ? "active" : "disabled"}`}>
+          {isRunning ? "ANPR Running" : "ANPR Stopped"}
+        </span>
+        {status && (
+          <>
+            <span className="muted small">Source: {status.source_type} {status.source_url ? `(${status.source_url})` : ""}</span>
+            <span className="muted small">FPS: {status.fps}</span>
+            <span className="muted small">Plates: {status.plates_detected}</span>
+            <span className="muted small">Frames: {status.frames_processed}</span>
+            <span className="muted small">Up: {uptimeStr}</span>
+          </>
+        )}
+      </div>
+
+      {/* Live preview */}
+      <div style={{
+        width: "100%",
+        maxHeight: 400,
+        borderRadius: 8,
+        overflow: "hidden",
+        background: "#000",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}>
+        {isRunning ? (
+          <img
+            key={previewKey}
+            src={`${ANPR_SERVICE_URL}/preview_frame?t=${previewKey}`}
+            alt="Live camera feed"
+            style={{ width: "100%", maxHeight: 400, objectFit: "contain" }}
+            onError={() => setError("Cannot load preview — check ANPR service.")}
+          />
+        ) : (
+          <div style={{ padding: 40, textAlign: "center" }}>
+            <p className="muted" style={{ fontSize: 14 }}>ANPR service is not running</p>
+            <p className="muted small" style={{ marginTop: 8 }}>
+              Start the service with a camera source to see live preview here.
+            </p>
+            <p className="muted small" style={{ marginTop: 12, fontFamily: "monospace", fontSize: 11, background: "#1a1a2e", padding: 8, borderRadius: 4 }}>
+              python anpr-service/main.py --source rtsp://YOUR_PHONE_IP:8080/video
+            </p>
+          </div>
+        )}
+      </div>
+
+      {error && <div className="error-banner">{error}</div>}
+
+      {/* Last detected plate */}
+      {lastPlate && (
+        <div className="row" style={{ gap: 12, alignItems: "center" }}>
+          <span className="muted small">Last detected:</span>
+          <span style={{ fontSize: 18, fontWeight: 700, fontFamily: "monospace" }}>{lastPlate.plate}</span>
+          <span className="badge active">{Math.round(lastPlate.confidence * 100)}% confidence</span>
+          <span className="muted small">{new Date(lastPlate.timestamp).toLocaleTimeString()}</span>
+        </div>
+      )}
+
+      {/* Setup instructions */}
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
+        <div className="section-title" style={{ fontSize: 13 }}>Quick Setup — Phone as CCTV</div>
+        <ol className="muted small" style={{ margin: "8px 0 0", paddingLeft: 20, lineHeight: 1.8 }}>
+          <li>Install <b>IP Webcam</b> from Play Store on your Android phone</li>
+          <li>Open IP Webcam → Start server → note the IP address shown (e.g. <code>192.168.1.5:8080</code>)</li>
+          <li>Make sure phone and computer are on the <b>same WiFi network</b></li>
+          <li>Start the ANPR service: <code style={{ fontSize: 11 }}>python anpr-service/main.py --source rtsp://192.168.1.5:8080/video</code></li>
+          <li>Point your phone camera at a vehicle plate</li>
+          <li>Watch the preview above — plates will be detected and logged automatically!</li>
+        </ol>
+        <p className="muted small" style={{ marginTop: 8 }}>
+          For testing without a phone: <code style={{ fontSize: 11 }}>python anpr-service/main.py --source ./test_images/</code>
+        </p>
+      </div>
     </div>
   );
 }
