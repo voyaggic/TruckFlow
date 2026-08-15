@@ -755,8 +755,9 @@ const ANPR_SERVICE_URL = "http://127.0.0.1:9800";
 function CameraPreview() {
   const [status, setStatus] = useState<AnprServiceStatus | null>(null);
   const [lastPlate, setLastPlate] = useState<{ plate: string; confidence: number; timestamp: string } | null>(null);
-  const [previewKey, setPreviewKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [useStream, setUseStream] = useState(true);
+  const [streamKey, setStreamKey] = useState(0);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -791,7 +792,6 @@ function CameraPreview() {
     const t = setInterval(() => {
       refreshStatus();
       fetchLatest();
-      setPreviewKey((k) => k + 1); // refresh preview image
     }, 2000);
     return () => clearInterval(t);
   }, [refreshStatus, fetchLatest]);
@@ -803,6 +803,10 @@ function CameraPreview() {
     : uptime > 60
       ? `${Math.floor(uptime / 60)}m ${uptime % 60}s`
       : `${uptime}s`;
+
+  // MJPEG stream URL (live, continuous) vs single frame (polled)
+  const streamUrl = `${ANPR_SERVICE_URL}/preview?t=${streamKey}`;
+  const frameUrl = `${ANPR_SERVICE_URL}/preview_frame?t=${streamKey}`;
 
   return (
     <div className="card stack" style={{ marginBottom: 16 }}>
@@ -830,6 +834,27 @@ function CameraPreview() {
         )}
       </div>
 
+      {/* Stream mode toggle */}
+      {isRunning && (
+        <div className="row" style={{ gap: 8, alignItems: "center" }}>
+          <span className="muted small">View:</span>
+          <button
+            className={useStream ? "ghost small" : "ghost small"}
+            style={useStream ? { background: "var(--accent)", color: "white" } : {}}
+            onClick={() => { setUseStream(true); setStreamKey((k) => k + 1); }}
+          >
+            Live Stream
+          </button>
+          <button
+            className="ghost small"
+            style={!useStream ? { background: "var(--accent)", color: "white" } : {}}
+            onClick={() => setUseStream(false)}
+          >
+            Snapshot
+          </button>
+        </div>
+      )}
+
       {/* Live preview */}
       <div style={{
         width: "100%",
@@ -840,15 +865,28 @@ function CameraPreview() {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        position: "relative",
       }}>
         {isRunning ? (
-          <img
-            key={previewKey}
-            src={`${ANPR_SERVICE_URL}/preview_frame?t=${previewKey}`}
-            alt="Live camera feed"
-            style={{ width: "100%", maxHeight: 400, objectFit: "contain" }}
-            onError={() => setError("Cannot load preview — check ANPR service.")}
-          />
+          useStream ? (
+            // MJPEG stream — continuous live feed (industry standard for IP cameras)
+            <img
+              key={`stream-${streamKey}`}
+              src={streamUrl}
+              alt="Live camera feed"
+              style={{ width: "100%", maxHeight: 400, objectFit: "contain" }}
+              onError={() => setError("Stream failed — try Snapshot mode or check ANPR service.")}
+            />
+          ) : (
+            // Single frame — polled every 2 seconds
+            <img
+              key={`frame-${streamKey}`}
+              src={frameUrl}
+              alt="Camera snapshot"
+              style={{ width: "100%", maxHeight: 400, objectFit: "contain" }}
+              onError={() => setError("Cannot load snapshot — check ANPR service.")}
+            />
+          )
         ) : (
           <div style={{ padding: 40, textAlign: "center" }}>
             <p className="muted" style={{ fontSize: 14 }}>ANPR service is not running</p>
@@ -856,17 +894,17 @@ function CameraPreview() {
               Start the service with a camera source to see live preview here.
             </p>
             <p className="muted small" style={{ marginTop: 12, fontFamily: "monospace", fontSize: 11, background: "#1a1a2e", padding: 8, borderRadius: 4 }}>
-              python anpr-service/main.py --source rtsp://YOUR_PHONE_IP:8080/video
+              python anpr-service/main.py --source http://PHONE_IP:8080/videofeed
             </p>
           </div>
         )}
       </div>
 
-      {error && <div className="error-banner">{error}</div>}
+      {error && <div className="error-banner" style={{ marginTop: 8 }}>{error}</div>}
 
       {/* Last detected plate */}
       {lastPlate && (
-        <div className="row" style={{ gap: 12, alignItems: "center" }}>
+        <div className="row" style={{ gap: 12, alignItems: "center", marginTop: 8 }}>
           <span className="muted small">Last detected:</span>
           <span style={{ fontSize: 18, fontWeight: 700, fontFamily: "monospace" }}>{lastPlate.plate}</span>
           <span className="badge active">{Math.round(lastPlate.confidence * 100)}% confidence</span>
@@ -875,13 +913,14 @@ function CameraPreview() {
       )}
 
       {/* Setup instructions */}
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, marginTop: 8 }}>
         <div className="section-title" style={{ fontSize: 13 }}>Quick Setup — Phone as CCTV</div>
         <ol className="muted small" style={{ margin: "8px 0 0", paddingLeft: 20, lineHeight: 1.8 }}>
           <li>Install <b>IP Webcam</b> from Play Store on your Android phone</li>
-          <li>Open IP Webcam → Start server → note the IP address shown (e.g. <code>192.168.1.5:8080</code>)</li>
+          <li>Open IP Webcam → Start server → note the IP address (e.g. <code>192.168.1.5:8080</code>)</li>
           <li>Make sure phone and computer are on the <b>same WiFi network</b></li>
-          <li>Start the ANPR service: <code style={{ fontSize: 11 }}>python anpr-service/main.py --source rtsp://192.168.1.5:8080/video</code></li>
+          <li>Add camera source: Type = <code>http</code>, URL = <code>http://PHONE_IP:8080/videofeed</code></li>
+          <li>Start ANPR service: <code style={{ fontSize: 11 }}>python anpr-service/main.py --source http://PHONE_IP:8080/videofeed</code></li>
           <li>Point your phone camera at a vehicle plate</li>
           <li>Watch the preview above — plates will be detected and logged automatically!</li>
         </ol>
