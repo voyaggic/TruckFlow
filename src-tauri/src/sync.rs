@@ -1584,6 +1584,7 @@ impl SheetsProvider for RealSheets {
         client
             .post(&clear_url)
             .bearer_auth(&token)
+            .json(&json!({}))
             .send()
             .map_err(|e| format!("sheet clear failed: {e}"))?
             .error_for_status()
