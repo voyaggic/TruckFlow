@@ -164,7 +164,7 @@ pub fn update_anpr_config(
 // camera_sources (01-database-schema.md)
 // ---------------------------------------------------------------------------
 
-const VALID_SOURCE_TYPES: &[&str] = &["rtsp", "nvr_export", "usb", "video_file", "live_test"];
+const VALID_SOURCE_TYPES: &[&str] = &["rtsp", "http", "nvr_export", "usb", "video_file", "live_test"];
 
 #[tauri::command]
 pub fn list_camera_sources(state: State<AppState>) -> Result<Vec<CameraSourceView>, String> {
@@ -328,23 +328,39 @@ pub fn test_camera_connection(
     camera_source_by_id(&conn, &source_id)
 }
 
+/// Parse a URL string to extract (host, port) regardless of scheme.
+/// Handles: rtsp://host:port/path, http://host:port/path, host:port, host
+fn parse_host_port(url: &str) -> (String, u16) {
+    // Strip scheme (rtsp://, http://, https://)
+    let stripped = url
+        .strip_prefix("rtsp://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    // Strip credentials (user:pass@host:port)
+    let after_at = stripped.split('@').last().unwrap_or(stripped);
+    // Strip path
+    let host_port = after_at.split('/').next().unwrap_or(after_at);
+    // Split host:port
+    let parts: Vec<&str> = host_port.split(':').collect();
+    let host = parts[0].to_string();
+    let port: u16 = parts.get(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(if url.starts_with("https") { 443 } else if url.starts_with("http") { 80 } else { 554 });
+    (host, port)
+}
+
 fn test_reachable(source_type: &str, connection_string: &str) -> Result<String, String> {
     match source_type {
         "rtsp" => {
-            // Extract host:port from RTSP URL
-            let url = connection_string.replace("rtsp://", "");
-            let host_port = url.split('@').last().unwrap_or(&url);
-            let parts: Vec<&str> = host_port.split(':').collect();
-            let host = parts[0];
-            let port: u16 = parts.get(1).and_then(|p| p.split('/').next()?.parse().ok()).unwrap_or(554);
-            std::net::TcpStream::connect((host, port))
+            let (host, port) = parse_host_port(connection_string);
+            std::net::TcpStream::connect((host.as_str(), port))
                 .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?
                 .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                 .ok();
             Ok(format!("TCP connection to {host}:{port} succeeded"))
         }
         "usb" => {
-            // USB cameras: validate device index format
             let device_id: i32 = connection_string.trim().parse().map_err(|_| format!("Invalid device index: {connection_string}"))?;
             if device_id < 0 {
                 return Err(format!("Device index must be non-negative, got {device_id}"));
@@ -364,7 +380,28 @@ fn test_reachable(source_type: &str, connection_string: &str) -> Result<String, 
                 .map_err(|_| "ANPR service not running on port 9800".to_string())?;
             Ok(format!("ANPR service reachable at {connection_string}"))
         }
-        _ => Err(format!("Unknown source type: {source_type}")),
+        _ => {
+            // Unknown type — try to parse as URL and do an HTTP HEAD or TCP probe
+            let (host, port) = parse_host_port(connection_string);
+            if connection_string.starts_with("http://") || connection_string.starts_with("https://") {
+                // HTTP/HTTPS stream — try an HTTP HEAD request
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+                let resp = client.head(connection_string).send()
+                    .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?;
+                Ok(format!("HTTP {} — {}", resp.status(), connection_string))
+            } else {
+                // TCP probe
+                std::net::TcpStream::connect((host.as_str(), port))
+                    .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .ok();
+                Ok(format!("TCP connection to {host}:{port} succeeded"))
+            }
+        }
     }
 }
 

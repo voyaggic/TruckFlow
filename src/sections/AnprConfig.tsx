@@ -22,7 +22,7 @@ interface AnprServiceStatus {
   uptime_seconds: number;
 }
 
-const SOURCE_TYPES = ["rtsp", "nvr_export", "usb", "video_file", "live_test"] as const;
+const SOURCE_TYPES = ["rtsp", "http", "nvr_export", "usb", "video_file", "live_test"] as const;
 
 export default function AnprConfig({ user }: { user: SessionUser }) {
   const [config, setConfig] = useState<AnprConfigView | null>(null);
@@ -278,7 +278,8 @@ function EnginePanel({
 // Each source type has its own expected format — switching types pre-fills the
 // right shape instead of always defaulting to an RTSP URL.
 const TYPE_TEMPLATES: Record<string, string> = {
-  rtsp: "rtsp://user:pass@192.168.1.100:554/stream1",
+  rtsp: "rtsp://192.168.1.100:554/stream1",
+  http: "http://192.168.1.100:8080/video",
   nvr_export: "C:\\NVR Exports\\gate_2026-08-14.mp4",
   usb: "0",
   video_file: "",
@@ -286,11 +287,12 @@ const TYPE_TEMPLATES: Record<string, string> = {
 };
 
 const TYPE_HELP: Record<string, string> = {
-  rtsp: "IP camera stream — rtsp://user:pass@host:554/path",
-  nvr_export: "A video export path from your NVR (a local .mp4/.avi file)",
+  rtsp: "RTSP camera stream (IP cameras, NVRs)",
+  http: "HTTP stream (IP Webcam app, MJPEG cameras)",
+  nvr_export: "A video export path from your NVR (local .mp4/.avi file)",
   usb: "USB webcam device index, e.g. 0 for the first camera",
-  video_file: "Pick a video file from your computer — it previews live below",
-  live_test: "A test HTTP stream URL used to verify the pipeline",
+  video_file: "Pick a video file from your computer",
+  live_test: "Test HTTP stream URL for pipeline verification",
 };
 
 function CameraPanel({
