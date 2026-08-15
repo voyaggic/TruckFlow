@@ -545,6 +545,9 @@ export const api = {
   acknowledgeHealthEvent: (actorId: string, eventId: string) =>
     invoke<HealthEventView>("acknowledge_health_event", { actorId, eventId }),
 
+  deleteHealthEvents: (actorId: string, eventIds: string[]) =>
+    invoke<number>("delete_health_events", { actorId, eventIds }),
+
   // --- Phase 6: Settings / profile / monitor trend ---
 
   updateOwnProfile: (userId: string, phoneNumber: string | null, languagePreference: string | null, notificationSound: boolean) =>

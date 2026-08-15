@@ -255,3 +255,30 @@ pub fn anpr_confidence_trend(
     }
     Ok(out)
 }
+
+/// Batch-delete health events so the incident history stays manageable.
+/// Gated on `acknowledge_health_alerts` — same permission that lets a user
+/// acknowledge individual alerts.
+#[tauri::command]
+pub fn delete_health_events(
+    state: State<AppState>,
+    actor_id: String,
+    event_ids: Vec<String>,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, "acknowledge_health_alerts")?;
+    let mut deleted: usize = 0;
+    for id in &event_ids {
+        deleted += conn
+            .execute("DELETE FROM system_health_events WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| format!("health event delete failed: {e}"))?;
+    }
+    crate::db::append_audit(
+        &conn,
+        &actor_id,
+        "deleted_health_events",
+        None,
+        Some(serde_json::json!({ "count": event_ids.len() })),
+    )?;
+    Ok(deleted as i64)
+}

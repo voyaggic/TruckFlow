@@ -28,12 +28,65 @@ const STATUS_LABELS: Record<string, string> = {
   resolved: "Resolved",
 };
 
+type SortKey = "date-desc" | "date-asc" | "component" | "status";
+
+const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  { key: "date-desc", label: "Newest first" },
+  { key: "date-asc", label: "Oldest first" },
+  { key: "component", label: "By component" },
+  { key: "status", label: "By status" },
+];
+
 export default function SystemMonitor({ user }: { user: SessionUser }) {
   const [dash, setDash] = useState<HealthDashboard | null>(null);
   const [trend, setTrend] = useState<ConfidenceTrendPoint[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [sortKey, setSortKey] = useState<SortKey>("date-desc");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
   const canAck = hasPerm(user, "acknowledge_health_alerts");
+
+  const toggleSelect = (id: string) => {
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const toggleExpand = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const sorted = [...(dash?.recent_history ?? [])].sort((a, b) => {
+    if (sortKey === "date-desc") return b.detected_at.localeCompare(a.detected_at);
+    if (sortKey === "date-asc") return a.detected_at.localeCompare(b.detected_at);
+    if (sortKey === "component") return a.component.localeCompare(b.component);
+    if (sortKey === "status") return a.status.localeCompare(b.status);
+    return 0;
+  });
+
+  const bulkDelete = async () => {
+    if (!selected.length) return;
+    const ok = window.confirm(
+      `Delete ${selected.length} incident record${selected.length === 1 ? "" : "s"}? This removes them from the history permanently.`,
+    );
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await api.deleteHealthEvents(user.id, selected);
+      setSelected([]);
+      setFlash(`${selected.length} record${selected.length === 1 ? "" : "s"} deleted.`);
+      setTimeout(() => setFlash(null), 3000);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -161,24 +214,74 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
           </div>
 
           <div className="card">
-            <h3 style={{ margin: 0, fontSize: 15 }}>Recent activity</h3>
+            <div className="row between">
+              <h3 style={{ margin: 0, fontSize: 15 }}>
+                Recent activity <span className="badge">{dash.recent_history.length}</span>
+              </h3>
+              {dash.recent_history.length > 0 && (
+                <div className="row" style={{ gap: 8 }}>
+                  <select value={sortKey} onChange={(e) => setSortKey(e.target.value as SortKey)} style={{ fontSize: 12 }}>
+                    {SORT_OPTIONS.map((o) => (
+                      <option key={o.key} value={o.key}>{o.label}</option>
+                    ))}
+                  </select>
+                  {canAck && (
+                    <button className="ghost small" onClick={() => {
+                      const allIds = sorted.map((e) => e.id);
+                      setSelected((prev) => prev.length === allIds.length ? [] : allIds);
+                    }}>
+                      {selected.length === sorted.length && sorted.length > 0 ? "Clear" : "Select all"}
+                    </button>
+                  )}
+                  {canAck && selected.length > 0 && (
+                    <button className="danger small" disabled={deleting} onClick={bulkDelete}>
+                      {deleting ? "Deleting…" : `Delete (${selected.length})`}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
             {dash.recent_history.length === 0 ? (
               <p className="muted small" style={{ margin: "10px 0 0" }}>
                 No recorded issues — everything has been running smoothly.
               </p>
             ) : (
               <div className="stack" style={{ marginTop: 10 }}>
-                {dash.recent_history.map((e) => (
-                  <div key={e.id} className="row" style={{ gap: 10, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
-                    <span style={{ minWidth: 120, fontWeight: 500 }}>{COMPONENT_LABELS[e.component] ?? e.component}</span>
-                    <span className={`badge ${e.status === "ok" ? "active" : e.status === "degraded" ? "pin" : "disabled"}`} style={{ minWidth: 80, textAlign: "center" }}>
-                      {STATUS_LABELS[e.status] ?? e.status}
-                    </span>
-                    <span className="muted small grow">{friendlyDetail(e.detail ?? "Issue recorded.")}</span>
-                    <span className="muted small" style={{ whiteSpace: "nowrap" }}>{fmtDateTime(e.detected_at)}</span>
-                    {e.resolved_at && <span className="badge active" style={{ whiteSpace: "nowrap" }}>Fixed {fmtDateTime(e.resolved_at)}</span>}
-                  </div>
-                ))}
+                {sorted.map((e) => {
+                  const isExpanded = expanded.has(e.id);
+                  return (
+                    <div key={e.id} style={{ borderBottom: "1px solid var(--border)", paddingBottom: 6 }}>
+                      <div className="row" style={{ gap: 8, padding: "6px 0", cursor: "pointer" }} onClick={() => toggleExpand(e.id)}>
+                        {canAck && (
+                          <input
+                            type="checkbox"
+                            checked={selected.includes(e.id)}
+                            onChange={(ev) => { ev.stopPropagation(); toggleSelect(e.id); }}
+                            style={{ width: "auto", margin: 0 }}
+                          />
+                        )}
+                        <span style={{ fontWeight: 500, minWidth: 120 }}>{COMPONENT_LABELS[e.component] ?? e.component}</span>
+                        <span className={`badge ${e.status === "ok" ? "active" : e.status === "degraded" ? "pin" : "disabled"}`} style={{ minWidth: 80, textAlign: "center" }}>
+                          {STATUS_LABELS[e.status] ?? e.status}
+                        </span>
+                        <span className="muted small grow">{friendlyDetail(e.detail ?? "Issue recorded.")}</span>
+                        <span className="muted small" style={{ whiteSpace: "nowrap" }}>{fmtDateTime(e.detected_at)}</span>
+                        {e.resolved_at && <span className="badge active" style={{ whiteSpace: "nowrap" }}>Fixed</span>}
+                        <span className="muted small" style={{ fontSize: 10 }}>{isExpanded ? "▾" : "▸"}</span>
+                      </div>
+                      {isExpanded && (
+                        <div className="stack" style={{ padding: "4px 0 4px 24px", fontSize: 12 }}>
+                          <div className="muted">Component: {COMPONENT_LABELS[e.component] ?? e.component} ({e.component})</div>
+                          <div className="muted">Status: {STATUS_LABELS[e.status] ?? e.status}</div>
+                          <div className="muted">Detail: {e.detail ?? "No additional details."}</div>
+                          <div className="muted">Detected: {fmtDateTime(e.detected_at)}</div>
+                          {e.acknowledged_at && <div className="muted">Acknowledged: {fmtDateTime(e.acknowledged_at)} by {e.acknowledged_by ?? "—"}</div>}
+                          {e.resolved_at && <div className="muted">Resolved: {fmtDateTime(e.resolved_at)}</div>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

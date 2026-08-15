@@ -136,6 +136,7 @@ pub fn run() {
             monitor::health_dashboard,
             monitor::acknowledge_health_event,
             monitor::anpr_confidence_trend,
+            monitor::delete_health_events,
             commands::update_own_profile,
             commands::set_profile_photo,
             commands::get_profile_photo,
