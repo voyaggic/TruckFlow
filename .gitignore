@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/icons/
+.updater-keys/
+updates/
+*.sqlite3
+tmp_tsc.txt
+cargo_*.txt

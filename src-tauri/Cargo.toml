@@ -1,0 +1,36 @@
+[package]
+name = "truckflow"
+version = "0.1.0"
+description = "TruckFlow — gate trip management"
+authors = ["TruckFlow"]
+edition = "2021"
+
+[lib]
+name = "truckflow_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+argon2 = "0.5.3"
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+postgres = "0.19.14"
+rand = "0.10.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust_xlsxwriter = "0.97.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+postgres = "0.19.14"
+serde_json = "1.0.151"
+tauri = { version = "2", features = ["test"] }
