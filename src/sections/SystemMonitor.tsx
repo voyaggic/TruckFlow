@@ -47,6 +47,7 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
   const canAck = hasPerm(user, "acknowledge_health_alerts");
+  const canDelete = hasPerm(user, "view_system_health");
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -225,7 +226,7 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
                       <option key={o.key} value={o.key}>{o.label}</option>
                     ))}
                   </select>
-                  {canAck && (
+                  {canDelete && (
                     <button className="ghost small" onClick={() => {
                       const allIds = sorted.map((e) => e.id);
                       setSelected((prev) => prev.length === allIds.length ? [] : allIds);
@@ -233,7 +234,7 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
                       {selected.length === sorted.length && sorted.length > 0 ? "Clear" : "Select all"}
                     </button>
                   )}
-                  {canAck && selected.length > 0 && (
+                  {canDelete && selected.length > 0 && (
                     <button className="danger small" disabled={deleting} onClick={bulkDelete}>
                       {deleting ? "Deleting…" : `Delete (${selected.length})`}
                     </button>
@@ -252,7 +253,7 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
                   return (
                     <div key={e.id} style={{ borderBottom: "1px solid var(--border)", paddingBottom: 6 }}>
                       <div className="row" style={{ gap: 8, padding: "6px 0", cursor: "pointer" }} onClick={() => toggleExpand(e.id)}>
-                        {canAck && (
+                        {canDelete && (
                           <input
                             type="checkbox"
                             checked={selected.includes(e.id)}
