@@ -412,6 +412,12 @@ export const api = {
   setCameraSourceStatus: (actorId: string, sourceId: string, status: "active" | "inactive") =>
     invoke<CameraSourceView>("set_camera_source_status", { actorId, sourceId, status }),
 
+  deleteCameraSource: (actorId: string, sourceId: string) =>
+    invoke<void>("delete_camera_source", { actorId, sourceId }),
+
+  testCameraConnection: (actorId: string, sourceId: string) =>
+    invoke<CameraSourceView>("test_camera_connection", { actorId, sourceId }),
+
   listModelVersions: () => invoke<ModelVersionView[]>("list_model_versions"),
 
   registerModelVersion: (

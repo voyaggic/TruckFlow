@@ -100,6 +100,8 @@ pub fn run() {
             anpr::add_camera_source,
             anpr::update_camera_source,
             anpr::set_camera_source_status,
+            anpr::delete_camera_source,
+            anpr::test_camera_connection,
             anpr::list_model_versions,
             anpr::register_model_version,
             anpr::deploy_model_version,

@@ -267,6 +267,107 @@ pub fn set_camera_source_status(
     camera_source_by_id(&conn, &source_id)
 }
 
+/// Camera sources can be deleted (permanent removal).
+#[tauri::command]
+pub fn delete_camera_source(
+    state: State<AppState>,
+    actor_id: String,
+    source_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let label: String = conn
+        .query_row(
+            "SELECT label FROM camera_sources WHERE id = ?1",
+            params![source_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "Camera source not found.".to_string())?;
+    conn.execute(
+        "DELETE FROM camera_sources WHERE id = ?1",
+        params![source_id],
+    )
+    .map_err(|e| format!("camera source delete failed: {e}"))?;
+    append_audit(&conn, &actor_id, "deleted_camera_source", Some(&source_id), Some(json!({ "label": label })))?;
+    Ok(())
+}
+
+/// Test whether a camera source is reachable. Updates the connection check
+/// fields and returns the result.
+#[tauri::command]
+pub fn test_camera_connection(
+    state: State<AppState>,
+    actor_id: String,
+    source_id: String,
+) -> Result<CameraSourceView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let (source_type, connection_string): (String, String) = conn
+        .query_row(
+            "SELECT source_type, connection_string FROM camera_sources WHERE id = ?1",
+            params![source_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "Camera source not found.".to_string())?;
+
+    let now = now_iso();
+    let result = test_reachable(&source_type, &connection_string);
+    let status = if result.is_ok() { "active" } else { "inactive" };
+    let result_str = match &result {
+        Ok(msg) => msg.clone(),
+        Err(e) => e.clone(),
+    };
+
+    conn.execute(
+        "UPDATE camera_sources SET status = ?1, last_connection_check_at = ?2,
+                last_connection_check_result = ?3, updated_at = ?2
+         WHERE id = ?4",
+        params![status, now, result_str, source_id],
+    )
+    .map_err(|e| format!("camera source status update failed: {e}"))?;
+    camera_source_by_id(&conn, &source_id)
+}
+
+fn test_reachable(source_type: &str, connection_string: &str) -> Result<String, String> {
+    match source_type {
+        "rtsp" => {
+            // Extract host:port from RTSP URL
+            let url = connection_string.replace("rtsp://", "");
+            let host_port = url.split('@').last().unwrap_or(&url);
+            let parts: Vec<&str> = host_port.split(':').collect();
+            let host = parts[0];
+            let port: u16 = parts.get(1).and_then(|p| p.split('/').next()?.parse().ok()).unwrap_or(554);
+            std::net::TcpStream::connect((host, port))
+                .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .ok();
+            Ok(format!("TCP connection to {host}:{port} succeeded"))
+        }
+        "usb" => {
+            // USB cameras: validate device index format
+            let device_id: i32 = connection_string.trim().parse().map_err(|_| format!("Invalid device index: {connection_string}"))?;
+            if device_id < 0 {
+                return Err(format!("Device index must be non-negative, got {device_id}"));
+            }
+            Ok(format!("USB device index {device_id} is valid. Start ANPR service to verify camera access."))
+        }
+        "video_file" | "nvr_export" => {
+            let path = std::path::Path::new(connection_string);
+            if path.exists() && path.is_file() {
+                Ok(format!("File exists: {} ({} bytes)", connection_string, std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)))
+            } else {
+                Err(format!("File not found: {connection_string}"))
+            }
+        }
+        "live_test" => {
+            std::net::TcpStream::connect("127.0.0.1:9800")
+                .map_err(|_| "ANPR service not running on port 9800".to_string())?;
+            Ok(format!("ANPR service reachable at {connection_string}"))
+        }
+        _ => Err(format!("Unknown source type: {source_type}")),
+    }
+}
+
 fn camera_source_by_id(conn: &Connection, id: &str) -> Result<CameraSourceView, String> {
     conn.query_row(
         "SELECT id, label, source_type, connection_string, status,

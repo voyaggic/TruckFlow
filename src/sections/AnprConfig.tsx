@@ -307,6 +307,12 @@ function CameraPanel({
   const [conn, setConn] = useState(TYPE_TEMPLATES.rtsp);
   const [draftUrl, setDraftUrl] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editLabel, setEditLabel] = useState("");
+  const [editConn, setEditConn] = useState("");
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
   const pickType = (t: CameraSourceView["source_type"]) => {
     setType(t);
@@ -332,81 +338,154 @@ function CameraPanel({
       setConn(TYPE_TEMPLATES[type] ?? "");
     }, "Camera source added.");
 
+  const startEdit = (c: CameraSourceView) => {
+    setEditingId(c.id);
+    setEditLabel(c.label);
+    setEditConn(c.connection_string);
+  };
+
+  const saveEdit = (sourceId: string) =>
+    onRun(async () => {
+      await api.updateCameraSource(actor.id, sourceId, editLabel, editConn);
+      setEditingId(null);
+    }, "Camera source updated.");
+
+  const testConnection = async (sourceId: string) => {
+    setTestingId(sourceId);
+    setTestResult((prev) => ({ ...prev, [sourceId]: { ok: false, msg: "Testing..." } }));
+    try {
+      const result = await api.testCameraConnection(actor.id, sourceId);
+      const ok = result.status === "active";
+      const msg = result.last_connection_check_result ?? (ok ? "Connection successful" : "Connection failed");
+      setTestResult((prev) => ({ ...prev, [sourceId]: { ok, msg } }));
+      onRun(() => Promise.resolve(result), "Connection test complete.");
+    } catch (e) {
+      setTestResult((prev) => ({ ...prev, [sourceId]: { ok: false, msg: String(e) } }));
+    } finally {
+      setTestingId(null);
+    }
+  };
+
+  const confirmDelete = (sourceId: string) => {
+    setDeleteConfirm(sourceId);
+  };
+
+  const doDelete = (sourceId: string) =>
+    onRun(async () => {
+      await api.deleteCameraSource(actor.id, sourceId);
+      setDeleteConfirm(null);
+    }, "Camera source deleted.");
+
   return (
     <div className="card stack" style={{ marginBottom: 16 }}>
       <div className="section-title" style={{ fontSize: 15 }}>
         2. Camera feeds ({cameras.length})
       </div>
       <p className="muted small" style={{ marginTop: -6 }}>
-        Where the recognition service gets video from. Each card below shows the feed live when it can, plus its
-        status and last connection check — so you can see whether a source is really working.
+        Where the recognition service gets video from. Add sources, test connections, and manage your camera setup.
       </p>
 
-      <div className="row">
-        <div className="field grow">
-          <label>Label</label>
-          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Main gate" />
-        </div>
-        <div className="field">
-          <label>Type</label>
-          <select value={type} onChange={(e) => pickType(e.target.value as CameraSourceView["source_type"])}>
-            {SOURCE_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-          <div className="muted small" style={{ marginTop: 4, maxWidth: 240 }}>
-            {TYPE_HELP[type]}
-          </div>
-        </div>
-        {type === "video_file" ? (
+      {/* Add new source form */}
+      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, background: "var(--surface)" }}>
+        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>Add New Camera Source</div>
+        <div className="row">
           <div className="field grow">
-            <label>Video file</label>
-            <input type="file" accept="video/*" onChange={(e) => pickFile(e.target.files?.[0])} />
-            {draftUrl && (
-              <video
-                src={draftUrl}
-                controls
-                muted
-                style={{ width: "100%", maxHeight: 140, marginTop: 8, borderRadius: 8, background: "#000" }}
-              />
-            )}
+            <label>Label</label>
+            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Main gate camera" />
           </div>
-        ) : (
-          <div className="field grow">
-            <label>Connection string</label>
-            <input value={conn} onChange={(e) => setConn(e.target.value)} placeholder={TYPE_TEMPLATES[type] || "…"} />
+          <div className="field">
+            <label>Type</label>
+            <select value={type} onChange={(e) => pickType(e.target.value as CameraSourceView["source_type"])}>
+              {SOURCE_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <div className="muted small" style={{ marginTop: 4, maxWidth: 240 }}>
+              {TYPE_HELP[type]}
+            </div>
           </div>
-        )}
-        <div className="field">
-          <label>&nbsp;</label>
-          <button
-            className="primary"
-            onClick={add}
-            disabled={!label.trim() || (type === "video_file" ? !draftUrl : !conn.trim())}
-          >
-            Add
-          </button>
+          {type === "video_file" ? (
+            <div className="field grow">
+              <label>Video file</label>
+              <input type="file" accept="video/*" onChange={(e) => pickFile(e.target.files?.[0])} />
+              {draftUrl && (
+                <video
+                  src={draftUrl}
+                  controls
+                  muted
+                  style={{ width: "100%", maxHeight: 140, marginTop: 8, borderRadius: 8, background: "#000" }}
+                />
+              )}
+            </div>
+          ) : (
+            <div className="field grow">
+              <label>Connection string</label>
+              <input value={conn} onChange={(e) => setConn(e.target.value)} placeholder={TYPE_TEMPLATES[type] || "..."} />
+            </div>
+          )}
+          <div className="field">
+            <label>&nbsp;</label>
+            <button
+              className="primary"
+              onClick={add}
+              disabled={!label.trim() || (type === "video_file" ? !draftUrl : !conn.trim())}
+            >
+              + Add Source
+            </button>
+          </div>
         </div>
       </div>
 
+      {/* Existing camera sources */}
       {cameras.length > 0 && (
         <div className="health-grid">
           {cameras.map((c) => {
             const url = previews[c.id];
             const isHttp = c.connection_string.startsWith("http://") || c.connection_string.startsWith("https://");
+            const isEditing = editingId === c.id;
+            const isTesting = testingId === c.id;
+            const tr = testResult[c.id];
+            const isDeleting = deleteConfirm === c.id;
+
             return (
               <div key={c.id} className="health-card" style={{ marginBottom: 0 }}>
-                <div className="row between">
-                  <b>{c.label}</b>
+                {/* Header */}
+                <div className="row between" style={{ alignItems: "center" }}>
+                  {isEditing ? (
+                    <input
+                      value={editLabel}
+                      onChange={(e) => setEditLabel(e.target.value)}
+                      style={{ fontWeight: 600, fontSize: 14, flex: 1 }}
+                    />
+                  ) : (
+                    <b>{c.label}</b>
+                  )}
                   <span className={`badge ${c.status}`}>{c.status}</span>
                 </div>
-                <div className="muted small">{c.source_type}</div>
+
+                {/* Type + Connection */}
+                <div className="muted small" style={{ marginTop: 4 }}>
+                  {c.source_type}
+                </div>
+                {isEditing ? (
+                  <input
+                    value={editConn}
+                    onChange={(e) => setEditConn(e.target.value)}
+                    style={{ marginTop: 8, fontSize: 12, fontFamily: "monospace" }}
+                  />
+                ) : (
+                  <div className="small muted" style={{ wordBreak: "break-all", marginTop: 4 }}>
+                    {c.connection_string}
+                  </div>
+                )}
+
+                {/* Preview */}
                 <div
                   style={{
                     margin: "8px 0",
-                    height: 120,
+                    height: 100,
                     borderRadius: 8,
                     overflow: "hidden",
                     background: "#000",
@@ -425,36 +504,93 @@ function CameraPanel({
                   ) : (
                     <span className="muted small" style={{ padding: 8, textAlign: "center" }}>
                       {c.source_type === "rtsp"
-                        ? "RTSP can't play inside the app window — verify the stream in VLC and check the status below."
+                        ? "RTSP — test connection below"
                         : c.source_type === "video_file"
-                          ? "Video file preview is available in this session after adding it."
-                          : "No live preview for this source type."}
+                          ? "Video preview after adding"
+                          : "No preview for this type"}
                     </span>
                   )}
                 </div>
-                <div className="small muted" style={{ wordBreak: "break-all" }}>
-                  {c.connection_string}
-                </div>
-                <div className="small muted">
-                  {c.last_connection_check_result
-                    ? `${c.last_connection_check_at} — ${c.last_connection_check_result}`
-                    : "No connection check yet"}
-                </div>
-                <div className="row" style={{ marginTop: 8, gap: 8 }}>
-                  {c.status === "active" ? (
-                    <button
-                      className="ghost small"
-                      onClick={() => onRun(() => api.setCameraSourceStatus(actor.id, c.id, "inactive"), "Camera source deactivated.")}
-                    >
-                      Deactivate
-                    </button>
+
+                {/* Connection check result */}
+                {c.last_connection_check_result && (
+                  <div className="small muted" style={{ marginBottom: 4 }}>
+                    Last check: {c.last_connection_check_result}
+                  </div>
+                )}
+
+                {/* Test result */}
+                {tr && (
+                  <div
+                    className="small"
+                    style={{
+                      marginBottom: 4,
+                      padding: "4px 8px",
+                      borderRadius: 4,
+                      background: tr.ok ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.15)",
+                      color: tr.ok ? "#22c55e" : "#ef4444",
+                    }}
+                  >
+                    {tr.msg}
+                  </div>
+                )}
+
+                {/* Action buttons */}
+                <div className="row" style={{ marginTop: 8, gap: 6, flexWrap: "wrap" }}>
+                  {isEditing ? (
+                    <>
+                      <button className="primary small" onClick={() => saveEdit(c.id)}>
+                        Save
+                      </button>
+                      <button className="ghost small" onClick={() => setEditingId(null)}>
+                        Cancel
+                      </button>
+                    </>
+                  ) : isDeleting ? (
+                    <>
+                      <span className="small" style={{ color: "#ef4444" }}>Delete this source?</span>
+                      <button className="ghost small" style={{ color: "#ef4444" }} onClick={() => doDelete(c.id)}>
+                        Yes, delete
+                      </button>
+                      <button className="ghost small" onClick={() => setDeleteConfirm(null)}>
+                        Cancel
+                      </button>
+                    </>
                   ) : (
-                    <button
-                      className="ghost small"
-                      onClick={() => onRun(() => api.setCameraSourceStatus(actor.id, c.id, "active"), "Camera source reactivated.")}
-                    >
-                      Reactivate
-                    </button>
+                    <>
+                      <button
+                        className="ghost small"
+                        onClick={() => testConnection(c.id)}
+                        disabled={isTesting}
+                      >
+                        {isTesting ? "Testing..." : "Test"}
+                      </button>
+                      <button className="ghost small" onClick={() => startEdit(c)}>
+                        Edit
+                      </button>
+                      {c.status === "active" ? (
+                        <button
+                          className="ghost small"
+                          onClick={() => onRun(() => api.setCameraSourceStatus(actor.id, c.id, "inactive"), "Deactivated.")}
+                        >
+                          Deactivate
+                        </button>
+                      ) : (
+                        <button
+                          className="ghost small"
+                          onClick={() => onRun(() => api.setCameraSourceStatus(actor.id, c.id, "active"), "Reactivated.")}
+                        >
+                          Activate
+                        </button>
+                      )}
+                      <button
+                        className="ghost small"
+                        style={{ color: "#ef4444" }}
+                        onClick={() => confirmDelete(c.id)}
+                      >
+                        Delete
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
