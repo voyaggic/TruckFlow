@@ -230,15 +230,38 @@ pub fn update_camera_source(
     actor_id: String,
     source_id: String,
     label: Option<String>,
+    source_type: Option<String>,
     connection_string: Option<String>,
 ) -> Result<CameraSourceView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    if let Some(t) = &source_type {
+        if !VALID_SOURCE_TYPES.contains(&t.as_str()) {
+            return Err(format!(
+                "Unknown camera source type. Valid: {}.",
+                VALID_SOURCE_TYPES.join(", ")
+            ));
+        }
+    }
+    // Connection/source_type changes invalidate the previous connection check
+    // result — never show a stale "Cannot reach …" from an older URL.
+    let changed = connection_string.is_some() || source_type.is_some();
     conn.execute(
         "UPDATE camera_sources SET label = COALESCE(?1, label),
-                connection_string = COALESCE(?2, connection_string), updated_at = ?3
-         WHERE id = ?4",
-        params![label.map(|l| l.trim().to_string()), connection_string.map(|c| c.trim().to_string()), now_iso(), source_id],
+                source_type = COALESCE(?2, source_type),
+                connection_string = COALESCE(?3, connection_string),
+                last_connection_check_result = CASE WHEN ?4 = 1 THEN NULL ELSE last_connection_check_result END,
+                last_connection_check_at = CASE WHEN ?4 = 1 THEN NULL ELSE last_connection_check_at END,
+                updated_at = ?5
+         WHERE id = ?6",
+        params![
+            label.map(|l| l.trim().to_string()),
+            source_type,
+            connection_string.map(|c| c.trim().to_string()),
+            if changed { 1 } else { 0 },
+            now_iso(),
+            source_id
+        ],
     )
     .map_err(|e| format!("camera source update failed: {e}"))?;
     append_audit(&conn, &actor_id, "updated_camera_source", Some(&source_id), None)?;

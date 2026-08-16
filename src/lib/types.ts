@@ -227,7 +227,7 @@ export interface AnprConfigView {
 export interface CameraSourceView {
   id: string;
   label: string;
-  source_type: "rtsp" | "nvr_export" | "usb" | "video_file" | "live_test";
+  source_type: "rtsp" | "http" | "nvr_export" | "usb" | "video_file" | "live_test";
   connection_string: string;
   status: "active" | "inactive";
   last_connection_check_at: string | null;

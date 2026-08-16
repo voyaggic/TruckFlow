@@ -406,8 +406,9 @@ export const api = {
     actorId: string,
     sourceId: string,
     label: string | null,
+    sourceType: string | null,
     connectionString: string | null,
-  ) => invoke<CameraSourceView>("update_camera_source", { actorId, sourceId, label, connectionString }),
+  ) => invoke<CameraSourceView>("update_camera_source", { actorId, sourceId, label, sourceType, connectionString }),
 
   setCameraSourceStatus: (actorId: string, sourceId: string, status: "active" | "inactive") =>
     invoke<CameraSourceView>("set_camera_source_status", { actorId, sourceId, status }),

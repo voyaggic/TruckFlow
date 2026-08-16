@@ -1,3 +1,5 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type {
@@ -311,6 +313,7 @@ function CameraPanel({
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editLabel, setEditLabel] = useState("");
+  const [editType, setEditType] = useState<CameraSourceView["source_type"]>("rtsp");
   const [editConn, setEditConn] = useState("");
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
@@ -322,11 +325,29 @@ function CameraPanel({
     setDraftUrl(null);
   };
 
-  const pickFile = (file: File | undefined) => {
-    if (!file) return;
-    if (draftUrl) URL.revokeObjectURL(draftUrl);
-    setDraftUrl(URL.createObjectURL(file));
-    setConn(file.name);
+  // Native file dialog → real absolute path (browser <input type=file> only
+  // exposes the file name, which the backend cannot locate on disk).
+  const browseVideo = async () => {
+    const picked = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Video", extensions: ["mp4", "avi", "mkv", "mov", "webm"] }],
+    });
+    if (typeof picked === "string" && picked) {
+      setConn(picked);
+      setDraftUrl(convertFileSrc(picked));
+    }
+  };
+
+  const browseVideoForEdit = async () => {
+    const picked = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Video", extensions: ["mp4", "avi", "mkv", "mov", "webm"] }],
+    });
+    if (typeof picked === "string" && picked) {
+      setEditConn(picked);
+    }
   };
 
   const add = () =>
@@ -343,12 +364,13 @@ function CameraPanel({
   const startEdit = (c: CameraSourceView) => {
     setEditingId(c.id);
     setEditLabel(c.label);
+    setEditType(c.source_type);
     setEditConn(c.connection_string);
   };
 
   const saveEdit = (sourceId: string) =>
     onRun(async () => {
-      await api.updateCameraSource(actor.id, sourceId, editLabel, editConn);
+      await api.updateCameraSource(actor.id, sourceId, editLabel, editType, editConn);
       setEditingId(null);
     }, "Camera source updated.");
 
@@ -411,7 +433,17 @@ function CameraPanel({
           {type === "video_file" ? (
             <div className="field grow">
               <label>Video file</label>
-              <input type="file" accept="video/*" onChange={(e) => pickFile(e.target.files?.[0])} />
+              <div className="row" style={{ gap: 6 }}>
+                <input
+                  value={conn}
+                  onChange={(e) => setConn(e.target.value)}
+                  placeholder="Click Browse to pick a video…"
+                  style={{ flex: 1 }}
+                />
+                <button className="ghost" onClick={browseVideo}>
+                  Browse…
+                </button>
+              </div>
               {draftUrl && (
                 <video
                   src={draftUrl}
@@ -432,7 +464,7 @@ function CameraPanel({
             <button
               className="primary"
               onClick={add}
-              disabled={!label.trim() || (type === "video_file" ? !draftUrl : !conn.trim())}
+              disabled={!label.trim() || !conn.trim()}
             >
               + Add Source
             </button>
@@ -468,9 +500,30 @@ function CameraPanel({
                 </div>
 
                 {/* Type + Connection */}
-                <div className="muted small" style={{ marginTop: 4 }}>
-                  {c.source_type}
-                </div>
+                {isEditing ? (
+                  <div className="row" style={{ gap: 6, marginTop: 4, alignItems: "center" }}>
+                    <select
+                      value={editType}
+                      onChange={(e) => setEditType(e.target.value as CameraSourceView["source_type"])}
+                      style={{ fontSize: 12, width: "auto" }}
+                    >
+                      {SOURCE_TYPES.map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                    {editType === "video_file" && (
+                      <button className="ghost small" onClick={browseVideoForEdit}>
+                        Browse…
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="muted small" style={{ marginTop: 4 }}>
+                    {c.source_type}
+                  </div>
+                )}
                 {isEditing ? (
                   <input
                     value={editConn}
@@ -496,9 +549,16 @@ function CameraPanel({
                     justifyContent: "center",
                   }}
                 >
-                  {url || isHttp ? (
+                  {isHttp ? (
+                    // MJPEG / HTTP stream — <img> renders multipart MJPEG; <video> cannot.
+                    <img
+                      src={c.connection_string}
+                      alt={`${c.label} live feed`}
+                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                    />
+                  ) : url || c.source_type === "video_file" || c.source_type === "nvr_export" ? (
                     <video
-                      src={url ?? c.connection_string}
+                      src={url ?? convertFileSrc(c.connection_string)}
                       controls
                       muted
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
@@ -507,8 +567,8 @@ function CameraPanel({
                     <span className="muted small" style={{ padding: 8, textAlign: "center" }}>
                       {c.source_type === "rtsp"
                         ? "RTSP — test connection below"
-                        : c.source_type === "video_file"
-                          ? "Video preview after adding"
+                        : c.source_type === "live_test"
+                          ? "HTTP stream — test connection below"
                           : "No preview for this type"}
                     </span>
                   )}
