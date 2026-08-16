@@ -451,3 +451,98 @@ export interface FieldDefinition {
   created_at: string;
   updated_at: string;
 }
+
+export type ReferenceEntityType = "company" | "driver" | "vehicle";
+export type ReferenceFileFormat = "csv" | "xlsx";
+
+export interface ReferenceImportSummary {
+  entity_type: ReferenceEntityType;
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+}
+
+export interface ReferenceExportResult {
+  file_path: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Combined reference import/export (single file, multiple entities)
+// ---------------------------------------------------------------------------
+
+/** How a spreadsheet header has been classified during import preview. */
+export type ColumnKind = "standard" | "existing_custom" | "new_custom" | "ignore";
+
+/** A recognized standard column of the reference database. */
+export interface StandardColumn {
+  kind: "standard";
+  /** The raw header text from the spreadsheet. */
+  header: string;
+  /** Internal field key this header maps to (e.g. "plate_number"). */
+  field_key: string;
+}
+
+/** A custom field already defined in the database. */
+export interface ExistingCustomColumn {
+  kind: "existing_custom";
+  header: string;
+  field_key: string;
+  field_type: "text" | "number" | "boolean" | "mixed";
+}
+
+/** A header that doesn't match anything yet and needs confirmation. */
+export interface NewCustomColumn {
+  kind: "new_custom";
+  header: string;
+  /** Proposed field key (derived from the header). */
+  field_key: string;
+  /** Field type chosen by the admin before import. */
+  field_type: "text" | "number" | "boolean" | "mixed";
+  /** Whether this column is required. */
+  is_required: boolean;
+}
+
+export type ColumnInfo = StandardColumn | ExistingCustomColumn | NewCustomColumn;
+
+/** One worksheet/sheet of the uploaded spreadsheet preview. */
+export interface SheetPreview {
+  sheet_name: string;
+  entity_type: ReferenceEntityType | "unknown";
+  columns: ColumnInfo[];
+  row_count: number;
+}
+
+export interface ReferenceImportPreview {
+  file_path: string;
+  sheets: SheetPreview[];
+}
+
+/** A column mapping confirmed by the admin before applying the import. */
+export interface ConfirmedColumn {
+  header: string;
+  /** "standard" | existing field_key | "new" */
+  mapping: "ignore" | string;
+  /** Required only when mapping === "new" */
+  new_field_key?: string;
+  new_field_type?: "text" | "number" | "boolean" | "mixed";
+  new_is_required?: boolean;
+}
+
+export interface ConfirmedSheet {
+  sheet_name: string;
+  entity_type: ReferenceEntityType;
+  columns: ConfirmedColumn[];
+}
+
+export interface ReferenceImportRequest {
+  file_path: string;
+  sheets: ConfirmedSheet[];
+}
+
+/** Full summary covering all three entity types in a combined import. */
+export interface CombinedImportSummary {
+  companies: ReferenceImportSummary;
+  drivers: ReferenceImportSummary;
+  vehicles: ReferenceImportSummary;
+}

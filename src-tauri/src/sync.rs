@@ -420,9 +420,16 @@ pub fn sheets_state_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> Resu
     })
 }
 
+/// Only trips that are sheet-eligible are counted: auto-detected plates that
+/// matched the reference DB push themselves (08-anpr-integration.md §9), while
+/// manual entries push only after the officer classifies them as discharge
+/// (`is_discharge_trip = 1`); non-discharge and unclassified manual entries
+/// stay local and never reach the sheet.
 fn pending_sheets_trips(conn: &Connection) -> Result<i64, String> {
     conn.query_row(
-        "SELECT COUNT(*) FROM trips WHERE status = 'logged' AND pushed_to_sheets = 0",
+        "SELECT COUNT(*) FROM trips
+         WHERE status = 'logged' AND pushed_to_sheets = 0
+           AND (capture_method = 'auto' OR is_discharge_trip = 1)",
         [],
         |r| r.get(0),
     )
@@ -441,6 +448,7 @@ fn sheet_trip_rows(conn: &Connection) -> Result<Vec<serde_json::Value>, String> 
              LEFT JOIN companies c ON c.id = t.company_id
              LEFT JOIN drivers d ON d.id = t.driver_id
              WHERE t.status = 'logged' AND t.pushed_to_sheets = 0
+               AND (t.capture_method = 'auto' OR t.is_discharge_trip = 1)
              ORDER BY t.created_at ASC",
         )
         .map_err(|e| format!("sheet rows failed: {e}"))?;

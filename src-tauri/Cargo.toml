@@ -15,7 +15,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 argon2 = "0.5.3"
 base64 = "0.22.1"
+calamine = "0.36.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+csv = "1.4.0"
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 postgres = "0.19.14"
 rand = "0.10.2"

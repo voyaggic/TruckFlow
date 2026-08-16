@@ -120,8 +120,8 @@ fn read(plate: &str, confidence: f64, timestamp: &str) -> AnprRead {
 /// Create one company + driver + two vehicles (A123AB cap 20, A223AB cap 21);
 /// returns veh_a.
 fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> VehicleView {
-    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
-    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     let veh_a = reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -130,6 +130,7 @@ fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> VehicleView {
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
     reference::create_vehicle(
@@ -140,6 +141,7 @@ fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> VehicleView {
         Some(21.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
     veh_a

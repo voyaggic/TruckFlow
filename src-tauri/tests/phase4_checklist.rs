@@ -15,7 +15,7 @@ use serde_json::json;
 use tauri::test::mock_app;
 use tauri::{App, Manager, State};
 
-use truckflow_lib::capture::{ingest_read, set_capture_settings, SimulatorSource};
+use truckflow_lib::capture::{classify_discharge_impl, ingest_read, manual_entry_impl, set_capture_settings, SimulatorSource};
 use truckflow_lib::commands;
 use truckflow_lib::db::{open_db, AppState};
 use truckflow_lib::models::{AnprFrame, AnprRead, SessionUser, VehicleView};
@@ -132,8 +132,8 @@ fn read(plate: &str, confidence: f64, timestamp: &str) -> AnprRead {
 
 /// Seed one company + driver + vehicle so an exact-match read auto-logs.
 fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> VehicleView {
-    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
-    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -142,6 +142,7 @@ fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> VehicleView {
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap()
 }
@@ -288,6 +289,52 @@ fn sheets_pushes_logged_trips_only() {
     assert_eq!(res.pushed, 1, "only the logged trip is exported");
     assert_eq!(pushed_to_sheets_flag(&conn, &logged.id), 1);
     assert_eq!(pushed_to_sheets_flag(&conn, &queued.id), 0, "queued trip must never reach the sheet");
+}
+
+/// 08 §9: Sheets receives a trip only when (a) it's an auto-detected plate
+/// matched to the reference DB (auto-pushed), or (b) it's a manual entry the
+/// officer classified as discharge (Yes) with confirmation. Non-discharge and
+/// unclassified manual entries stay local — never exported.
+#[test]
+fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+    seed_reference(&ctx, &admin);
+
+    let conn = ctx.conn();
+    let sheets = MockSheets::new();
+
+    // Auto-detected plate matched to the DB → auto-pushed, no human step.
+    let auto = log_trip(&ctx, &admin, "A123AB");
+
+    // Manual entry logs but is UNclassified → must NOT reach the sheet.
+    let manual = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir())
+        .unwrap()
+        .trip
+        .expect("manual exact match logs");
+    assert_eq!(manual.capture_method, "manual_entry");
+    assert_eq!(manual.is_discharge_trip, None, "logged but not yet classified");
+
+    let first = run_sheets_sync_impl(&conn, &sheets).unwrap();
+    assert_eq!(first.pushed, 1, "only the auto trip is pushed; unclassified manual stays local");
+    assert_eq!(pushed_to_sheets_flag(&conn, &auto.id), 1);
+    assert_eq!(pushed_to_sheets_flag(&conn, &manual.id), 0, "unclassified manual must not export");
+
+    // Classify the manual entry as NON-discharge (No) → stays local forever.
+    classify_discharge_impl(&ctx.conn(), &manual.id, &admin.id, false).expect("classify non-discharge");
+    let second = run_sheets_sync_impl(&conn, &sheets).unwrap();
+    assert_eq!(second.pushed, 0, "non-discharge manual entry never reaches the sheet");
+    assert_eq!(pushed_to_sheets_flag(&conn, &manual.id), 0);
+
+    // Another manual entry classified as discharge (Yes) → exported.
+    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir())
+        .unwrap()
+        .trip
+        .expect("manual exact match logs");
+    classify_discharge_impl(&ctx.conn(), &discharge.id, &admin.id, true).expect("classify discharge");
+    let third = run_sheets_sync_impl(&conn, &sheets).unwrap();
+    assert_eq!(third.pushed, 1, "discharge-confirmed manual entry is exported");
+    assert_eq!(pushed_to_sheets_flag(&conn, &discharge.id), 1);
 }
 
 // ---------------------------------------------------------------------------

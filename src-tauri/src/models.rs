@@ -527,3 +527,14 @@ pub struct FieldDefinition {
     pub created_at: String,
     pub updated_at: String,
 }
+
+/// Per-entity outcome of a reference import (CSV/XLSX).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceImportSummary {
+    pub entity_type: String,
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}

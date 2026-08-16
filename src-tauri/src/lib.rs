@@ -75,6 +75,8 @@ pub fn run() {
             reference::create_field_definition,
             reference::update_field_definition,
             reference::delete_field_definition,
+            reference::reference_export,
+            reference::reference_import,
             capture::simulate_read,
             capture::manual_entry,
             capture::approve_trip,

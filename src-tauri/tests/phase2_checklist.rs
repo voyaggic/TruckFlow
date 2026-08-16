@@ -104,8 +104,8 @@ struct Ref {
 }
 
 fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> Ref {
-    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
-    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     let veh_a = reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -114,6 +114,7 @@ fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> Ref {
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
     let veh_b = reference::create_vehicle(
@@ -124,6 +125,7 @@ fn seed_reference(ctx: &TestCtx, admin: &SessionUser) -> Ref {
         Some(21.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
     Ref { veh_a, veh_b }
@@ -200,6 +202,7 @@ fn exact_match_auto_fills_and_copies_all_fields() {
         Some(30.0),
         "litres".into(),
         r.veh_a.default_driver_id.clone(),
+        None,
     )
     .unwrap();
     let stored_capacity: Option<f64> = ctx
@@ -457,11 +460,11 @@ fn reference_crud_is_permission_gated() {
     let admin = ctx.create_admin();
     let gate = ctx.create_gate_user(&admin, "Officer");
 
-    let err = reference::create_company(ctx.state(), gate.id.clone(), "Rogue Co".into())
+    let err = reference::create_company(ctx.state(), gate.id.clone(), "Rogue Co".into(), None)
         .expect_err("gate officer must not create companies");
     assert!(err.contains("permission"));
 
-    let comp = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
+    let comp = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
     assert_eq!(comp.status, "active");
 
     // No hard deletes — deactivate only.
@@ -501,7 +504,7 @@ fn every_auto_trip_retains_multiple_frames() {
 fn capacity_unit_defaults_to_litres_and_is_snapshotted() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
 
     // Unknown units are rejected up front.
     let err = reference::create_vehicle(
@@ -511,6 +514,7 @@ fn capacity_unit_defaults_to_litres_and_is_snapshotted() {
         Some(company.id.clone()),
         Some(20.0),
         "barrels".into(),
+        None,
         None,
     )
     .expect_err("unsupported capacity unit must be rejected");
@@ -524,6 +528,7 @@ fn capacity_unit_defaults_to_litres_and_is_snapshotted() {
         Some(company.id.clone()),
         Some(20.0),
         "gallons".into(),
+        None,
         None,
     )
     .unwrap();
@@ -546,6 +551,7 @@ fn capacity_unit_defaults_to_litres_and_is_snapshotted() {
         Some(company.id.clone()),
         Some(30.0),
         "tonnes".into(),
+        None,
         None,
     )
     .unwrap();

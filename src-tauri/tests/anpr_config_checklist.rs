@@ -234,7 +234,7 @@ fn camera_sources_crud_and_deactivate_not_delete() {
         .expect_err("invalid source type rejected");
     assert!(bad.contains("Unknown camera source type"));
 
-    let updated = update_camera_source(ctx.state(), admin.id.clone(), src.id.clone(), Some("Main gate".into()), None)
+    let updated = update_camera_source(ctx.state(), admin.id.clone(), src.id.clone(), Some("Main gate".into()), None, None)
         .expect("update camera source");
     assert_eq!(updated.label, "Main gate");
 
@@ -296,8 +296,8 @@ fn training_candidates_list_returns_flagged_frames() {
     let admin = ctx.create_admin();
 
     // Create a company/driver/vehicle via reference commands.
-    let company = truckflow_lib::reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
-    let driver = truckflow_lib::reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = truckflow_lib::reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = truckflow_lib::reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     let veh = truckflow_lib::reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -306,6 +306,7 @@ fn training_candidates_list_returns_flagged_frames() {
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
 
@@ -368,8 +369,8 @@ fn trips_filtered_by_model_version_never_mix_engines() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
 
-    let company = truckflow_lib::reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into()).unwrap();
-    let driver = truckflow_lib::reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = truckflow_lib::reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = truckflow_lib::reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     truckflow_lib::reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -378,6 +379,7 @@ fn trips_filtered_by_model_version_never_mix_engines() {
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap();
 

@@ -31,6 +31,12 @@ import type {
   RolePresetView,
   SessionUser,
   PgSyncStateView,
+  ReferenceEntityType,
+  ReferenceFileFormat,
+  ReferenceImportSummary,
+  CombinedImportSummary,
+  ReferenceImportPreview,
+  ReferenceImportRequest,
   SheetsStateView,
   SyncRunResult,
   SyncStatusView,
@@ -247,6 +253,32 @@ export const api = {
 
   deleteFieldDefinition: (actorId: string, fieldId: string) =>
     invoke<void>("delete_field_definition", { actorId, fieldId }),
+
+  // --- Reference database import / export (CSV & XLSX) ---
+
+  referenceExport: (actorId: string, entityType: ReferenceEntityType, format: ReferenceFileFormat, targetPath?: string) =>
+    invoke<string>("reference_export", {
+      actorId,
+      entityType,
+      format,
+      targetPath: targetPath ?? null,
+    }),
+
+  referenceImport: (actorId: string, entityType: ReferenceEntityType, filePath: string) =>
+    invoke<ReferenceImportSummary>("reference_import", { actorId, entityType, filePath }),
+
+  // --- Combined reference database import/export (single file, all entities) ---
+  referenceExportCombined: (actorId: string, targetPath?: string) =>
+    invoke<string>("reference_export_combined", {
+      actorId,
+      targetPath: targetPath ?? null,
+    }),
+
+  referenceImportPreview: (actorId: string, filePath: string) =>
+    invoke<ReferenceImportPreview>("reference_import_preview", { actorId, filePath }),
+
+  referenceImportCombined: (actorId: string, request: ReferenceImportRequest) =>
+    invoke<CombinedImportSummary>("reference_import_combined", { actorId, request }),
 
   // --- Capture pipeline ---
 

@@ -143,8 +143,8 @@ fn read(plate: &str, confidence: f64, timestamp: &str) -> AnprRead {
 
 /// Seed a company + driver + vehicle so an exact-match read auto-logs.
 fn seed_vehicle(ctx: &TestCtx, admin: &SessionUser, company_name: &str, plate: &str) -> VehicleView {
-    let company = reference::create_company(ctx.state(), admin.id.clone(), company_name.into()).unwrap();
-    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into()).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), company_name.into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
     reference::create_vehicle(
         ctx.state(),
         admin.id.clone(),
@@ -153,6 +153,7 @@ fn seed_vehicle(ctx: &TestCtx, admin: &SessionUser, company_name: &str, plate: &
         Some(20.0),
         "litres".into(),
         Some(driver.id.clone()),
+        None,
     )
     .unwrap()
 }
@@ -477,12 +478,12 @@ fn report_csv_export_writes_file_and_stays_read_only() {
     let trip = log_trip(&ctx, &admin, "AAA111");
     stamp_trip(&ctx, &trip.id, "2026-08-05T08:00:00Z");
 
-    let err = reporting::report_export_csv(ctx.state(), gate.id.clone(), ReportFilters::default())
+    let err = reporting::report_export_csv(ctx.state(), gate.id.clone(), ReportFilters::default(), None)
         .expect_err("gate officer must not export");
     assert!(err.contains("permission"));
 
     let audit_before: i64 = ctx.conn().query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0)).unwrap();
-    let path = reporting::report_export_csv(ctx.state(), admin.id.clone(), ReportFilters::default()).expect("export");
+    let path = reporting::report_export_csv(ctx.state(), admin.id.clone(), ReportFilters::default(), None).expect("export");
     assert!(path.ends_with(".csv"));
     let content = std::fs::read_to_string(&path).expect("csv readable");
     assert!(content.contains("AAA111"));
@@ -765,4 +766,145 @@ fn reporting_reads_from_postgres_archive_when_connected() {
     admin
         .batch_execute(&format!("DROP DATABASE IF EXISTS \"{}\"", dbname.replace('"', "\"\"")))
         .expect("drop throwaway db");
+}
+
+// ---------------------------------------------------------------------------
+// Reference database import / export round-trip (CSV & XLSX)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reference_export_then_import_round_trips_custom_fields() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    // A custom vehicle field "fleet_no" ensures export/import covers extra_fields.
+    reference::create_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        "fleet_no".into(),
+        "Fleet No".into(),
+        "text".into(),
+        false,
+        None,
+    )
+    .expect("create vehicle field def");
+
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
+    let vehicle = reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "DL 4G 8834".into(),
+        Some(company.id.clone()),
+        Some(20.0),
+        "litres".into(),
+        Some(driver.id.clone()),
+        Some(r#"{"fleet_no":"A-4412"}"#.into()),
+    )
+    .unwrap();
+
+    let tmp = TempDb::new();
+
+    // CSV export → re-import into the same DB upserts the existing plate.
+    let csv_path = tmp.dir.join("vehicles.csv");
+    let csv_out = reference::reference_export(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        "csv".into(),
+        Some(csv_path.to_string_lossy().into_owned()),
+    )
+    .expect("export vehicles csv");
+    assert!(std::path::Path::new(&csv_out).exists());
+
+    // XLSX export writes a real workbook.
+    let xlsx_path = tmp.dir.join("vehicles.xlsx");
+    let xlsx_out = reference::reference_export(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        "xlsx".into(),
+        Some(xlsx_path.to_string_lossy().into_owned()),
+    )
+    .expect("export vehicles xlsx");
+    assert!(std::path::Path::new(&xlsx_out).exists());
+
+    let summary = reference::reference_import(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        csv_path.to_string_lossy().into_owned(),
+    )
+    .expect("import vehicles csv");
+    assert_eq!(summary.created, 0, "same DB → update only");
+    assert_eq!(summary.updated, 1, "one existing vehicle row");
+    assert_eq!(summary.errors.len(), 0, "no import errors");
+
+    // Custom field survived the round trip.
+    let conn = ctx.conn();
+    let plate_from_db: String = conn
+        .query_row(
+            "SELECT upper(plate_number) FROM vehicles WHERE id = ?1",
+            rusqlite::params![vehicle.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(plate_from_db, "DL4G8834", "plate normalised on import");
+    let extra: Option<String> = conn
+        .query_row("SELECT extra_fields FROM vehicles WHERE id = ?1", rusqlite::params![vehicle.id], |r| r.get(0))
+        .unwrap();
+    assert!(
+        extra.as_deref().map(|s| s.contains("A-4412")).unwrap_or(false),
+        "custom field preserved through export/import: {extra:?}"
+    );
+
+    // Import into an empty DB via xlsx creates fresh rows.
+    let fresh = TempDb::new();
+    let fdir = fresh.dir.join("frames");
+    std::fs::create_dir_all(&fdir).unwrap();
+    let fconn = open_db(&fresh.db_path()).expect("open fresh db");
+    let fapp = mock_app();
+    fapp.manage(AppState {
+        db: Mutex::new(fconn),
+        session: Mutex::new(None),
+        simulator: Arc::new(SimulatorSource::new()),
+        anpr_last: Mutex::new(None),
+        running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        frames_dir: fdir,
+        pg: Arc::new(MockPostgres::new()),
+        sheets: Arc::new(MockSheets::new()),
+    });
+    let admin2 = commands::create_first_admin(fapp.state(), "Boss2".into(), ADMIN_PASS.into())
+        .expect("create second admin")
+        .user;
+    // Company + driver + the same vehicle field so xlsx custom columns are recognised.
+    reference::create_company(fapp.state(), admin2.id.clone(), "Acme Waste".into(), None).unwrap();
+    reference::create_driver(fapp.state(), admin2.id.clone(), "D. Singh".into(), None).unwrap();
+    reference::create_field_definition(
+        fapp.state(),
+        admin2.id.clone(),
+        "vehicle".into(),
+        "fleet_no".into(),
+        "Fleet No".into(),
+        "text".into(),
+        false,
+        None,
+    )
+    .expect("create vehicle field def on second db");
+
+    let summary2 = reference::reference_import(fapp.state(), admin2.id.clone(), "vehicle".into(), xlsx_out)
+        .expect("import vehicles xlsx");
+    assert_eq!(summary2.created, 1, "vehicle created from xlsx import");
+    assert_eq!(summary2.updated, 0);
+    assert_eq!(summary2.errors.len(), 0);
+
+    // Unrecognised company/driver names are reported, not silently linked.
+    let broken = fresh.dir.join("broken.csv");
+    std::fs::write(&broken, "plate_number,company,status\nNO-SUCH-1,Nope Corp,active\n").unwrap();
+    let summary3 = reference::reference_import(fapp.state(), admin2.id.clone(), "vehicle".into(), broken.to_string_lossy().into_owned())
+        .expect("import broken csv");
+    assert_eq!(summary3.created, 0, "vehicle skipped");
+    assert_eq!(summary3.errors.len(), 1, "one per-row error reported");
+    assert!(summary3.errors[0].contains("Nope Corp"));
 }

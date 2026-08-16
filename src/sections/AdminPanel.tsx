@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../lib/api";
 import type {
   AuditEntry,
@@ -9,6 +10,8 @@ import type {
   ListPermissionItem,
   OfficerActivityView,
   PasswordResetRequestView,
+  ReferenceEntityType,
+  ReferenceImportSummary,
   RolePresetView,
   SessionUser,
   TripView,
@@ -1129,6 +1132,50 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
     }
   };
 
+  const exportTo = async (entityType: ReferenceEntityType, label: string, format: "csv" | "xlsx") => {
+    setError(null);
+    try {
+      const filePath = await save({
+        defaultPath: `truckflow-${label}-${new Date().toISOString().slice(0, 10)}.${format}`,
+        filters: [{ name: format === "csv" ? "CSV" : "Excel Workbook", extensions: [format] }],
+      });
+      if (!filePath) return; // cancelled
+      const path = await api.referenceExport(actor.id, entityType, format, filePath);
+      onNotice(`${label[0].toUpperCase()}${label.slice(1)} exported to ${path}`);
+      setTimeout(() => onNotice(""), 5000);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const importFrom = async (entityType: ReferenceEntityType, label: string) => {
+    setError(null);
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "CSV or Excel", extensions: ["csv", "xlsx"] }],
+      });
+      if (typeof picked !== "string") return; // cancelled
+      const summary: ReferenceImportSummary = await api.referenceImport(actor.id, entityType, picked);
+      const parts = [
+        `${summary.created} created`,
+        `${summary.updated} updated`,
+        `${summary.skipped} skipped`,
+      ];
+      const msg = `${label[0].toUpperCase()}${label.slice(1)} import: ${parts.join(", ")}`;
+      if (summary.errors.length) {
+        setError(`${msg}. Errors:\n${summary.errors.slice(0, 8).join("\n")}`);
+      } else {
+        onNotice(msg);
+        setTimeout(() => onNotice(""), 6000);
+      }
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const q = search.trim().toLowerCase();
   const vq = vehicles.filter(
     (v) => !q || v.plate_number.toLowerCase().includes(q) || (v.company_name ?? "").toLowerCase().includes(q),
@@ -1159,6 +1206,20 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+
+      <div className="row between" style={{ flexWrap: "wrap", gap: 8 }}>
+        <div className="seg" style={{ flexWrap: "wrap" }}>
+          <button onClick={() => exportTo("company", "companies", "csv")}>Export companies CSV</button>
+          <button onClick={() => exportTo("company", "companies", "xlsx")}>Export companies XLSX</button>
+          <button onClick={() => importFrom("company", "companies")}>Import companies</button>
+          <button onClick={() => exportTo("driver", "drivers", "csv")}>Export drivers CSV</button>
+          <button onClick={() => exportTo("driver", "drivers", "xlsx")}>Export drivers XLSX</button>
+          <button onClick={() => importFrom("driver", "drivers")}>Import drivers</button>
+          <button onClick={() => exportTo("vehicle", "vehicles", "csv")}>Export vehicles CSV</button>
+          <button onClick={() => exportTo("vehicle", "vehicles", "xlsx")}>Export vehicles XLSX</button>
+          <button onClick={() => importFrom("vehicle", "vehicles")}>Import vehicles</button>
+        </div>
+      </div>
 
       {tab !== "fields" && (
         <div className="row">

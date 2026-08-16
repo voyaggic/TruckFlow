@@ -123,7 +123,13 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
       setFlash(res.message);
       setTimeout(() => setFlash(null), 2500);
       setManualPlate("");
-      await refresh();
+      // Manual entries always require discharge Yes/No + Confirm before they
+      // are eligible to reach Google Sheets; unclassified trips stay local.
+      if (res.trip && res.trip.status === "logged" && res.trip.is_discharge_trip == null) {
+        setDischargePrompt(res.trip);
+      } else {
+        await refresh();
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -476,7 +482,10 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
         <DischargeStep
           trip={dischargePrompt}
           onConfirm={(isDischarge) => classifyDischarge(dischargePrompt, isDischarge)}
-          onClose={() => setDischargePrompt(null)}
+          onClose={() => {
+            setDischargePrompt(null);
+            refresh().catch((e) => setError(String(e)));
+          }}
         />
       )}
     </div>
