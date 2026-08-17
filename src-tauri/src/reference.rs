@@ -575,7 +575,8 @@ pub fn list_field_definitions(
     let mut stmt = conn
         .prepare(
             "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, binding, sort_order, created_at, updated_at
-             FROM field_definitions WHERE entity_type = ?1 ORDER BY sort_order, field_label",
+             FROM field_definitions WHERE entity_type = ?1
+             ORDER BY is_standard DESC, sort_order, field_label",
         )
         .map_err(|e| format!("field_definitions list failed: {e}"))?;
     let rows = stmt
@@ -1300,7 +1301,8 @@ fn visible_fields(conn: &Connection, entity_type: &str) -> Result<Vec<(String, b
     let mut stmt = conn
         .prepare(
             "SELECT COALESCE(binding, field_key), is_standard FROM field_definitions
-             WHERE entity_type = ?1 AND is_hidden = 0 ORDER BY sort_order, field_label",
+             WHERE entity_type = ?1 AND is_hidden = 0
+             ORDER BY is_standard DESC, sort_order, field_label",
         )
         .map_err(|e| format!("field_definitions list failed: {e}"))?;
     let rows = stmt
