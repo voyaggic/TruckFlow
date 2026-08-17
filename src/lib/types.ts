@@ -471,6 +471,28 @@ export const DEFAULT_ENTITY_LABELS: EntityLabels = {
   driver: "Drivers",
 };
 
+/** A parent entity of the reference database — the three built-ins plus any
+ *  the admin adds (e.g. "Trailers"). Parents own their field definitions. */
+export interface ReferenceEntity {
+  entity_type: string;
+  label: string;
+  /** True for the pipeline entities (vehicle/company/driver): renameable but
+   *  not deletable — the gate, trips, and reports depend on them. */
+  is_core: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One record of a non-core parent entity (stored as JSON). */
+export interface EntityRecordView {
+  id: string;
+  entity_type: string;
+  data: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ReferenceImportSummary {
   entity_type: ReferenceEntityType;
   created: number;

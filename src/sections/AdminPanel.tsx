@@ -10,6 +10,7 @@ import type {
   ConfirmedColumn,
   ConfirmedSheet,
   DriverView,
+  EntityRecordView,
   FieldDefinition,
   ListPermissionItem,
   OfficerActivityView,
@@ -1093,7 +1094,7 @@ function EditUserForm({
 // ---------------------------------------------------------------------------
 
 function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUser; onNotice: (msg: string) => void; canRegister: boolean }) {
-  const { refresh: refreshRefFields, entityLabel } = useReferenceFields();
+  const { refresh: refreshRefFields, entityLabel, entities } = useReferenceFields();
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
   const [vehicles, setVehicles] = useState<VehicleView[]>([]);
@@ -1102,9 +1103,19 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
   const [driverFields, setDriverFields] = useState<FieldDefinition[]>([]);
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<"vehicles" | "companies" | "drivers" | "fields">("vehicles");
+  const [tab, setTab] = useState<string>("vehicles");
   const [importPreview, setImportPreview] = useState<ReferenceImportPreview | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  // Core entity keys always render first; admin-added parents follow.
+  const coreTabs: { key: string; label: string }[] = [
+    { key: "vehicles", label: entityLabel("vehicle") },
+    { key: "companies", label: entityLabel("company") },
+    { key: "drivers", label: entityLabel("driver") },
+  ];
+  const extraTabs = entities
+    .filter((e) => !e.is_core)
+    .map((e) => ({ key: e.entity_type, label: e.label }));
+  const allTabs = [...coreTabs, ...extraTabs, { key: "fields", label: "Fields" }];
 
   const refresh = useCallback(async () => {
     try {
@@ -1194,18 +1205,19 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           Reference Database
         </div>
         <div className="seg" style={{ flexWrap: "wrap" }}>
-          <button className={tab === "vehicles" ? "active" : ""} onClick={() => setTab("vehicles")}>
-            {entityLabel("vehicle")} ({vehicles.length})
-          </button>
-          <button className={tab === "companies" ? "active" : ""} onClick={() => setTab("companies")}>
-            {entityLabel("company")} ({companies.length})
-          </button>
-          <button className={tab === "drivers" ? "active" : ""} onClick={() => setTab("drivers")}>
-            {entityLabel("driver")} ({drivers.length})
-          </button>
-          <button className={tab === "fields" ? "active" : ""} onClick={() => setTab("fields")}>
-            Fields
-          </button>
+          {allTabs.map((t) => (
+            <button
+              key={t.key}
+              className={tab === t.key ? "active" : ""}
+              onClick={() => setTab(t.key)}
+              title={t.key === "fields" ? "Parent fields & parents management" : undefined}
+            >
+              {t.label}
+              {t.key === "vehicles" && ` (${vehicles.length})`}
+              {t.key === "companies" && ` (${companies.length})`}
+              {t.key === "drivers" && ` (${drivers.length})`}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -1288,8 +1300,16 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           onDelete={(id) => run(() => api.deleteDriver(actor.id, id), "Driver deleted.")}
         />
       )}
-      {tab === "fields" && (
-        <FieldManager actor={actor} onNotice={onNotice} onChanged={refresh} />
+      {tab === "fields" && <FieldManager actor={actor} onNotice={onNotice} onChanged={refresh} />}
+      {tab !== "vehicles" && tab !== "companies" && tab !== "drivers" && tab !== "fields" && (
+        <GenericRecordsTable
+          key={tab}
+          entityType={tab}
+          entityLabel={entityLabel(tab)}
+          actor={actor}
+          onNotice={onNotice}
+          onChanged={refresh}
+        />
       )}
 
       {importPreview && (
@@ -2178,14 +2198,186 @@ function DriverTable({
 }
 
 // ---------------------------------------------------------------------------
-// Field Manager — dynamic custom fields for the reference database
+// Generic records table — data for an admin-added parent (e.g. Trailers)
 // ---------------------------------------------------------------------------
 
-const ENTITY_LABELS: Record<string, string> = {
-  vehicle: "Vehicles",
-  company: "Companies",
-  driver: "Drivers",
-};
+function GenericRecordsTable({
+  entityType,
+  entityLabel: label,
+  actor,
+  onNotice,
+  onChanged,
+}: {
+  entityType: string;
+  entityLabel: string;
+  actor: SessionUser;
+  onNotice: (msg: string) => void;
+  onChanged: () => void;
+}) {
+  const { fieldsFor } = useReferenceFields();
+  const [records, setRecords] = useState<EntityRecordView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<EntityRecordView | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState<Record<string, unknown>>({});
+  const [busy, setBusy] = useState(false);
+  const defs = fieldsFor(entityType).filter((f) => !f.is_hidden);
+
+  const refresh = useCallback(() => {
+    api
+      .listEntityRecords(entityType)
+      .then(setRecords)
+      .catch((e) => setError(String(e)));
+  }, [entityType]);
+
+  useEffect(() => {
+    refresh();
+    setAdding(false);
+    setEditing(null);
+  }, [refresh]);
+
+  const startAdd = () => {
+    setAdding(true);
+    setEditing(null);
+    const d: Record<string, unknown> = {};
+    for (const fd of defs) d[fd.field_key] = fd.field_type === "boolean" ? null : "";
+    setDraft(d);
+  };
+
+  const startEdit = (rec: EntityRecordView) => {
+    setEditing(rec);
+    setAdding(false);
+    const d: Record<string, unknown> = {};
+    for (const fd of defs) d[fd.field_key] = rec.data[fd.field_key] ?? (fd.field_type === "boolean" ? null : "");
+    setDraft(d);
+  };
+
+  const submit = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      if (editing) {
+        await api.updateEntityRecord(actor.id, entityType, editing.id, draft);
+        onNotice(`${label} record updated.`);
+      } else {
+        await api.createEntityRecord(actor.id, entityType, draft);
+        onNotice(`${label} record added.`);
+      }
+      setTimeout(() => onNotice(""), 4000);
+      setAdding(false);
+      setEditing(null);
+      refresh();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (rec: EntityRecordView) => {
+    if (!window.confirm(`Delete this ${label.toLowerCase()} record permanently? This cannot be undone.`)) return;
+    setError(null);
+    try {
+      await api.deleteEntityRecord(actor.id, entityType, rec.id);
+      refresh();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <div className="stack">
+      {error && <div className="error-banner">{error}</div>}
+      {defs.length === 0 ? (
+        <p className="muted small">
+          "{label}" has no fields yet. Go to the <b>Fields</b> tab, select "{label}", and add the fields this record
+          needs — they'll appear here as columns.
+        </p>
+      ) : (
+        <>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <button className="primary" onClick={startAdd} disabled={busy}>
+              + Add {label.toLowerCase()} record
+            </button>
+            {(adding || editing) && (
+              <>
+                <button className="ghost" onClick={() => { setAdding(false); setEditing(null); }}>
+                  Cancel
+                </button>
+                <button className="primary" onClick={submit} disabled={busy}>
+                  {busy ? "Saving…" : editing ? "Save changes" : "Add record"}
+                </button>
+              </>
+            )}
+          </div>
+
+          {(adding || editing) && (
+            <div className="row" style={{ gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+              {defs.map((fd) => (
+                <DynamicFieldInput
+                  key={fd.id}
+                  fd={fd}
+                  value={draft[fd.field_key]}
+                  onChange={(v) => setDraft((prev) => ({ ...prev, [fd.field_key]: v }))}
+                />
+              ))}
+            </div>
+          )}
+
+          {records === null ? (
+            <p className="muted small">Loading…</p>
+          ) : records.length === 0 ? (
+            <p className="muted small">No {label.toLowerCase()} records yet.</p>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  {defs.map((fd) => (
+                    <th key={fd.id}>{fd.field_label}</th>
+                  ))}
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {records.map((rec) => (
+                  <tr key={rec.id}>
+                    {defs.map((fd) => (
+                      <td key={fd.id}>
+                        {fd.field_type === "boolean"
+                          ? rec.data[fd.field_key] == null
+                            ? "—"
+                            : String(rec.data[fd.field_key]) === "true"
+                              ? "Yes"
+                              : "No"
+                          : String(rec.data[fd.field_key] ?? "") || "—"}
+                      </td>
+                    ))}
+                    <td>
+                      <div className="row" style={{ gap: 6 }}>
+                        <button className="ghost small" onClick={() => startEdit(rec)}>
+                          Edit
+                        </button>
+                        <button className="danger small" onClick={() => remove(rec)}>
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Field Manager — dynamic custom fields for the reference database
+// ---------------------------------------------------------------------------
 
 /** Reusable input that renders based on a field definition's type. */
 function DynamicFieldInput({
@@ -2260,7 +2452,7 @@ function FieldManager({
   onNotice: (msg: string) => void;
   onChanged: () => void;
 }) {
-  const { entityLabel, refresh: refreshRefFields } = useReferenceFields();
+  const { entityLabel, refresh: refreshRefFields, entities } = useReferenceFields();
   const [entityTab, setEntityTab] = useState<string>("vehicle");
   const [fields, setFields] = useState<FieldDefinition[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -2274,6 +2466,20 @@ function FieldManager({
   const [renamingEntity, setRenamingEntity] = useState<string | null>(null);
   const [entityNameDraft, setEntityNameDraft] = useState("");
   const [savingName, setSavingName] = useState(false);
+  // Add / delete parent entities.
+  const [addingParent, setAddingParent] = useState(false);
+  const [parentNameDraft, setParentNameDraft] = useState("");
+  const [savingParent, setSavingParent] = useState(false);
+  const [deletingParentFor, setDeletingParentFor] = useState<string | null>(null);
+  const [parentPassword, setParentPassword] = useState("");
+  const [deletingParentBusy, setDeletingParentBusy] = useState(false);
+
+  // Core parents first, then admin-added ones — in line, like the main tabs.
+  const parentTabs = [
+    ...entities.filter((e) => e.is_core),
+    ...entities.filter((e) => !e.is_core),
+  ];
+  const currentEntity = entities.find((e) => e.entity_type === entityTab);
 
   const refreshFields = useCallback(async () => {
     try {
@@ -2306,7 +2512,7 @@ function FieldManager({
     setError(null);
     try {
       await api.setEntityLabel(actor.id, renamingEntity, name);
-      onNotice(`"${ENTITY_LABELS[renamingEntity]}" renamed to "${name}" — updated everywhere in the app.`);
+      onNotice(`"${entityLabel(renamingEntity)}" renamed to "${name}" — updated everywhere in the app.`);
       setTimeout(() => onNotice(""), 5000);
       setRenamingEntity(null);
       await refreshRefFields();
@@ -2315,6 +2521,60 @@ function FieldManager({
       setError(String(e));
     } finally {
       setSavingName(false);
+    }
+  };
+
+  const submitParent = async () => {
+    setError(null);
+    const name = parentNameDraft.trim();
+    if (!name) {
+      setError("Give the new parent a display name.");
+      return;
+    }
+    setSavingParent(true);
+    try {
+      const created = await api.createReferenceEntity(actor.id, name);
+      onNotice(`"${created.label}" added — it now appears as a tab next to the others.`);
+      setTimeout(() => onNotice(""), 5000);
+      setAddingParent(false);
+      setParentNameDraft("");
+      await refreshRefFields();
+      setEntityTab(created.entity_type);
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingParent(false);
+    }
+  };
+
+  const confirmDeleteParent = async () => {
+    if (!deletingParentFor) return;
+    if (!parentPassword.trim()) {
+      setError("Enter your password to delete the parent.");
+      return;
+    }
+    const ent = entities.find((e) => e.entity_type === deletingParentFor);
+    if (!ent) return;
+    const ok = window.confirm(
+      `Delete the "${ent.label}" parent permanently?\n\nIts child fields and all of its records will be deleted too. Anywhere the parent is referenced in the app will stop showing it. This cannot be undone.`,
+    );
+    if (!ok) return;
+    setDeletingParentBusy(true);
+    setError(null);
+    try {
+      await api.deleteReferenceEntity(actor.id, deletingParentFor, parentPassword);
+      onNotice(`"${ent.label}" deleted — removed everywhere in the app.`);
+      setTimeout(() => onNotice(""), 5000);
+      setDeletingParentFor(null);
+      setParentPassword("");
+      setEntityTab("vehicle");
+      await refreshRefFields();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDeletingParentBusy(false);
     }
   };
 
@@ -2407,39 +2667,86 @@ function FieldManager({
   return (
     <div className="stack">
       <p className="muted small">
-        These fields drive the registration forms, exports, and imports. The standard fields (Plate, Company, Driver,
-        Capacity…) are here too — rename them, change their type, or remove them so the system matches how your
-        operation actually records vehicles. Add as many custom fields as you need.
+        Parents are the main record types — Vehicles, Companies, Drivers and any you add (e.g. Trailers, Fuel
+        Cards). Each parent owns its fields (the children). The standard fields (Plate, Company, Driver, Capacity…)
+        are children of the built-in parents — rename them, change their type, or remove them so the system matches
+        how your operation actually records things.
       </p>
 
       <div className="stack" style={{ gap: 6 }}>
-        <div className="seg" style={{ alignSelf: "flex-start" }}>
-          {Object.entries(ENTITY_LABELS).map(([key, _label]) => (
+        <div className="seg" style={{ alignSelf: "flex-start", flexWrap: "wrap" }}>
+          {parentTabs.map((ent) => (
             <button
-              key={key}
-              className={entityTab === key ? "active" : ""}
+              key={ent.entity_type}
+              className={entityTab === ent.entity_type ? "active" : ""}
               onClick={() => {
-                setEntityTab(key);
+                setEntityTab(ent.entity_type);
                 setRenamingEntity(null);
+                setDeletingParentFor(null);
               }}
+              title={ent.is_core ? "Built-in parent (gate/trips depend on it)" : "Parent you added"}
             >
-              {entityLabel(key as ReferenceEntityType)}
+              {entityLabel(ent.entity_type)}
+              {!ent.is_core && <span className="badge" style={{ marginLeft: 6 }}>Added</span>}
             </button>
           ))}
           <button
             className="ghost small"
-            style={{ marginLeft: 8, border: "none" }}
-            onClick={() => startRename(entityTab)}
-            title="Rename this entity everywhere in the app"
+            style={{ border: "none" }}
+            onClick={() => setAddingParent((v) => !v)}
+            title="Add a completely new parent record type"
           >
-            ✎ Rename {entityLabel(entityTab as ReferenceEntityType)}
+            ＋ Add parent
           </button>
         </div>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+          <button
+            className="ghost small"
+            onClick={() => startRename(entityTab)}
+            title="Rename this parent everywhere in the app"
+          >
+            ✎ Rename {entityLabel(entityTab)}
+          </button>
+          {currentEntity && !currentEntity.is_core && (
+            <button className="danger small" onClick={() => setDeletingParentFor(entityTab)}>
+              🗑 Delete {entityLabel(entityTab)}
+            </button>
+          )}
+        </div>
         <p className="muted small" style={{ margin: 0 }}>
-          Renaming an entity changes its name everywhere — the tabs here, the Gate screen, reports, and exports —
-          just like renaming a field does.
+          Renaming a parent (or a field) changes it everywhere — the tabs here, the Gate screen, reports, and
+          exports. Parents you add can be deleted with your password; the three built-in parents keep the gate and
+          trips working.
         </p>
       </div>
+
+      {addingParent && (
+        <div
+          className="stack"
+          style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 12, maxWidth: 480 }}
+        >
+          <div className="section-title" style={{ fontSize: 14 }}>
+            Add a new parent
+          </div>
+          <p className="muted small" style={{ margin: 0 }}>
+            A brand-new record type that appears as its own tab next to Vehicles / Companies / Drivers. Give it a
+            name, then add its fields below — you'll be able to enter records for it right away.
+          </p>
+          <input
+            value={parentNameDraft}
+            onChange={(e) => setParentNameDraft(e.target.value)}
+            placeholder="e.g. Trailers, Fuel Cards, Suppliers…"
+          />
+          <div className="row">
+            <button className="primary" onClick={submitParent} disabled={savingParent || !parentNameDraft.trim()}>
+              {savingParent ? "Creating…" : "Add parent"}
+            </button>
+            <button className="ghost" onClick={() => setAddingParent(false)} disabled={savingParent}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {renamingEntity && (
         <div
@@ -2447,7 +2754,7 @@ function FieldManager({
           style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 12, maxWidth: 480 }}
         >
           <div className="section-title" style={{ fontSize: 14 }}>
-            Rename {ENTITY_LABELS[renamingEntity]}
+            Rename {entityLabel(renamingEntity)}
           </div>
           <p className="muted small" style={{ margin: 0 }}>
             This name is used everywhere in the app (tabs, gate screen, reports, exports). Pick the name your
@@ -2459,6 +2766,36 @@ function FieldManager({
               {savingName ? "Saving…" : "Save name"}
             </button>
             <button className="ghost" onClick={() => setRenamingEntity(null)} disabled={savingName}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {deletingParentFor && (
+        <div
+          className="stack"
+          style={{ border: "1px solid var(--danger, #d32f2f)", borderRadius: "var(--radius)", padding: 12, maxWidth: 520 }}
+        >
+          <div className="section-title" style={{ fontSize: 14 }}>
+            Delete "{entityLabel(deletingParentFor)}" permanently
+          </div>
+          <p className="muted small" style={{ margin: 0 }}>
+            This deletes the parent, its child fields, and every record in it. It disappears from the tabs, forms,
+            exports and imports. This cannot be undone. Enter your password to confirm.
+          </p>
+          <input
+            type="password"
+            value={parentPassword}
+            onChange={(e) => setParentPassword(e.target.value)}
+            placeholder="Your password"
+            style={{ maxWidth: 260 }}
+          />
+          <div className="row">
+            <button className="danger" onClick={confirmDeleteParent} disabled={deletingParentBusy}>
+              {deletingParentBusy ? "Deleting…" : "Delete parent permanently"}
+            </button>
+            <button className="ghost" onClick={() => { setDeletingParentFor(null); setParentPassword(""); }} disabled={deletingParentBusy}>
               Cancel
             </button>
           </div>
@@ -2538,12 +2875,12 @@ function FieldManager({
       )}
 
       <button className="primary" style={{ alignSelf: "flex-start" }} onClick={startAdd}>
-        + Add custom field
+        + Add child field to {entityLabel(entityTab)}
       </button>
 
       {fields.length === 0 ? (
         <p className="muted small">
-          No fields defined yet for {entityLabel(entityTab as ReferenceEntityType)}. Add fields above.
+          No fields defined yet for {entityLabel(entityTab)}. Add fields above.
         </p>
       ) : (
         <table className="table">

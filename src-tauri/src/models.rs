@@ -634,3 +634,30 @@ pub struct CombinedImportSummary {
     pub drivers: ReferenceImportSummary,
     pub vehicles: ReferenceImportSummary,
 }
+
+/// A parent entity of the reference database (Vehicles / Companies / Drivers
+/// plus any the admin adds, e.g. "Trailers"). Each parent owns its field
+/// definitions (children).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceEntity {
+    pub entity_type: String,
+    pub label: String,
+    /// True for the seeded pipeline entities (vehicle/company/driver) that the
+    /// gate, trips, and reports depend on — they can be renamed but not deleted.
+    pub is_core: bool,
+    pub sort_order: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One record of a non-core parent entity (stored as JSON in entity_records).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EntityRecordView {
+    pub id: String,
+    pub entity_type: String,
+    pub data: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}

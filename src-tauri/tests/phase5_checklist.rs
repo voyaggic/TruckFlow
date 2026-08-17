@@ -1223,3 +1223,70 @@ fn entity_labels_rename_and_are_persisted() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---------------------------------------------------------------------------
+// Parent entities — add a new parent, manage its records, delete it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parent_entity_add_record_export_and_delete_lifecycle() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    // Core parents are seeded and protected from deletion.
+    let entities = reference::list_reference_entities(ctx.state()).unwrap();
+    assert!(entities.iter().any(|e| e.entity_type == "vehicle" && e.is_core));
+    assert!(reference::delete_reference_entity(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        ADMIN_PASS.to_string()
+    )
+    .is_err(), "core entity deletion blocked");
+
+    // Add a brand-new parent, e.g. "Trailers".
+    let trailers = reference::create_reference_entity(ctx.state(), admin.id.clone(), "Trailers".into()).unwrap();
+    let entities = reference::list_reference_entities(ctx.state()).unwrap();
+    assert!(entities.iter().any(|e| e.entity_type == trailers.entity_type && !e.is_core));
+    assert!(
+        entities
+            .iter()
+            .any(|e| e.entity_type == trailers.entity_type && e.label == "Trailers"),
+        "new parent has its label"
+    );
+
+    // Give the new parent a child field and store a record in it.
+    reference::create_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        trailers.entity_type.clone(),
+        "plate".into(),
+        "Plate".into(),
+        "mixed".into(),
+        false,
+        Some(0),
+    )
+    .unwrap();
+    reference::create_entity_record(
+        ctx.state(),
+        admin.id.clone(),
+        trailers.entity_type.clone(),
+        serde_json::json!({ "plate": "TR-001" }),
+    )
+    .unwrap();
+    let recs = reference::list_entity_records(ctx.state(), trailers.entity_type.clone()).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].data["plate"], serde_json::json!("TR-001"));
+
+    // The combined export includes the new parent's sheet (name = label).
+    let temp = std::env::temp_dir().join(format!("tf-parent-export-{}.xlsx", uuid::Uuid::new_v4()));
+    let path = reference::reference_export_combined(ctx.state(), admin.id.clone(), Some(temp.to_str().unwrap().to_string())).unwrap();
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_file(&path);
+
+    // Delete the parent with the admin's password: records + fields + entity gone.
+    reference::delete_reference_entity(ctx.state(), admin.id.clone(), trailers.entity_type.clone(), ADMIN_PASS.to_string())
+        .expect("custom parent deletable");
+    let entities = reference::list_reference_entities(ctx.state()).unwrap();
+    assert!(!entities.iter().any(|e| e.entity_type == trailers.entity_type), "parent removed");
+}
+

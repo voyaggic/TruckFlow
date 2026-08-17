@@ -8,12 +8,12 @@ use tauri::State;
 
 use calamine::Reader as _; // worksheet_range_at
 
-use crate::commands::ensure_admin_permission;
+use crate::commands::{ensure_admin_permission, verify_actor_password};
 use crate::db::{append_audit, now_iso, AppState};
 use crate::models::{
-    ColumnInfo, CombinedImportSummary, CompanyView, DriverView, FieldDefinition,
-    ReferenceImportPreview, ReferenceImportRequest, ReferenceImportSummary, SheetPreview,
-    VehicleView,
+    ColumnInfo, CombinedImportSummary, CompanyView, DriverView, EntityRecordView, FieldDefinition,
+    ReferenceEntity, ReferenceImportPreview, ReferenceImportRequest, ReferenceImportSummary,
+    SheetPreview, VehicleView,
 };
 
 const REF_PERM: &str = "manage_reference_database";
@@ -563,15 +563,8 @@ fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
     })
 }
 
-#[tauri::command]
-pub fn list_field_definitions(
-    state: State<AppState>,
-    entity_type: String,
-) -> Result<Vec<FieldDefinition>, String> {
-    if !VALID_ENTITY_TYPES.contains(&entity_type.as_str()) {
-        return Err(format!("Invalid entity type '{entity_type}'. Must be one of: {}.", VALID_ENTITY_TYPES.join(", ")));
-    }
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+/// Read field definitions for any registered entity (core or admin-added).
+fn list_field_defs_raw(conn: &Connection, entity_type: &str) -> Result<Vec<FieldDefinition>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, binding, sort_order, created_at, updated_at
@@ -587,6 +580,18 @@ pub fn list_field_definitions(
 }
 
 #[tauri::command]
+pub fn list_field_definitions(
+    state: State<AppState>,
+    entity_type: String,
+) -> Result<Vec<FieldDefinition>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Invalid entity type '{entity_type}'."));
+    }
+    list_field_defs_raw(&conn, &entity_type)
+}
+
+#[tauri::command]
 pub fn create_field_definition(
     state: State<AppState>,
     actor_id: String,
@@ -597,9 +602,6 @@ pub fn create_field_definition(
     is_required: bool,
     sort_order: Option<i32>,
 ) -> Result<FieldDefinition, String> {
-    if !VALID_ENTITY_TYPES.contains(&entity_type.as_str()) {
-        return Err(format!("Invalid entity type '{entity_type}'. Must be one of: {}.", VALID_ENTITY_TYPES.join(", ")));
-    }
     if !VALID_FIELD_TYPES.contains(&field_type.as_str()) {
         return Err(format!("Invalid field type '{field_type}'. Must be one of: {}.", VALID_FIELD_TYPES.join(", ")));
     }
@@ -613,6 +615,9 @@ pub fn create_field_definition(
     }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Invalid entity type '{entity_type}'."));
+    }
     // Check unique per entity_type
     let dup: Option<String> = conn
         .query_row(
@@ -1293,7 +1298,9 @@ pub fn reference_import(
 }
 
 // ---------------------------------------------------------------------------
-// Entity display names (Vehicles / Companies / Drivers — user-editable)
+// Parent entities — the reference database's parents (Vehicles / Companies /
+// Drivers plus any the admin adds, e.g. "Trailers"). Labels, add/delete/rename
+// all live here and drive every screen through the shared context.
 // ---------------------------------------------------------------------------
 
 fn default_entity_label(entity_type: &str) -> &'static str {
@@ -1306,24 +1313,198 @@ fn default_entity_label(entity_type: &str) -> &'static str {
 
 fn entity_label(conn: &Connection, entity_type: &str) -> String {
     conn.query_row(
-        "SELECT label FROM entity_labels WHERE entity_type = ?1",
+        "SELECT label FROM reference_entities WHERE entity_type = ?1",
         params![entity_type],
         |r| r.get(0),
     )
     .unwrap_or_else(|_| default_entity_label(entity_type).to_string())
 }
 
+fn entity_exists(conn: &Connection, entity_type: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM reference_entities WHERE entity_type = ?1",
+        params![entity_type],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Every registered parent, core first then creation order.
+fn all_entities(conn: &Connection) -> Result<Vec<ReferenceEntity>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT entity_type, label, is_core, sort_order, created_at, updated_at
+             FROM reference_entities ORDER BY is_core DESC, sort_order, created_at",
+        )
+        .map_err(|e| format!("reference_entities list failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ReferenceEntity {
+                entity_type: r.get(0)?,
+                label: r.get(1)?,
+                is_core: r.get::<_, i32>(2)? != 0,
+                sort_order: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("reference_entities list failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("reference_entities read failed: {e}"))
+}
+
+#[tauri::command]
+pub fn list_reference_entities(state: State<AppState>) -> Result<Vec<ReferenceEntity>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    all_entities(&conn)
+}
+
+#[tauri::command]
+pub fn create_reference_entity(
+    state: State<AppState>,
+    actor_id: String,
+    label: String,
+) -> Result<ReferenceEntity, String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("The parent's display name is required.".to_string());
+    }
+    if label.len() > 40 {
+        return Err("Keep the display name under 40 characters.".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let entity_type = format!("custom_{}", uuid::Uuid::new_v4().simple());
+    let max_order: i32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM reference_entities",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("reference_entities order failed: {e}"))?;
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO reference_entities (entity_type, label, is_core, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+        params![entity_type, label, max_order + 1, now],
+    )
+    .map_err(|e| format!("reference_entities create failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "created_reference_entity",
+        Some(&entity_type),
+        Some(serde_json::json!({ "entity_type": entity_type, "label": label })),
+    )?;
+    Ok(ReferenceEntity {
+        entity_type,
+        label,
+        is_core: false,
+        sort_order: max_order + 1,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+pub fn rename_reference_entity(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    label: String,
+) -> Result<String, String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("The display name can't be empty.".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Unknown entity '{entity_type}'."));
+    }
+    conn.execute(
+        "UPDATE reference_entities SET label = ?1, updated_at = ?2 WHERE entity_type = ?3",
+        params![label, now_iso(), entity_type],
+    )
+    .map_err(|e| format!("reference_entities rename failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "renamed_reference_entity",
+        Some(&entity_type),
+        Some(serde_json::json!({ "entity_type": entity_type, "label": label })),
+    )?;
+    Ok(label)
+}
+
+/// Delete a parent and everything under it (its child fields and, for non-core
+/// parents, its records). Core pipeline entities (vehicle/company/driver) are
+/// protected — the gate, trips, and reports depend on them.
+#[tauri::command]
+pub fn delete_reference_entity(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    actor_credential: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let is_core: Option<i32> = conn
+        .query_row(
+            "SELECT is_core FROM reference_entities WHERE entity_type = ?1",
+            params![entity_type],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("reference_entities lookup failed: {e}"))?;
+    match is_core {
+        None => return Err(format!("Unknown entity '{entity_type}'.")),
+        Some(1) => {
+            return Err(format!(
+                "'{}' is a core entity the gate and trip pipeline depend on, so it can't be deleted. You can rename it, or delete any parent you added instead.",
+                entity_label(&conn, &entity_type)
+            ));
+        }
+        _ => {}
+    }
+    verify_actor_password(&conn, &actor_id, &actor_credential)
+        .map_err(|e| format!("Password check failed: {e}"))?;
+    conn.execute(
+        "DELETE FROM entity_records WHERE entity_type = ?1",
+        params![entity_type],
+    )
+    .map_err(|e| format!("entity_records delete failed: {e}"))?;
+    conn.execute(
+        "DELETE FROM field_definitions WHERE entity_type = ?1",
+        params![entity_type],
+    )
+    .map_err(|e| format!("field_definitions delete failed: {e}"))?;
+    conn.execute(
+        "DELETE FROM reference_entities WHERE entity_type = ?1",
+        params![entity_type],
+    )
+    .map_err(|e| format!("reference_entities delete failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "deleted_reference_entity",
+        Some(&entity_type),
+        Some(serde_json::json!({ "entity_type": entity_type })),
+    )?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn list_entity_labels(state: State<AppState>) -> Result<HashMap<String, String>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT entity_type, label FROM entity_labels")
-        .map_err(|e| format!("entity_labels list failed: {e}"))?;
+        .prepare("SELECT entity_type, label FROM reference_entities")
+        .map_err(|e| format!("reference_entities list failed: {e}"))?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| format!("entity_labels list failed: {e}"))?;
+        .map_err(|e| format!("reference_entities list failed: {e}"))?;
     rows.collect::<Result<HashMap<_, _>, _>>()
-        .map_err(|e| format!("entity_labels read failed: {e}"))
+        .map_err(|e| format!("reference_entities read failed: {e}"))
 }
 
 #[tauri::command]
@@ -1333,24 +1514,20 @@ pub fn set_entity_label(
     entity_type: String,
     label: String,
 ) -> Result<String, String> {
-    if !VALID_ENTITY_TYPES.contains(&entity_type.as_str()) {
-        return Err(format!(
-            "Invalid entity type '{entity_type}'. Must be one of: {}.",
-            VALID_ENTITY_TYPES.join(", ")
-        ));
-    }
     let label = label.trim().to_string();
     if label.is_empty() {
         return Err("Display name is required.".to_string());
     }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Unknown entity '{entity_type}'."));
+    }
     conn.execute(
-        "INSERT INTO entity_labels (entity_type, label, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(entity_type) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at",
-        params![entity_type, label, now_iso()],
+        "UPDATE reference_entities SET label = ?1, updated_at = ?2 WHERE entity_type = ?3",
+        params![label, now_iso(), entity_type],
     )
-    .map_err(|e| format!("entity_labels update failed: {e}"))?;
+    .map_err(|e| format!("reference_entities update failed: {e}"))?;
     append_audit(
         &conn,
         &actor_id,
@@ -1359,6 +1536,193 @@ pub fn set_entity_label(
         Some(serde_json::json!({ "entity_type": entity_type, "label": label })),
     )?;
     Ok(label)
+}
+
+// ---------------------------------------------------------------------------
+// Generic records for non-core parent entities (e.g. Trailers, Fuel Cards)
+// ---------------------------------------------------------------------------
+
+/// Look up a record row for any parent entity. Returns (id, data_json).
+fn record_row(conn: &Connection, entity_type: &str, id: &str) -> Result<(String, String), String> {
+    conn.query_row(
+        "SELECT id, data FROM entity_records WHERE entity_type = ?1 AND id = ?2",
+        params![entity_type, id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(|e| format!("entity_records lookup failed: {e}"))
+}
+
+fn list_entity_records_inner(conn: &Connection, entity_type: &str) -> Result<Vec<EntityRecordView>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, entity_type, data, created_at, updated_at FROM entity_records WHERE entity_type = ?1 ORDER BY created_at")
+        .map_err(|e| format!("entity_records list failed: {e}"))?;
+    let rows = stmt
+        .query_map(params![entity_type], |r| {
+            Ok(EntityRecordView {
+                id: r.get(0)?,
+                entity_type: r.get(1)?,
+                data: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or(serde_json::Value::Null),
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| format!("entity_records list failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("entity_records read failed: {e}"))
+}
+
+#[tauri::command]
+pub fn list_entity_records(state: State<AppState>, entity_type: String) -> Result<Vec<EntityRecordView>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Unknown entity '{entity_type}'."));
+    }
+    list_entity_records_inner(&conn, &entity_type)
+}
+
+fn validate_record_data(conn: &Connection, entity_type: &str, data: &serde_json::Value) -> Result<(), String> {
+    let obj = data
+        .as_object()
+        .ok_or_else(|| "Record data must be an object.".to_string())?;
+    let defs = list_field_defs_raw(conn, entity_type)?;
+    for fd in &defs {
+        if fd.is_required && fd.is_hidden == false {
+            let v = obj.get(&fd.field_key);
+            let empty = match v {
+                None => true,
+                Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+                _ => false,
+            };
+            if empty {
+                return Err(format!("'{}' is required. Fill it in and try again.", fd.field_label));
+            }
+        }
+        if let Some(v) = obj.get(&fd.field_key) {
+            if fd.field_type == "number" && !v.is_null() {
+                if let Some(s) = v.as_str() {
+                    if !s.trim().is_empty() && s.parse::<f64>().is_err() {
+                        return Err(format!(
+                            "'{}' must be a number (e.g. 42), got '{}'. Correct the value and try again.",
+                            fd.field_label, s
+                        ));
+                    }
+                }
+            }
+            if fd.field_type == "boolean" && !v.is_null() {
+                if let Some(s) = v.as_str() {
+                    let low = s.trim().to_lowercase();
+                    if !low.is_empty() && !["true", "false", "yes", "no", "y", "n", "0", "1"].contains(&low.as_str()) {
+                        return Err(format!(
+                            "'{}' must be Yes or No, got '{}'. Correct the value and try again.",
+                            fd.field_label, s
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_entity_record(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    data: serde_json::Value,
+) -> Result<EntityRecordView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Unknown entity '{entity_type}'."));
+    }
+    validate_record_data(&conn, &entity_type, &data)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO entity_records (id, entity_type, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![id, entity_type, data.to_string(), now],
+    )
+    .map_err(|e| format!("entity_records create failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "created_entity_record",
+        Some(&id),
+        Some(serde_json::json!({ "entity_type": entity_type })),
+    )?;
+    Ok(EntityRecordView {
+        id,
+        entity_type,
+        data,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+#[tauri::command]
+pub fn update_entity_record(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    record_id: String,
+    data: serde_json::Value,
+) -> Result<EntityRecordView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    if !entity_exists(&conn, &entity_type) {
+        return Err(format!("Unknown entity '{entity_type}'."));
+    }
+    validate_record_data(&conn, &entity_type, &data)?;
+    let (_, _) = record_row(&conn, &entity_type, &record_id)?;
+    conn.execute(
+        "UPDATE entity_records SET data = ?1, updated_at = ?2 WHERE id = ?3 AND entity_type = ?4",
+        params![data.to_string(), now_iso(), record_id, entity_type],
+    )
+    .map_err(|e| format!("entity_records update failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "updated_entity_record",
+        Some(&record_id),
+        Some(serde_json::json!({ "entity_type": entity_type })),
+    )?;
+    Ok(EntityRecordView {
+        id: record_id,
+        entity_type,
+        data,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    })
+}
+
+#[tauri::command]
+pub fn delete_entity_record(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    record_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let n = conn
+        .execute(
+            "DELETE FROM entity_records WHERE id = ?1 AND entity_type = ?2",
+            params![record_id, entity_type],
+        )
+        .map_err(|e| format!("entity_records delete failed: {e}"))?;
+    if n == 0 {
+        return Err("Record not found.".to_string());
+    }
+    append_audit(
+        &conn,
+        &actor_id,
+        "deleted_entity_record",
+        Some(&record_id),
+        Some(serde_json::json!({ "entity_type": entity_type })),
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,7 +1853,8 @@ pub fn reference_export_combined(
         std::fs::create_dir_all(parent).map_err(|e| format!("export dir create failed: {e}"))?;
     }
     let mut workbook = rust_xlsxwriter::Workbook::new();
-    for entity_type in ["company", "driver", "vehicle"] {
+    for entity in all_entities(&conn)? {
+        let entity_type = &entity.entity_type;
         let fields = visible_fields(&conn, entity_type)?;
         if fields.is_empty() {
             continue;
@@ -1498,7 +1863,18 @@ pub fn reference_export_combined(
             .iter()
             .map(|(key, _)| field_label(&conn, entity_type, key).unwrap_or_else(|| key.clone()))
             .collect();
-        let rows = entity_row_maps(&conn, entity_type)?;
+        let rows = if entity.is_core {
+            entity_row_maps(&conn, entity_type)?
+        } else {
+            // Admin-added parents: records are JSON blobs in entity_records.
+            let mut out = Vec::new();
+            for rec in list_entity_records_inner(&conn, entity_type)? {
+                if let Some(obj) = rec.data.as_object() {
+                    out.push(obj.clone());
+                }
+            }
+            out
+        };
         let worksheet = workbook.add_worksheet();
         worksheet
             .set_name(entity_label(&conn, entity_type))
@@ -1821,8 +2197,9 @@ fn apply_import_row_combined(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    let is_core_entity = matches!(entity_type, "company" | "driver" | "vehicle");
     let status = get("status").unwrap_or_else(|| "active".to_string());
-    if status != "active" && status != "inactive" {
+    if is_core_entity && status != "active" && status != "inactive" {
         return Err(format!(
             "Invalid status '{status}'. Fix: the status column must contain only 'active' or 'inactive' — correct the value in the spreadsheet and import again."
         ));
@@ -1906,7 +2283,7 @@ fn apply_import_row_combined(
                 }
             }
         }
-        _ => {
+        "vehicle" => {
             let plate = normalize_plate(&get("plate_number").ok_or_else(|| {
                 "Plate number is required. Fix: every row needs a value in the plate column (or map the right column to it in the mapping screen)."
                     .to_string()
@@ -1956,6 +2333,48 @@ fn apply_import_row_combined(
                     )
                     .map_err(|e| format!("vehicle create failed: {e}"))?;
                     append_audit(conn, actor_id, "created_vehicle", Some(&id), Some(serde_json::json!({ "plate_number": plate })))?;
+                    Ok(true)
+                }
+            }
+        }
+        // Admin-added parents: store the row's values as a JSON record.
+        _ => {
+            let mut data = serde_json::Map::new();
+            for key in cols.keys() {
+                if let Some(v) = get(key) {
+                    data.insert(key.clone(), serde_json::Value::String(v));
+                }
+            }
+            if data.is_empty() {
+                return Err("Row has no values to import.".to_string());
+            }
+            let data_str = serde_json::Value::Object(data.clone()).to_string();
+            // Treat an identical existing record as an update (round-trip safe).
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM entity_records WHERE entity_type = ?1 AND data = ?2",
+                    params![entity_type, data_str],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match existing {
+                Some(id) => {
+                    conn.execute(
+                        "UPDATE entity_records SET data = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![data_str, now_iso(), id],
+                    )
+                    .map_err(|e| format!("entity_records update failed: {e}"))?;
+                    Ok(false)
+                }
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO entity_records (id, entity_type, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                        params![id, entity_type, data_str, now_iso()],
+                    )
+                    .map_err(|e| format!("entity_records create failed: {e}"))?;
+                    append_audit(conn, actor_id, "created_entity_record", Some(&id), Some(serde_json::json!({ "entity_type": entity_type })))?;
                     Ok(true)
                 }
             }
@@ -2050,10 +2469,10 @@ pub fn reference_import_combined(
         if rows.is_empty() {
             continue;
         }
-        if !VALID_ENTITY_TYPES.contains(&sheet.entity_type.as_str()) {
+        if !entity_exists(&conn, &sheet.entity_type) {
             summary_for(&mut summary, &sheet.entity_type)
                 .errors
-                .push(format!("{}: invalid entity type '{}'", sheet.sheet_name, sheet.entity_type));
+                .push(format!("{}: unknown entity '{}' — create the parent first in Fields, then import again.", sheet.sheet_name, sheet.entity_type));
             continue;
         }
         // Resolve column mappings → field_key → column index; create new fields.

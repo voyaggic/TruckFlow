@@ -35,8 +35,10 @@ import type {
   ReferenceFileFormat,
   ReferenceImportSummary,
   CombinedImportSummary,
+  ReferenceEntity,
   ReferenceImportPreview,
   ReferenceImportRequest,
+  EntityRecordView,
   SheetsStateView,
   SyncRunResult,
   SyncStatusView,
@@ -284,6 +286,33 @@ export const api = {
 
   setEntityLabel: (actorId: string, entityType: string, label: string) =>
     invoke<string>("set_entity_label", { actorId, entityType, label }),
+
+  // --- Parent entities (the reference database's parents, incl. admin-added) ---
+
+  listReferenceEntities: () => invoke<ReferenceEntity[]>("list_reference_entities"),
+
+  createReferenceEntity: (actorId: string, label: string) =>
+    invoke<ReferenceEntity>("create_reference_entity", { actorId, label }),
+
+  renameReferenceEntity: (actorId: string, entityType: string, label: string) =>
+    invoke<string>("rename_reference_entity", { actorId, entityType, label }),
+
+  deleteReferenceEntity: (actorId: string, entityType: string, actorCredential: string) =>
+    invoke<void>("delete_reference_entity", { actorId, entityType, actorCredential }),
+
+  // --- Records for non-core parent entities ---
+
+  listEntityRecords: (entityType: string) =>
+    invoke<EntityRecordView[]>("list_entity_records", { entityType }),
+
+  createEntityRecord: (actorId: string, entityType: string, data: Record<string, unknown>) =>
+    invoke<EntityRecordView>("create_entity_record", { actorId, entityType, data }),
+
+  updateEntityRecord: (actorId: string, entityType: string, recordId: string, data: Record<string, unknown>) =>
+    invoke<EntityRecordView>("update_entity_record", { actorId, entityType, recordId, data }),
+
+  deleteEntityRecord: (actorId: string, entityType: string, recordId: string) =>
+    invoke<void>("delete_entity_record", { actorId, entityType, recordId }),
 
   // --- Combined reference database import/export (single file, all entities) ---
   referenceExportCombined: (actorId: string, targetPath?: string) =>

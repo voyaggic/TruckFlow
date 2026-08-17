@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
@@ -594,6 +594,63 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migration 17 seed failed: {e}"))?;
         }
         conn.execute_batch("PRAGMA user_version = 17;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    if current < 18 {
+        // Parents become dynamic: the three built-in entities (vehicle / company /
+        // driver) plus any the admin adds (e.g. "Trailers"). Each parent owns its
+        // field definitions (children). New parents store their records in the
+        // generic entity_records table; the built-ins keep their dedicated tables.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS reference_entities (
+                entity_type TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                is_core INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_records (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_records_type ON entity_records(entity_type);
+            "#,
+        )
+        .map_err(|e| format!("migration 18 failed: {e}"))?;
+        let now = now_iso();
+        for (i, (et, label)) in [("vehicle", "Vehicles"), ("company", "Companies"), ("driver", "Drivers")]
+            .iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO reference_entities (entity_type, label, is_core, sort_order, created_at, updated_at) VALUES (?1, ?2, 1, ?3, ?4, ?4)",
+                params![et, label, i as i32, now],
+            )
+            .map_err(|e| format!("migration 18 seed failed: {e}"))?;
+            // Carry over any user-renamed label from entity_labels (migration 17).
+            let renamed: Option<String> = conn
+                .query_row(
+                    "SELECT label FROM entity_labels WHERE entity_type = ?1",
+                    params![et],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("migration 18 label carry failed: {e}"))?;
+            if let Some(lbl) = renamed {
+                conn.execute(
+                    "UPDATE reference_entities SET label = ?1 WHERE entity_type = ?2",
+                    params![lbl, et],
+                )
+                .map_err(|e| format!("migration 18 label update failed: {e}"))?;
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 18;")
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
