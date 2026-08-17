@@ -1068,3 +1068,130 @@ fn combined_export_then_import_round_trips_all_entities() {
         "vehicle custom field preserved"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Whole-record delete (vehicles / companies / drivers)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Field key rename migrates stored custom-field data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renaming_custom_field_key_migrates_extra_fields() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    let company = reference::create_company(
+        ctx.state(),
+        admin.id.clone(),
+        "Acme Waste".into(),
+        Some(r#"{"region":"North"}"#.into()),
+    )
+    .unwrap();
+    let fd = reference::create_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        "company".into(),
+        "region".into(),
+        "Region".into(),
+        "text".into(),
+        false,
+        None,
+    )
+    .expect("create region field");
+
+    // Rename the key: the stored value must follow from "region" → "area".
+    reference::update_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        fd.id.clone(),
+        Some("area".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("rename field key");
+
+    let fields = reference::list_field_definitions(ctx.state(), "company".into()).unwrap();
+    let renamed = fields.iter().find(|f| f.id == fd.id).expect("field still present");
+    assert_eq!(renamed.field_key, "area", "key updated");
+    assert_eq!(renamed.binding, None, "custom fields have no binding");
+
+    let companies = reference::list_companies(ctx.state(), None).unwrap();
+    let acme = companies.iter().find(|c| c.name == "Acme Waste").unwrap();
+    assert_eq!(
+        acme.extra_fields.as_ref().and_then(|m| m.get("area")).and_then(|v| v.as_str()),
+        Some("North"),
+        "value migrated to the new key"
+    );
+    assert!(
+        acme.extra_fields.as_ref().map(|m| m.get("region").is_none()).unwrap_or(true),
+        "old key removed"
+    );
+}
+
+#[test]
+fn delete_company_and_vehicle_remove_records_and_unlink() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
+    let vehicle = reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "DL 4G 8834".into(),
+        Some(company.id.clone()),
+        Some(20.0),
+        "litres".into(),
+        Some(driver.id.clone()),
+        None,
+    )
+    .unwrap();
+
+    // Deleting the vehicle removes it from the list.
+    reference::delete_vehicle(ctx.state(), admin.id.clone(), vehicle.id.clone()).expect("delete vehicle");
+    let vehicles = reference::list_vehicles(ctx.state(), None).unwrap();
+    assert!(!vehicles.iter().any(|v| v.id == vehicle.id), "vehicle gone");
+
+    // Deleting the company unlinks remaining vehicles (none here) and removes it.
+    reference::delete_company(ctx.state(), admin.id.clone(), company.id.clone()).expect("delete company");
+    let companies = reference::list_companies(ctx.state(), None).unwrap();
+    assert!(!companies.iter().any(|c| c.id == company.id), "company gone");
+
+    // Driver still exists; deleting it removes it too.
+    reference::delete_driver(ctx.state(), admin.id.clone(), driver.id.clone()).expect("delete driver");
+    let drivers = reference::list_drivers(ctx.state(), None).unwrap();
+    assert!(!drivers.iter().any(|d| d.id == driver.id), "driver gone");
+
+    // Deleting a missing record is an error, not a silent no-op.
+    assert!(reference::delete_vehicle(ctx.state(), admin.id.clone(), vehicle.id.clone()).is_err());
+}
+
+#[test]
+fn deleting_company_unlinks_vehicles_but_keeps_them() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Acme Waste".into(), None).unwrap();
+    let vehicle = reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "DL 4G 8834".into(),
+        Some(company.id.clone()),
+        Some(20.0),
+        "litres".into(),
+        None,
+        None,
+    )
+    .unwrap();
+
+    reference::delete_company(ctx.state(), admin.id.clone(), company.id.clone()).expect("delete company");
+    let vehicles = reference::list_vehicles(ctx.state(), None).unwrap();
+    let v = vehicles.iter().find(|v| v.id == vehicle.id).expect("vehicle kept");
+    assert_eq!(v.company_id, None, "company unlinked from vehicle");
+}
+

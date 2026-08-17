@@ -530,6 +530,10 @@ pub struct FieldDefinition {
     /// Hidden fields are excluded from forms, import, and export. Standard
     /// fields are hidden (never hard-deleted) because they back real columns.
     pub is_hidden: bool,
+    /// For standard fields: the fixed internal column binding (e.g.
+    /// "plate_number"). The user-editable `field_key` may differ from it.
+    /// Custom fields have binding = None.
+    pub binding: Option<String>,
     pub sort_order: i32,
     pub created_at: String,
     pub updated_at: String,

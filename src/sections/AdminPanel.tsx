@@ -17,7 +17,6 @@ import type {
   ReferenceEntityType,
   ReferenceImportPreview,
   ReferenceImportRequest,
-  ReferenceImportSummary,
   RolePresetView,
   SessionUser,
   SheetPreview,
@@ -1141,22 +1140,6 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
     }
   };
 
-  const exportTo = async (entityType: ReferenceEntityType, label: string, format: "csv" | "xlsx") => {
-    setError(null);
-    try {
-      const filePath = await save({
-        defaultPath: `truckflow-${label}-${new Date().toISOString().slice(0, 10)}.${format}`,
-        filters: [{ name: format === "csv" ? "CSV" : "Excel Workbook", extensions: [format] }],
-      });
-      if (!filePath) return; // cancelled
-      const path = await api.referenceExport(actor.id, entityType, format, filePath);
-      onNotice(`${label[0].toUpperCase()}${label.slice(1)} exported to ${path}`);
-      setTimeout(() => onNotice(""), 5000);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
   const exportAll = async () => {
     setError(null);
     try {
@@ -1192,34 +1175,6 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
     }
   };
 
-  const importFrom = async (entityType: ReferenceEntityType, label: string) => {
-    setError(null);
-    try {
-      const picked = await open({
-        multiple: false,
-        directory: false,
-        filters: [{ name: "CSV or Excel", extensions: ["csv", "xlsx"] }],
-      });
-      if (typeof picked !== "string") return; // cancelled
-      const summary: ReferenceImportSummary = await api.referenceImport(actor.id, entityType, picked);
-      const parts = [
-        `${summary.created} created`,
-        `${summary.updated} updated`,
-        `${summary.skipped} skipped`,
-      ];
-      const msg = `${label[0].toUpperCase()}${label.slice(1)} import: ${parts.join(", ")}`;
-      if (summary.errors.length) {
-        setError(`${msg}. Errors:\n${summary.errors.slice(0, 8).join("\n")}`);
-      } else {
-        onNotice(msg);
-        setTimeout(() => onNotice(""), 6000);
-      }
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
   const q = search.trim().toLowerCase();
   const vq = vehicles.filter(
     (v) => !q || v.plate_number.toLowerCase().includes(q) || (v.company_name ?? "").toLowerCase().includes(q),
@@ -1251,28 +1206,13 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
 
       {error && <div className="error-banner">{error}</div>}
 
-      <div className="row between" style={{ flexWrap: "wrap", gap: 8 }}>
-        <div className="seg" style={{ flexWrap: "wrap" }}>
-          <button className="primary" onClick={exportAll}>
-            ⬇ Export all (one Excel file)
-          </button>
-          <button className="primary" onClick={startImport} disabled={importBusy}>
-            ⬆ Import spreadsheet…
-          </button>
-        </div>
-      </div>
       <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
-        <div className="seg" style={{ flexWrap: "wrap" }}>
-          <button onClick={() => exportTo("company", "companies", "csv")}>Export companies CSV</button>
-          <button onClick={() => exportTo("company", "companies", "xlsx")}>Export companies XLSX</button>
-          <button onClick={() => importFrom("company", "companies")}>Import companies</button>
-          <button onClick={() => exportTo("driver", "drivers", "csv")}>Export drivers CSV</button>
-          <button onClick={() => exportTo("driver", "drivers", "xlsx")}>Export drivers XLSX</button>
-          <button onClick={() => importFrom("driver", "drivers")}>Import drivers</button>
-          <button onClick={() => exportTo("vehicle", "vehicles", "csv")}>Export vehicles CSV</button>
-          <button onClick={() => exportTo("vehicle", "vehicles", "xlsx")}>Export vehicles XLSX</button>
-          <button onClick={() => importFrom("vehicle", "vehicles")}>Import vehicles</button>
-        </div>
+        <button className="primary" onClick={exportAll}>
+          ⬇ Export all (one Excel file)
+        </button>
+        <button className="primary" onClick={startImport} disabled={importBusy}>
+          ⬆ Import spreadsheet…
+        </button>
       </div>
 
       {tab !== "fields" && (
@@ -1306,6 +1246,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           onStatus={(id, status) =>
             run(() => api.setVehicleStatus(actor.id, id, status), status === "inactive" ? "Vehicle deactivated." : "Vehicle reactivated.")
           }
+          onDelete={(id) => run(() => api.deleteVehicle(actor.id, id), "Vehicle deleted.")}
         />
       )}
       {tab === "companies" && (
@@ -1322,6 +1263,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           onStatus={(id, status) =>
             run(() => api.setCompanyStatus(actor.id, id, status), status === "inactive" ? "Company deactivated." : "Company reactivated.")
           }
+          onDelete={(id) => run(() => api.deleteCompany(actor.id, id), "Company deleted.")}
         />
       )}
       {tab === "drivers" && (
@@ -1338,6 +1280,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           onStatus={(id, status) =>
             run(() => api.setDriverStatus(actor.id, id, status), status === "inactive" ? "Driver deactivated." : "Driver reactivated.")
           }
+          onDelete={(id) => run(() => api.deleteDriver(actor.id, id), "Driver deleted.")}
         />
       )}
       {tab === "fields" && (
@@ -1397,32 +1340,15 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
   mixed: "Mixed",
 };
 
-/** Standard field keys the backend understands per entity. */
-const STANDARD_KEYS: Record<ReferenceEntityType, { key: string; label: string }[]> = {
-  vehicle: [
-    { key: "plate_number", label: "Plate number" },
-    { key: "company", label: "Company" },
-    { key: "driver", label: "Driver" },
-    { key: "registered_capacity", label: "Registered capacity" },
-    { key: "capacity_unit", label: "Capacity unit" },
-    { key: "status", label: "Status" },
-  ],
-  company: [
-    { key: "name", label: "Name" },
-    { key: "status", label: "Status" },
-  ],
-  driver: [
-    { key: "name", label: "Name" },
-    { key: "status", label: "Status" },
-  ],
-};
+/** The mapping value for a field: its fixed binding (standard) or its key (custom). */
+function fieldMappingValue(f: FieldDefinition): string {
+  return f.is_standard ? f.binding ?? f.field_key : f.field_key;
+}
 
-function defaultMappingFor(entity: ReferenceEntityType, col: ColumnInfo, fields: FieldDefinition[]): ColConfig {
-  const valid = new Set([...STANDARD_KEYS[entity].map((s) => s.key), ...fields.filter((f) => !f.is_hidden).map((f) => f.field_key)]);
+function defaultMappingFor(col: ColumnInfo, fields: FieldDefinition[]): ColConfig {
+  const valid = new Set(fields.filter((f) => !f.is_hidden).map(fieldMappingValue));
   let mapping: string;
-  if (col.kind === "standard" && valid.has(col.field_key)) {
-    mapping = col.field_key;
-  } else if (col.kind === "existing_custom" && valid.has(col.field_key)) {
+  if ((col.kind === "standard" || col.kind === "existing_custom") && valid.has(col.field_key)) {
     mapping = col.field_key;
   } else {
     mapping = "new";
@@ -1456,7 +1382,7 @@ function ImportWizard({
       const entity = resolveEntity(s.entity_type);
       return {
         entity,
-        columns: Object.fromEntries(s.columns.map((c) => [c.header, defaultMappingFor(entity, c, fields[entity])])),
+        columns: Object.fromEntries(s.columns.map((c) => [c.header, defaultMappingFor(c, fields[entity])])),
       };
     }),
   );
@@ -1478,7 +1404,7 @@ function ImportWizard({
           ? {
               entity,
               columns: Object.fromEntries(
-                sheet.columns.map((col) => [col.header, defaultMappingFor(entity, col, fields[entity])]),
+                sheet.columns.map((col) => [col.header, defaultMappingFor(col, fields[entity])]),
               ),
             }
           : c,
@@ -1537,10 +1463,13 @@ function ImportWizard({
 
       {preview.sheets.map((sheet, si) => {
         const cfg = configs[si];
-        const customKeys = fields[cfg.entity].filter((f) => !f.is_hidden).map((f) => f.field_key);
         const options = [
-          ...STANDARD_KEYS[cfg.entity].filter((s) => !customKeys.includes(s.key)).map((s) => ({ value: s.key, label: `${s.label} (standard)` })),
-          ...fields[cfg.entity].filter((f) => !f.is_hidden && !STANDARD_KEYS[cfg.entity].some((s) => s.key === f.field_key)).map((f) => ({ value: f.field_key, label: `${f.field_label} (existing field)` })),
+          ...fields[cfg.entity]
+            .filter((f) => !f.is_hidden)
+            .map((f) => ({
+              value: fieldMappingValue(f),
+              label: `${f.field_label}${f.is_standard ? " (standard)" : " (existing field)"}`,
+            })),
           { value: "new", label: "＋ Create new field…" },
           { value: "ignore", label: "✕ Ignore (don't import)" },
         ];
@@ -1664,6 +1593,7 @@ function VehicleTable({
   canRegister,
   onSave,
   onStatus,
+  onDelete,
 }: {
   vehicles: VehicleView[];
   companies: CompanyView[];
@@ -1673,6 +1603,7 @@ function VehicleTable({
   canRegister: boolean;
   onSave: (v: VehicleDraft, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
+  onDelete: (id: string) => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1737,7 +1668,7 @@ function VehicleTable({
   const visibleDefs = fieldDefs.filter((fd) => !fd.is_hidden);
   const stdDefs = visibleDefs.filter((fd) => fd.is_standard);
   const customDefs = visibleDefs.filter((fd) => !fd.is_standard);
-  const showUnit = stdDefs.some((fd) => fd.field_key === "capacity_unit");
+  const showUnit = stdDefs.some((fd) => fd.binding === "capacity_unit");
 
   return (
     <div className="stack">
@@ -1749,7 +1680,7 @@ function VehicleTable({
           <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
             {stdDefs.map((fd) => {
               const req = fd.is_required ? <span style={{ color: "var(--danger, #d32f2f)" }}> *</span> : null;
-              if (fd.field_key === "plate_number") {
+              if (fd.binding === "plate_number") {
                 return (
                   <div key={fd.id} className="field" style={{ margin: 0 }}>
                     <label>{fd.field_label}{req}</label>
@@ -1757,7 +1688,7 @@ function VehicleTable({
                   </div>
                 );
               }
-              if (fd.field_key === "company") {
+              if (fd.binding === "company") {
                 return (
                   <div key={fd.id} className="field" style={{ margin: 0 }}>
                     <label>{fd.field_label}{req}</label>
@@ -1774,7 +1705,7 @@ function VehicleTable({
                   </div>
                 );
               }
-              if (fd.field_key === "driver") {
+              if (fd.binding === "driver") {
                 return (
                   <div key={fd.id} className="field" style={{ margin: 0 }}>
                     <label>{fd.field_label}{req}</label>
@@ -1791,7 +1722,7 @@ function VehicleTable({
                   </div>
                 );
               }
-              if (fd.field_key === "registered_capacity") {
+              if (fd.binding === "registered_capacity") {
                 return (
                   <div key={fd.id} className="field" style={{ margin: 0 }}>
                     <label>{fd.field_label}{req}</label>
@@ -1819,22 +1750,18 @@ function VehicleTable({
                   </div>
                 );
               }
-              if (fd.field_key === "capacity_unit") return null; // rendered inside the capacity row
+              if (fd.binding === "capacity_unit") return null; // rendered inside the capacity row
               return null;
             })}
+            {customDefs.map((fd) => (
+              <DynamicFieldInput
+                key={fd.id}
+                fd={fd}
+                value={extraFields[fd.field_key]}
+                onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })}
+              />
+            ))}
           </div>
-          {customDefs.length > 0 && (
-            <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {customDefs.map((fd) => (
-                <DynamicFieldInput
-                  key={fd.id}
-                  fd={fd}
-                  value={extraFields[fd.field_key]}
-                  onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })}
-                />
-              ))}
-            </div>
-          )}
           <div className="row">
             <button className="primary" onClick={submit} disabled={!plate.trim()}>
               {editingId ? "Save changes" : "Register vehicle"}
@@ -1900,6 +1827,17 @@ function VehicleTable({
                     >
                       {v.status === "active" ? "Deactivate" : "Reactivate"}
                     </button>
+                    <button
+                      className="danger small"
+                      onClick={() => {
+                        const ok = window.confirm(
+                          `Delete vehicle ${v.plate_number} permanently?\n\nThis removes the vehicle from the reference database. Past trips are kept but no longer linked to it. This cannot be undone.`,
+                        );
+                        if (ok) onDelete(v.id);
+                      }}
+                    >
+                      Delete
+                    </button>
                   </div>
                 </td>
               </tr>
@@ -1921,12 +1859,14 @@ function CompanyTable({
   canRegister,
   onSave,
   onStatus,
+  onDelete,
 }: {
   companies: CompanyView[];
   fieldDefs: FieldDefinition[];
   canRegister: boolean;
   onSave: (name: string, extraFields: Record<string, unknown>, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
+  onDelete: (id: string) => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1956,7 +1896,7 @@ function CompanyTable({
   };
 
   const customDefs = fieldDefs.filter((fd) => !fd.is_hidden && !fd.is_standard);
-  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.field_key === "name" && !fd.is_hidden);
+  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.binding === "name" && !fd.is_hidden);
 
   return (
     <div className="stack">
@@ -1968,8 +1908,8 @@ function CompanyTable({
 
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
-          <div className="row">
-            <div className="field" style={{ margin: 0, flex: 1, maxWidth: 300 }}>
+          <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
+            <div className="field" style={{ margin: 0, maxWidth: 300 }}>
               {nameDef && (
                 <label>
                   {nameDef.field_label}
@@ -1978,14 +1918,10 @@ function CompanyTable({
               )}
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder={nameDef?.field_label ?? "Company name"} />
             </div>
+            {customDefs.map((fd) => (
+              <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
+            ))}
           </div>
-          {customDefs.length > 0 && (
-            <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {customDefs.map((fd) => (
-                <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
-              ))}
-            </div>
-          )}
           <div className="row">
             <button className="primary" onClick={submit} disabled={!name.trim()}>
               {editingId ? "Save" : "Add"}
@@ -2036,6 +1972,17 @@ function CompanyTable({
                     >
                       {c.status === "active" ? "Deactivate" : "Reactivate"}
                     </button>
+                    <button
+                      className="danger small"
+                      onClick={() => {
+                        const ok = window.confirm(
+                          `Delete company "${c.name}" permanently?\n\nVehicles linked to it will keep their history but be unlinked. This cannot be undone.`,
+                        );
+                        if (ok) onDelete(c.id);
+                      }}
+                    >
+                      Delete
+                    </button>
                   </div>
                 </td>
               </tr>
@@ -2053,12 +2000,14 @@ function DriverTable({
   canRegister,
   onSave,
   onStatus,
+  onDelete,
 }: {
   drivers: DriverView[];
   fieldDefs: FieldDefinition[];
   canRegister: boolean;
   onSave: (name: string, extraFields: Record<string, unknown>, id: string | null) => void;
   onStatus: (id: string, status: "active" | "inactive") => void;
+  onDelete: (id: string) => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -2088,7 +2037,7 @@ function DriverTable({
   };
 
   const customDefs = fieldDefs.filter((fd) => !fd.is_hidden && !fd.is_standard);
-  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.field_key === "name" && !fd.is_hidden);
+  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.binding === "name" && !fd.is_hidden);
 
   return (
     <div className="stack">
@@ -2100,8 +2049,8 @@ function DriverTable({
 
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
-          <div className="row">
-            <div className="field" style={{ margin: 0, flex: 1, maxWidth: 300 }}>
+          <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
+            <div className="field" style={{ margin: 0, maxWidth: 300 }}>
               {nameDef && (
                 <label>
                   {nameDef.field_label}
@@ -2110,14 +2059,10 @@ function DriverTable({
               )}
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder={nameDef?.field_label ?? "Driver name"} />
             </div>
+            {customDefs.map((fd) => (
+              <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
+            ))}
           </div>
-          {customDefs.length > 0 && (
-            <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {customDefs.map((fd) => (
-                <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
-              ))}
-            </div>
-          )}
           <div className="row">
             <button className="primary" onClick={submit} disabled={!name.trim()}>
               {editingId ? "Save" : "Add"}
@@ -2167,6 +2112,17 @@ function DriverTable({
                       }}
                     >
                       {d.status === "active" ? "Deactivate" : "Reactivate"}
+                    </button>
+                    <button
+                      className="danger small"
+                      onClick={() => {
+                        const ok = window.confirm(
+                          `Delete driver "${d.name}" permanently?\n\nVehicles using them as default driver will be unlinked. This cannot be undone.`,
+                        );
+                        if (ok) onDelete(d.id);
+                      }}
+                    >
+                      Delete
                     </button>
                   </div>
                 </td>
@@ -2271,7 +2227,6 @@ function FieldManager({
   const [newLabel, setNewLabel] = useState("");
   const [newType, setNewType] = useState("text");
   const [newRequired, setNewRequired] = useState(false);
-  const [showHidden, setShowHidden] = useState(false);
 
   const refreshFields = useCallback(async () => {
     try {
@@ -2340,6 +2295,7 @@ function FieldManager({
     }
     try {
       await api.updateFieldDefinition(actor.id, editingId, {
+        field_key: newKey.trim(),
         field_label: newLabel.trim(),
         field_type: newType as FieldDefinition["field_type"],
         is_required: newRequired,
@@ -2355,28 +2311,14 @@ function FieldManager({
   };
 
   const deleteField = async (fd: FieldDefinition) => {
-    const msg = fd.is_standard
-      ? `Remove the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]}?\n\nStandard fields are hidden, not deleted — your existing records and history are untouched. You can restore it later.`
-      : `Delete the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]}?\n\nExisting data in this field will be kept in the records but the field will no longer appear in the forms.`;
-    const ok = window.confirm(msg);
+    const ok = window.confirm(
+      `Delete the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]} permanently?\n\nIt disappears from the registration forms and from import/export. Your existing records keep their data — only the field definition is removed. This cannot be undone.`,
+    );
     if (!ok) return;
     setError(null);
     try {
       await api.deleteFieldDefinition(actor.id, fd.id);
-      onNotice(`Field "${fd.field_label}" ${fd.is_standard ? "hidden" : "removed"}.`);
-      setTimeout(() => onNotice(""), 4000);
-      await refreshFields();
-      onChanged();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  const restoreField = async (fd: FieldDefinition) => {
-    setError(null);
-    try {
-      await api.updateFieldDefinition(actor.id, fd.id, { is_hidden: false });
-      onNotice(`Field "${fd.field_label}" restored.`);
+      onNotice(`Field "${fd.field_label}" deleted.`);
       setTimeout(() => onNotice(""), 4000);
       await refreshFields();
       onChanged();
@@ -2393,23 +2335,12 @@ function FieldManager({
         operation actually records vehicles. Add as many custom fields as you need.
       </p>
 
-      <div className="row" style={{ flexWrap: "wrap", gap: 8, alignItems: "flex-end" }}>
-        <div className="seg" style={{ alignSelf: "flex-start" }}>
-          {Object.entries(ENTITY_LABELS).map(([key, label]) => (
-            <button key={key} className={entityTab === key ? "active" : ""} onClick={() => setEntityTab(key)}>
-              {label}
-            </button>
-          ))}
-        </div>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
-          <input
-            type="checkbox"
-            checked={showHidden}
-            onChange={(e) => setShowHidden(e.target.checked)}
-            style={{ width: "auto" }}
-          />
-          Show hidden fields
-        </label>
+      <div className="seg" style={{ alignSelf: "flex-start" }}>
+        {Object.entries(ENTITY_LABELS).map(([key, label]) => (
+          <button key={key} className={entityTab === key ? "active" : ""} onClick={() => setEntityTab(key)}>
+            {label}
+          </button>
+        ))}
       </div>
 
       {error && <div className="error-banner">{error}</div>}
@@ -2421,15 +2352,15 @@ function FieldManager({
           </div>
           <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
             <div className="field" style={{ margin: 0, minWidth: 160 }}>
-              <label>Field key (used internally)</label>
+              <label>Field key</label>
               <input
                 value={newKey}
                 onChange={(e) => setNewKey(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}
                 placeholder="e.g. insurance_expiry"
-                disabled={!!editingId}
               />
               <p className="muted small" style={{ marginTop: 2 }}>
-                Lowercase letters, numbers, and underscores only. Cannot be changed after creation.
+                Lowercase letters, numbers, and underscores only. Renaming a field key renames its stored data —
+                custom field values follow automatically.
               </p>
             </div>
             <div className="field" style={{ margin: 0, minWidth: 200 }}>
@@ -2504,40 +2435,31 @@ function FieldManager({
             </tr>
           </thead>
           <tbody>
-            {fields
-              .filter((fd) => showHidden || !fd.is_hidden)
-              .map((fd) => (
-                <tr key={fd.id} style={fd.is_hidden ? { opacity: 0.55 } : undefined}>
-                  <td>
-                    <b>{fd.field_label}</b>{" "}
-                    {fd.is_standard && <span className="badge">Standard</span>}
-                    {fd.is_hidden && <span className="badge">Hidden</span>}
-                  </td>
-                  <td className="muted small" style={{ fontFamily: "monospace" }}>{fd.field_key}</td>
-                  <td>
-                    <span className="badge">
-                      {FIELD_TYPE_OPTIONS.find((o) => o.value === fd.field_type)?.label ?? fd.field_type}
-                    </span>
-                  </td>
-                  <td>{fd.is_required ? <span className="badge active">Yes</span> : "No"}</td>
-                  <td>
-                    <div className="row" style={{ gap: 6 }}>
-                      <button className="ghost small" onClick={() => startEdit(fd)} disabled={fd.is_hidden}>
-                        Edit
-                      </button>
-                      {fd.is_hidden ? (
-                        <button className="ghost small" onClick={() => restoreField(fd)}>
-                          Restore
-                        </button>
-                      ) : (
-                        <button className="ghost small" onClick={() => deleteField(fd)}>
-                          {fd.is_standard ? "Remove" : "Delete"}
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+            {fields.map((fd) => (
+              <tr key={fd.id}>
+                <td>
+                  <b>{fd.field_label}</b>{" "}
+                  {fd.is_standard && <span className="badge">Standard</span>}
+                </td>
+                <td className="muted small" style={{ fontFamily: "monospace" }}>{fd.field_key}</td>
+                <td>
+                  <span className="badge">
+                    {FIELD_TYPE_OPTIONS.find((o) => o.value === fd.field_type)?.label ?? fd.field_type}
+                  </span>
+                </td>
+                <td>{fd.is_required ? <span className="badge active">Yes</span> : "No"}</td>
+                <td>
+                  <div className="row" style={{ gap: 6 }}>
+                    <button className="ghost small" onClick={() => startEdit(fd)}>
+                      Edit
+                    </button>
+                    <button className="danger small" onClick={() => deleteField(fd)}>
+                      Delete
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       )}

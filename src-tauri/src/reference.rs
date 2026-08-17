@@ -474,6 +474,72 @@ pub fn normalize_plate(raw: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Hard delete (whole records) — reference.rs's "never hard delete" applies to
+// deactivation, but admins must be able to remove a record as a whole.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn delete_company(state: State<AppState>, actor_id: String, company_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let n = conn
+        .execute(
+            "UPDATE vehicles SET company_id = NULL, updated_at = ?2 WHERE company_id = ?1",
+            params![company_id, now_iso()],
+        )
+        .map_err(|e| format!("company unlink failed: {e}"))?;
+    let _ = n;
+    let n = conn
+        .execute("DELETE FROM companies WHERE id = ?1", params![company_id])
+        .map_err(|e| format!("company delete failed: {e}"))?;
+    if n == 0 {
+        return Err("Company not found.".to_string());
+    }
+    append_audit(&conn, &actor_id, "deleted_company", Some(&company_id), None)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_driver(state: State<AppState>, actor_id: String, driver_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    conn.execute(
+        "UPDATE vehicles SET default_driver_id = NULL, updated_at = ?2 WHERE default_driver_id = ?1",
+        params![driver_id, now_iso()],
+    )
+    .map_err(|e| format!("driver unlink failed: {e}"))?;
+    let n = conn
+        .execute("DELETE FROM drivers WHERE id = ?1", params![driver_id])
+        .map_err(|e| format!("driver delete failed: {e}"))?;
+    if n == 0 {
+        return Err("Driver not found.".to_string());
+    }
+    append_audit(&conn, &actor_id, "deleted_driver", Some(&driver_id), None)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_vehicle(state: State<AppState>, actor_id: String, vehicle_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    // Keep trip history readable: trips snapshot plate/company/driver, so
+    // unlink the vehicle id rather than leaving a dangling reference.
+    conn.execute(
+        "UPDATE trips SET vehicle_id = NULL WHERE vehicle_id = ?1",
+        params![vehicle_id],
+    )
+    .map_err(|e| format!("vehicle unlink failed: {e}"))?;
+    let n = conn
+        .execute("DELETE FROM vehicles WHERE id = ?1", params![vehicle_id])
+        .map_err(|e| format!("vehicle delete failed: {e}"))?;
+    if n == 0 {
+        return Err("Vehicle not found.".to_string());
+    }
+    append_audit(&conn, &actor_id, "deleted_vehicle", Some(&vehicle_id), None)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Dynamic field definitions (migration 14)
 // ---------------------------------------------------------------------------
 
@@ -490,9 +556,10 @@ fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
         is_required: row.get::<_, i32>(5)? != 0,
         is_standard: row.get::<_, i32>(6)? != 0,
         is_hidden: row.get::<_, i32>(7)? != 0,
-        sort_order: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        binding: row.get(8)?,
+        sort_order: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -507,7 +574,7 @@ pub fn list_field_definitions(
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, sort_order, created_at, updated_at
+            "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, binding, sort_order, created_at, updated_at
              FROM field_definitions WHERE entity_type = ?1 ORDER BY sort_order, field_label",
         )
         .map_err(|e| format!("field_definitions list failed: {e}"))?;
@@ -576,10 +643,54 @@ pub fn create_field_definition(
         is_required,
         is_standard: false,
         is_hidden: false,
+        binding: None,
         sort_order: order,
         created_at: now.clone(),
         updated_at: now,
     })
+}
+
+/// Rename a custom field's key inside every entity row's `extra_fields` JSON
+/// (old key → new key) so the data follows the rename.
+fn migrate_extra_field_key(
+    conn: &Connection,
+    entity_type: &str,
+    old_key: &str,
+    new_key: &str,
+) -> Result<(), String> {
+    let table = match entity_type {
+        "company" => "companies",
+        "driver" => "drivers",
+        _ => "vehicles",
+    };
+    let rows: Vec<(String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare(&format!("SELECT id, extra_fields FROM {table}"))
+            .map_err(|e| format!("extra_fields scan failed: {e}"))?;
+        let mapped = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(|e| format!("extra_fields scan failed: {e}"))?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(|e| format!("extra_fields read failed: {e}"))?
+    };
+    for (id, extra) in rows {
+        let Some(extra) = extra else { continue };
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&extra) else {
+            continue;
+        };
+        let Some(obj) = val.as_object_mut() else {
+            continue;
+        };
+        if let Some(old_val) = obj.remove(old_key) {
+            obj.insert(new_key.to_string(), old_val);
+            let updated = serde_json::Value::Object(obj.clone()).to_string();
+            conn.execute(
+                &format!("UPDATE {table} SET extra_fields = ?1, updated_at = ?2 WHERE id = ?3"),
+                params![updated, now_iso(), id],
+            )
+            .map_err(|e| format!("extra_fields update failed: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -587,6 +698,7 @@ pub fn update_field_definition(
     state: State<AppState>,
     actor_id: String,
     field_id: String,
+    field_key: Option<String>,
     field_label: Option<String>,
     field_type: Option<String>,
     is_required: Option<bool>,
@@ -600,9 +712,50 @@ pub fn update_field_definition(
             return Err(format!("Invalid field type '{ft}'. Must be one of: {}.", VALID_FIELD_TYPES.join(", ")));
         }
     }
-    let now = now_iso();
+    // Load the current row so a key rename can migrate its data.
+    let cur: Option<(String, String, String, bool)> = conn
+        .query_row(
+            "SELECT entity_type, field_key, field_label, is_standard FROM field_definitions WHERE id = ?1",
+            params![field_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i32>(3)? != 0)),
+        )
+        .optional()
+        .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+    let (entity_type, old_key, _old_label, is_standard) =
+        cur.ok_or_else(|| "Field definition not found.".to_string())?;
+
     let mut sets = vec!["updated_at = ?1".to_string()];
     let mut idx = 2;
+    let mut key_used = old_key.clone();
+    if let Some(ref new_key) = field_key {
+        let key = new_key.trim().to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        if key.is_empty() {
+            return Err("Field key is required.".to_string());
+        }
+        if key != old_key {
+            // Unique per entity type.
+            let dup: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM field_definitions WHERE entity_type = ?1 AND field_key = ?2 AND id != ?3",
+                    params![entity_type, key, field_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+            if dup.is_some() {
+                return Err(format!("A field with key '{key}' already exists for {entity_type}s."));
+            }
+            // Standard fields keep their fixed binding; only the identifier
+            // changes. Custom fields store data in extra_fields by key, so the
+            // stored values must follow the rename.
+            if !is_standard {
+                migrate_extra_field_key(&conn, &entity_type, &old_key, &key)?;
+            }
+            sets.push(format!("field_key = ?{idx}"));
+            idx += 1;
+            key_used = key;
+        }
+    }
     if field_label.is_some() {
         sets.push(format!("field_label = ?{idx}"));
         idx += 1;
@@ -624,7 +777,10 @@ pub fn update_field_definition(
         idx += 1;
     }
     let sql = format!("UPDATE field_definitions SET {} WHERE id = ?{idx}", sets.join(", "));
-    let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.clone())];
+    let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now_iso())];
+    if field_key.is_some() && key_used != old_key {
+        bound.push(Box::new(key_used.clone()));
+    }
     if let Some(ref label) = field_label {
         bound.push(Box::new(label.clone()));
     }
@@ -646,7 +802,13 @@ pub fn update_field_definition(
     if n == 0 {
         return Err("Field definition not found.".to_string());
     }
-    append_audit(&conn, &actor_id, "updated_field_definition", Some(&field_id), None)?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "updated_field_definition",
+        Some(&field_id),
+        Some(serde_json::json!({ "field_key": key_used })),
+    )?;
     Ok(())
 }
 
@@ -658,33 +820,16 @@ pub fn delete_field_definition(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
-    // Standard (built-in) fields back real database columns, so they are
-    // soft-deleted (hidden from forms/import/export) instead of dropped.
-    // Custom fields are hard-deleted.
-    let is_standard: Option<i32> = conn
-        .query_row(
-            "SELECT is_standard FROM field_definitions WHERE id = ?1",
-            params![field_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
-    match is_standard {
-        Some(1) => {
-            conn.execute(
-                "UPDATE field_definitions SET is_hidden = 1, updated_at = ?2 WHERE id = ?1",
-                params![field_id, now_iso()],
-            )
-            .map_err(|e| format!("field_definitions hide failed: {e}"))?;
-            append_audit(&conn, &actor_id, "hidden_field_definition", Some(&field_id), None)?;
-        }
-        Some(_) => {
-            conn.execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
-                .map_err(|e| format!("field_definitions delete failed: {e}"))?;
-            append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
-        }
-        None => return Err("Field definition not found.".to_string()),
+    // Fields are deleted as a whole — standard and custom alike. The real
+    // database column behind a standard field is kept (history stays intact),
+    // but the field disappears from forms, import, and export everywhere.
+    let n = conn
+        .execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
+        .map_err(|e| format!("field_definitions delete failed: {e}"))?;
+    if n == 0 {
+        return Err("Field definition not found.".to_string());
     }
+    append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
     Ok(())
 }
 
@@ -1154,7 +1299,7 @@ pub fn reference_import(
 fn visible_fields(conn: &Connection, entity_type: &str) -> Result<Vec<(String, bool)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT field_key, is_standard FROM field_definitions
+            "SELECT COALESCE(binding, field_key), is_standard FROM field_definitions
              WHERE entity_type = ?1 AND is_hidden = 0 ORDER BY sort_order, field_label",
         )
         .map_err(|e| format!("field_definitions list failed: {e}"))?;
@@ -1441,32 +1586,39 @@ fn classify_column(
             sample_values: samples,
         });
     }
-    let mut defs: Vec<(String, String, String, bool)> = Vec::new();
+    let mut defs: Vec<(String, String, String, bool, Option<String>)> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT field_key, field_label, field_type, is_standard FROM field_definitions WHERE entity_type = ?1")
+            .prepare("SELECT field_key, field_label, field_type, is_standard, binding FROM field_definitions WHERE entity_type = ?1")
             .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
         let rows = stmt
             .query_map(params![entity_type], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)? != 0))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i32>(3)? != 0,
+                    r.get::<_, Option<String>>(4)?,
+                ))
             })
             .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
         for row in rows {
             defs.push(row.map_err(|e| format!("field_definitions read failed: {e}"))?);
         }
     }
-    for (key, label, ftype, is_std) in &defs {
+    for (key, label, ftype, is_std, binding) in &defs {
         if h == norm_header(key) || h == norm_header(label) {
+            let field_key = if *is_std { binding.clone().unwrap_or_else(|| key.clone()) } else { key.clone() };
             return if *is_std {
                 Ok(ColumnInfo::Standard {
                     header: header.to_string(),
-                    field_key: key.clone(),
+                    field_key,
                     sample_values: samples,
                 })
             } else {
                 Ok(ColumnInfo::ExistingCustom {
                     header: header.to_string(),
-                    field_key: key.clone(),
+                    field_key,
                     field_type: ftype.clone(),
                     sample_values: samples,
                 })

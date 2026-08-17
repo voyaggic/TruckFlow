@@ -451,6 +451,9 @@ export interface FieldDefinition {
   is_standard: boolean;
   /** Hidden fields are excluded from forms/import/export. */
   is_hidden: boolean;
+  /** For standard fields: the fixed internal column binding (e.g. "plate_number");
+   *  the user-editable `field_key` may differ. Custom fields: null. */
+  binding: string | null;
   sort_order: number;
   created_at: string;
   updated_at: string;

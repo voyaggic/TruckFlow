@@ -146,6 +146,9 @@ export const api = {
   setCompanyStatus: (actorId: string, companyId: string, status: "active" | "inactive") =>
     invoke<void>("set_company_status", { actorId, companyId, status }),
 
+  deleteCompany: (actorId: string, companyId: string) =>
+    invoke<void>("delete_company", { actorId, companyId }),
+
   listDrivers: (search?: string) =>
     invoke<DriverView[]>("list_drivers", { search: search ?? null }),
 
@@ -166,6 +169,9 @@ export const api = {
 
   setDriverStatus: (actorId: string, driverId: string, status: "active" | "inactive") =>
     invoke<void>("set_driver_status", { actorId, driverId, status }),
+
+  deleteDriver: (actorId: string, driverId: string) =>
+    invoke<void>("delete_driver", { actorId, driverId }),
 
   listVehicles: (search?: string) =>
     invoke<VehicleView[]>("list_vehicles", { search: search ?? null }),
@@ -213,6 +219,9 @@ export const api = {
   setVehicleStatus: (actorId: string, vehicleId: string, status: "active" | "inactive") =>
     invoke<void>("set_vehicle_status", { actorId, vehicleId, status }),
 
+  deleteVehicle: (actorId: string, vehicleId: string) =>
+    invoke<void>("delete_vehicle", { actorId, vehicleId }),
+
   // --- Dynamic field definitions ---
 
   listFieldDefinitions: (entityType: string) =>
@@ -240,11 +249,12 @@ export const api = {
   updateFieldDefinition: (
     actorId: string,
     fieldId: string,
-    changes: Partial<Pick<FieldDefinition, "field_label" | "field_type" | "is_required" | "sort_order" | "is_hidden">>,
+    changes: Partial<Pick<FieldDefinition, "field_key" | "field_label" | "field_type" | "is_required" | "sort_order" | "is_hidden">>,
   ) =>
     invoke<void>("update_field_definition", {
       actorId,
       fieldId,
+      fieldKey: changes.field_key ?? null,
       fieldLabel: changes.field_label ?? null,
       fieldType: changes.field_type ?? null,
       isRequired: changes.is_required ?? null,

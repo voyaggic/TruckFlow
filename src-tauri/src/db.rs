@@ -556,6 +556,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 16 {
+        // Field keys become freely editable. Standard fields get a fixed
+        // internal `binding` (the real column they map to) so renaming the key
+        // doesn't break forms/import/export; custom fields keep binding NULL.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE field_definitions ADD COLUMN binding TEXT;
+            UPDATE field_definitions SET binding = field_key WHERE is_standard = 1;
+            "#,
+        )
+        .map_err(|e| format!("migration 16 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 16;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
