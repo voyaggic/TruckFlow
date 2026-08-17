@@ -1852,6 +1852,7 @@ function VehicleTable({
       {vehicles.length === 0 ? (
         <p className="muted small">No vehicles yet — register the first one above.</p>
       ) : (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
@@ -1921,6 +1922,7 @@ function VehicleTable({
             ))}
           </tbody>
         </table>
+        </div>
       )}
       <p className="muted small">
         Registered once per vehicle — the system cross-references every capture against this list. Editing runs under{" "}
@@ -2014,6 +2016,7 @@ function CompanyTable({
       {companies.length === 0 ? (
         <p className="muted small">No companies yet.</p>
       ) : (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
@@ -2076,6 +2079,7 @@ function CompanyTable({
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -2165,6 +2169,7 @@ function DriverTable({
       {drivers.length === 0 ? (
         <p className="muted small">No drivers yet.</p>
       ) : (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
@@ -2220,13 +2225,13 @@ function DriverTable({
                       }}
                     >
                       Delete
-                    </button>
-                  </div>
+                    </button>                  </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -2366,6 +2371,7 @@ function GenericRecordsTable({
           ) : records.length === 0 ? (
             <p className="muted small">No {label.toLowerCase()} records yet.</p>
           ) : (
+            <div className="table-scroll">
             <table className="table">
               <thead>
                 <tr>
@@ -2403,6 +2409,7 @@ function GenericRecordsTable({
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </>
       )}

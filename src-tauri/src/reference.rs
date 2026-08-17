@@ -1977,29 +1977,50 @@ fn read_xlsx_sheets(path: &std::path::Path) -> Result<Vec<(String, Vec<Vec<Strin
 
 /// Guess the entity type of a sheet from its headers ("unknown" when
 /// company-vs-driver is ambiguous — the admin picks in the UI).
+/// Guess which entity a worksheet holds from its header row. Uses the same
+/// alias vocabulary as `standard_key_for` so renamed columns (Business Name,
+/// Full Name, Fleet, Reg No…) still resolve to the right parent. Scores each
+/// candidate by how many header keys match it; the highest wins.
 fn infer_entity_type(header: &[String]) -> String {
     let keys: Vec<String> = header.iter().map(|h| norm_header(h)).collect();
-    let plate_keys = ["plate_number", "plate", "license_plate", "number_plate", "reg_no", "registration", "plate_no"];
+
+    let vehicle_plate = [
+        "plate_number", "plate", "license_plate", "number_plate", "reg_no",
+        "registration", "plate_no", "registration_number",
+    ];
+    let vehicle_capacity = [
+        "registered_capacity", "capacity", "capacity_l", "capacity_litres",
+        "tonnage", "payload", "load_capacity",
+    ];
+    let company_name = [
+        "name", "company", "company_name", "business_name", "business",
+        "organisation", "organization", "firm", "enterprise", "trading_name",
+    ];
+    let driver_name = [
+        "driver", "driver_name", "full_name", "chauffeur", "driver_full_name", "trucker",
+    ];
+
+    let mut score = [("vehicle", 0usize), ("company", 0usize), ("driver", 0usize)];
     for k in &keys {
-        if plate_keys.contains(&k.as_str()) {
-            return "vehicle".to_string();
+        if vehicle_plate.contains(&k.as_str()) || vehicle_capacity.contains(&k.as_str()) {
+            score[0].1 += 2; // plate/capacity is a strong vehicle signal
+        }
+        if company_name.contains(&k.as_str()) {
+            score[1].1 += 1;
+        }
+        if driver_name.contains(&k.as_str()) {
+            score[2].1 += 1;
         }
     }
-    if keys.iter().any(|k| matches!(k.as_str(), "registered_capacity" | "capacity" | "capacity_l" | "capacity_litres")) {
+    // A sheet with both company and driver columns is a vehicle sheet.
+    if score[1].1 > 0 && score[2].1 > 0 && score[0].1 > 0 {
         return "vehicle".to_string();
     }
-    let has_company = keys.iter().any(|k| k == "company" || k == "company_name");
-    let has_driver = keys.iter().any(|k| k == "driver" || k == "driver_name");
-    if has_company && has_driver {
-        return "vehicle".to_string();
+    let best = score.iter().max_by_key(|(_, s)| *s).map(|(e, _)| *e).unwrap_or("unknown");
+    if score.iter().all(|(_, s)| *s == 0) {
+        return "unknown".to_string();
     }
-    if has_company {
-        return "company".to_string();
-    }
-    if has_driver {
-        return "driver".to_string();
-    }
-    "unknown".to_string()
+    best.to_string()
 }
 
 /// Standard field key a normalised header maps to, if any.
@@ -2621,5 +2642,32 @@ mod alias_tests {
         assert_eq!(standard_key_for("company", "location"), None);
         assert_eq!(standard_key_for("vehicle", "insurance_expiry"), None);
         assert_eq!(standard_key_for("vehicle", "route"), None);
+    }
+
+    #[test]
+    fn infer_entity_type_from_renamed_headers() {
+        use super::infer_entity_type;
+        let v = |hs: &[&str]| hs.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        // Vehicles sheet: Reg No + Fleet + Truck Driver + Tonnage
+        assert_eq!(
+            infer_entity_type(&v(&["Reg No", "Fleet", "Truck Driver", "Tonnage", "Unit", "Operational"])),
+            "vehicle"
+        );
+        // Companies sheet: Business Name + Operational + Location + Contact
+        assert_eq!(
+            infer_entity_type(&v(&["Business Name", "Operational", "Location", "Contact"])),
+            "company"
+        );
+        // Drivers sheet: Full Name + Operational + License Type + Phone
+        assert_eq!(
+            infer_entity_type(&v(&["Full Name", "Operational", "License Type", "Phone"])),
+            "driver"
+        );
+        // Plain English headers too
+        assert_eq!(infer_entity_type(&v(&["Plate", "Company", "Driver", "Capacity"])), "vehicle");
+        assert_eq!(infer_entity_type(&v(&["Company Name", "Status"])), "company");
+        assert_eq!(infer_entity_type(&v(&["Driver Name", "Status"])), "driver");
+        // No recognizable headers
+        assert_eq!(infer_entity_type(&v(&["Foo", "Bar", "Baz"])), "unknown");
     }
 }

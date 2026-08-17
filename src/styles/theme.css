@@ -332,7 +332,8 @@ label {
 .section {
   padding: 20px;
   flex: 1;
-  overflow-y: auto;
+  overflow: auto;
+  min-width: 0;
 }
 .section-title {
   font-size: 17px;
@@ -353,8 +354,17 @@ label {
   color: var(--text-dim);
 }
 
+/* Data tables: never squish when columns/data expand — grow to content
+   width and let the section scroll horizontally instead. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
 .table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
 }
 .table th,
@@ -363,6 +373,7 @@ label {
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   font-size: 13px;
+  vertical-align: top;
 }
 .table th {
   color: var(--text-dim);
@@ -370,9 +381,17 @@ label {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.03em;
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
 }
 .table tr:hover td {
   background: var(--surface-2);
+}
+.table td {
+  overflow-wrap: anywhere;
 }
 
 .badge {
