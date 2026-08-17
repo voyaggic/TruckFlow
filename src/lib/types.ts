@@ -447,6 +447,10 @@ export interface FieldDefinition {
   field_label: string;
   field_type: "text" | "number" | "boolean" | "mixed";
   is_required: boolean;
+  /** Seeded built-in fields (plate, company, name…) back real columns. */
+  is_standard: boolean;
+  /** Hidden fields are excluded from forms/import/export. */
+  is_hidden: boolean;
   sort_order: number;
   created_at: string;
   updated_at: string;
@@ -481,6 +485,8 @@ export interface StandardColumn {
   header: string;
   /** Internal field key this header maps to (e.g. "plate_number"). */
   field_key: string;
+  /** Up to 5 example values from the column, to help the admin decide. */
+  sample_values: string[];
 }
 
 /** A custom field already defined in the database. */
@@ -489,6 +495,7 @@ export interface ExistingCustomColumn {
   header: string;
   field_key: string;
   field_type: "text" | "number" | "boolean" | "mixed";
+  sample_values: string[];
 }
 
 /** A header that doesn't match anything yet and needs confirmation. */
@@ -501,6 +508,7 @@ export interface NewCustomColumn {
   field_type: "text" | "number" | "boolean" | "mixed";
   /** Whether this column is required. */
   is_required: boolean;
+  sample_values: string[];
 }
 
 export type ColumnInfo = StandardColumn | ExistingCustomColumn | NewCustomColumn;

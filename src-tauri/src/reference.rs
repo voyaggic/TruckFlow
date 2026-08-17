@@ -10,7 +10,11 @@ use calamine::Reader as _; // worksheet_range_at
 
 use crate::commands::ensure_admin_permission;
 use crate::db::{append_audit, now_iso, AppState};
-use crate::models::{CompanyView, DriverView, FieldDefinition, ReferenceImportSummary, VehicleView};
+use crate::models::{
+    ColumnInfo, CombinedImportSummary, CompanyView, DriverView, FieldDefinition,
+    ReferenceImportPreview, ReferenceImportRequest, ReferenceImportSummary, SheetPreview,
+    VehicleView,
+};
 
 const REF_PERM: &str = "manage_reference_database";
 
@@ -484,9 +488,11 @@ fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
         field_label: row.get(3)?,
         field_type: row.get(4)?,
         is_required: row.get::<_, i32>(5)? != 0,
-        sort_order: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        is_standard: row.get::<_, i32>(6)? != 0,
+        is_hidden: row.get::<_, i32>(7)? != 0,
+        sort_order: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -501,7 +507,7 @@ pub fn list_field_definitions(
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, entity_type, field_key, field_label, field_type, is_required, sort_order, created_at, updated_at
+            "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, sort_order, created_at, updated_at
              FROM field_definitions WHERE entity_type = ?1 ORDER BY sort_order, field_label",
         )
         .map_err(|e| format!("field_definitions list failed: {e}"))?;
@@ -568,6 +574,8 @@ pub fn create_field_definition(
         field_label: label,
         field_type,
         is_required,
+        is_standard: false,
+        is_hidden: false,
         sort_order: order,
         created_at: now.clone(),
         updated_at: now,
@@ -583,6 +591,7 @@ pub fn update_field_definition(
     field_type: Option<String>,
     is_required: Option<bool>,
     sort_order: Option<i32>,
+    is_hidden: Option<bool>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
@@ -610,6 +619,10 @@ pub fn update_field_definition(
         sets.push(format!("sort_order = ?{idx}"));
         idx += 1;
     }
+    if is_hidden.is_some() {
+        sets.push(format!("is_hidden = ?{idx}"));
+        idx += 1;
+    }
     let sql = format!("UPDATE field_definitions SET {} WHERE id = ?{idx}", sets.join(", "));
     let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.clone())];
     if let Some(ref label) = field_label {
@@ -623,6 +636,9 @@ pub fn update_field_definition(
     }
     if let Some(ord) = sort_order {
         bound.push(Box::new(ord));
+    }
+    if let Some(hidden) = is_hidden {
+        bound.push(Box::new(hidden as i32));
     }
     bound.push(Box::new(field_id.clone()));
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
@@ -642,13 +658,33 @@ pub fn delete_field_definition(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
-    let n = conn
-        .execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
-        .map_err(|e| format!("field_definitions delete failed: {e}"))?;
-    if n == 0 {
-        return Err("Field definition not found.".to_string());
+    // Standard (built-in) fields back real database columns, so they are
+    // soft-deleted (hidden from forms/import/export) instead of dropped.
+    // Custom fields are hard-deleted.
+    let is_standard: Option<i32> = conn
+        .query_row(
+            "SELECT is_standard FROM field_definitions WHERE id = ?1",
+            params![field_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+    match is_standard {
+        Some(1) => {
+            conn.execute(
+                "UPDATE field_definitions SET is_hidden = 1, updated_at = ?2 WHERE id = ?1",
+                params![field_id, now_iso()],
+            )
+            .map_err(|e| format!("field_definitions hide failed: {e}"))?;
+            append_audit(&conn, &actor_id, "hidden_field_definition", Some(&field_id), None)?;
+        }
+        Some(_) => {
+            conn.execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
+                .map_err(|e| format!("field_definitions delete failed: {e}"))?;
+            append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
+        }
+        None => return Err("Field definition not found.".to_string()),
     }
-    append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
     Ok(())
 }
 
@@ -1105,6 +1141,735 @@ pub fn reference_import(
             "updated": summary.updated,
             "skipped": summary.skipped,
             "errors": summary.errors.len(),
+        })),
+    )?;
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// Combined reference import/export (one spreadsheet, all entity types)
+// ---------------------------------------------------------------------------
+
+/// Ordered visible field keys for an entity: `(field_key, is_standard)`.
+fn visible_fields(conn: &Connection, entity_type: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT field_key, is_standard FROM field_definitions
+             WHERE entity_type = ?1 AND is_hidden = 0 ORDER BY sort_order, field_label",
+        )
+        .map_err(|e| format!("field_definitions list failed: {e}"))?;
+    let rows = stmt
+        .query_map(params![entity_type], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)? != 0)))
+        .map_err(|e| format!("field_definitions list failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("field_definitions read failed: {e}"))
+}
+
+/// Every row of an entity as a key → value map (custom fields flattened from
+/// the `extra_fields` JSON so export headers line up with field definitions).
+fn entity_row_maps(conn: &Connection, entity_type: &str) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    let mut out = Vec::new();
+    let base_sql = match entity_type {
+        "company" => "SELECT name, status, COALESCE(extra_fields, '{}') FROM companies ORDER BY name",
+        "driver" => "SELECT name, status, COALESCE(extra_fields, '{}') FROM drivers ORDER BY name",
+        _ => "SELECT v.plate_number, COALESCE(c.name, ''), COALESCE(d.name, ''), v.registered_capacity,
+                     COALESCE(v.capacity_unit, 'litres'), v.status, COALESCE(v.extra_fields, '{}')
+              FROM vehicles v
+              LEFT JOIN companies c ON c.id = v.company_id
+              LEFT JOIN drivers d ON d.id = v.default_driver_id
+              ORDER BY v.plate_number",
+    };
+    let mut stmt = conn.prepare(base_sql).map_err(|e| format!("export query failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            if entity_type == "vehicle" {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            } else {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, None, String::new(), String::new(), String::new()))
+            }
+        })
+        .map_err(|e| format!("export query failed: {e}"))?;
+    for row in rows {
+        let row = row.map_err(|e| format!("export read failed: {e}"))?;
+        let mut map = serde_json::Map::new();
+        if entity_type == "vehicle" {
+            map.insert("plate_number".into(), serde_json::Value::String(row.0));
+            map.insert("company".into(), serde_json::Value::String(row.1));
+            map.insert("driver".into(), serde_json::Value::String(row.2));
+            map.insert(
+                "registered_capacity".into(),
+                match row.3 {
+                    Some(v) => serde_json::Value::from(v),
+                    None => serde_json::Value::Null,
+                },
+            );
+            map.insert("capacity_unit".into(), serde_json::Value::String(row.4));
+            map.insert("status".into(), serde_json::Value::String(row.5));
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.6) {
+                if let Some(obj) = v.as_object() {
+                    for (k, val) in obj {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        } else {
+            map.insert("name".into(), serde_json::Value::String(row.0));
+            map.insert("status".into(), serde_json::Value::String(row.1));
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.2) {
+                if let Some(obj) = v.as_object() {
+                    for (k, val) in obj {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        out.push(map);
+    }
+    Ok(out)
+}
+
+fn json_cell_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Export the whole reference database as one XLSX workbook with a sheet per
+/// entity (Companies / Drivers / Vehicles). Column headers come from the field
+/// definitions (labels), so renamed built-ins and custom fields round-trip.
+#[tauri::command]
+pub fn reference_export_combined(
+    state: State<AppState>,
+    actor_id: String,
+    target_path: Option<String>,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let path = if let Some(tp) = target_path.as_deref() {
+        std::path::PathBuf::from(tp)
+    } else {
+        let dir = state
+            .frames_dir
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("exports");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("export dir create failed: {e}"))?;
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        dir.join(format!("truckflow-reference-{ts}.xlsx"))
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("export dir create failed: {e}"))?;
+    }
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheets: &[(&str, &str)] = &[("company", "Companies"), ("driver", "Drivers"), ("vehicle", "Vehicles")];
+    for (entity_type, sheet_name) in sheets {
+        let fields = visible_fields(&conn, entity_type)?;
+        if fields.is_empty() {
+            continue;
+        }
+        let labels: Vec<String> = fields
+            .iter()
+            .map(|(key, _)| field_label(&conn, entity_type, key).unwrap_or_else(|| key.clone()))
+            .collect();
+        let rows = entity_row_maps(&conn, entity_type)?;
+        let worksheet = workbook.add_worksheet();
+        worksheet
+            .set_name(*sheet_name)
+            .map_err(|e| format!("worksheet name failed: {e}"))?;
+        for (ci, label) in labels.iter().enumerate() {
+            let _ = worksheet.write_string(0, ci as u16, label);
+        }
+        for (ri, map) in rows.iter().enumerate() {
+            let row_idx = ri as u32 + 1;
+            for (ci, (key, _)) in fields.iter().enumerate() {
+                let _ = worksheet.write_string(row_idx, ci as u16, &json_cell_string(map.get(key).unwrap_or(&serde_json::Value::Null)));
+            }
+        }
+    }
+    workbook
+        .save(&path)
+        .map_err(|e| format!("xlsx save failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "reference_exported_combined",
+        None,
+        Some(serde_json::json!({ "path": path.to_string_lossy() })),
+    )?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn field_label(conn: &Connection, entity_type: &str, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT field_label FROM field_definitions WHERE entity_type = ?1 AND field_key = ?2",
+        params![entity_type, key],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Read every worksheet of an XLSX file as (sheet name, rows incl. header).
+fn read_xlsx_sheets(path: &std::path::Path) -> Result<Vec<(String, Vec<Vec<String>>)>, String> {
+    let mut workbook = calamine::open_workbook_auto(path).map_err(|e| format!("xlsx open failed: {e}"))?;
+    let names: Vec<String> = workbook.sheet_names().to_vec();
+    let mut out = Vec::new();
+    for name in names {
+        let range = workbook
+            .worksheet_range(&name)
+            .map_err(|e| format!("xlsx sheet '{name}' read failed: {e}"))?;
+        out.push((
+            name,
+            range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Guess the entity type of a sheet from its headers ("unknown" when
+/// company-vs-driver is ambiguous — the admin picks in the UI).
+fn infer_entity_type(header: &[String]) -> String {
+    let keys: Vec<String> = header.iter().map(|h| norm_header(h)).collect();
+    let plate_keys = ["plate_number", "plate", "license_plate", "number_plate", "reg_no", "registration", "plate_no"];
+    for k in &keys {
+        if plate_keys.contains(&k.as_str()) {
+            return "vehicle".to_string();
+        }
+    }
+    if keys.iter().any(|k| matches!(k.as_str(), "registered_capacity" | "capacity" | "capacity_l" | "capacity_litres")) {
+        return "vehicle".to_string();
+    }
+    let has_company = keys.iter().any(|k| k == "company" || k == "company_name");
+    let has_driver = keys.iter().any(|k| k == "driver" || k == "driver_name");
+    if has_company && has_driver {
+        return "vehicle".to_string();
+    }
+    if has_company {
+        return "company".to_string();
+    }
+    if has_driver {
+        return "driver".to_string();
+    }
+    "unknown".to_string()
+}
+
+/// Standard field key a normalised header maps to, if any.
+fn standard_key_for(entity_type: &str, h: &str) -> Option<&'static str> {
+    match entity_type {
+        "vehicle" => match h {
+            "plate_number" | "plate" | "license_plate" | "number_plate" | "reg_no" | "registration" | "plate_no" => Some("plate_number"),
+            "company" | "company_name" => Some("company"),
+            "driver" | "driver_name" => Some("driver"),
+            "registered_capacity" | "capacity" | "capacity_l" | "capacity_litres" => Some("registered_capacity"),
+            "capacity_unit" | "unit" => Some("capacity_unit"),
+            "status" => Some("status"),
+            _ => None,
+        },
+        "company" | "driver" => match h {
+            "name" => Some("name"),
+            "status" => Some("status"),
+            _ => None,
+        },
+        _ => match h {
+            "name" => Some("name"),
+            _ => None,
+        },
+    }
+}
+
+/// Guess a field type from the non-empty values in a column.
+fn infer_field_type(values: &[String]) -> String {
+    let vals: Vec<&str> = values.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if vals.is_empty() {
+        return "text".to_string();
+    }
+    if vals.iter().all(|v| v.parse::<f64>().is_ok()) {
+        return "number".to_string();
+    }
+    let bools = ["true", "false", "yes", "no", "y", "n", "0", "1"];
+    if vals.iter().all(|v| bools.contains(&v.to_lowercase().as_str())) {
+        return "boolean".to_string();
+    }
+    let has_digit = vals.iter().any(|v| v.chars().any(|c| c.is_ascii_digit()));
+    let has_letter = vals.iter().any(|v| v.chars().any(|c| c.is_ascii_alphabetic()));
+    if has_digit && has_letter {
+        "mixed"
+    } else if has_digit {
+        "number"
+    } else {
+        "text"
+    }
+    .to_string()
+}
+
+fn derive_field_key(header: &str, existing: &[String]) -> String {
+    let base = norm_header(header).replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+    let base = if base.is_empty() { "custom_field".to_string() } else { base };
+    let mut key = base.clone();
+    let mut n = 2;
+    while existing.contains(&key) {
+        key = format!("{base}_{n}");
+        n += 1;
+    }
+    key
+}
+
+/// Classify one spreadsheet column against the entity's field definitions.
+fn classify_column(
+    conn: &Connection,
+    entity_type: &str,
+    header: &str,
+    values: &[String],
+) -> Result<ColumnInfo, String> {
+    let h = norm_header(header);
+    let samples: Vec<String> = values.iter().take(5).cloned().collect();
+    if let Some(key) = standard_key_for(entity_type, &h) {
+        return Ok(ColumnInfo::Standard {
+            header: header.to_string(),
+            field_key: key.to_string(),
+            sample_values: samples,
+        });
+    }
+    let mut defs: Vec<(String, String, String, bool)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT field_key, field_label, field_type, is_standard FROM field_definitions WHERE entity_type = ?1")
+            .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![entity_type], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i32>(3)? != 0))
+            })
+            .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+        for row in rows {
+            defs.push(row.map_err(|e| format!("field_definitions read failed: {e}"))?);
+        }
+    }
+    for (key, label, ftype, is_std) in &defs {
+        if h == norm_header(key) || h == norm_header(label) {
+            return if *is_std {
+                Ok(ColumnInfo::Standard {
+                    header: header.to_string(),
+                    field_key: key.clone(),
+                    sample_values: samples,
+                })
+            } else {
+                Ok(ColumnInfo::ExistingCustom {
+                    header: header.to_string(),
+                    field_key: key.clone(),
+                    field_type: ftype.clone(),
+                    sample_values: samples,
+                })
+            };
+        }
+    }
+    let existing_keys: Vec<String> = defs.iter().map(|d| d.0.clone()).collect();
+    Ok(ColumnInfo::NewCustom {
+        header: header.to_string(),
+        field_key: derive_field_key(header, &existing_keys),
+        field_type: infer_field_type(values),
+        is_required: false,
+        sample_values: samples,
+    })
+}
+
+/// Build the import preview: read the file, guess each sheet's entity and
+/// classify every column so the admin can confirm the mapping.
+#[tauri::command]
+pub fn reference_import_preview(
+    state: State<AppState>,
+    actor_id: String,
+    file_path: String,
+) -> Result<ReferenceImportPreview, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Err(format!("Import file not found: {file_path}"));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let sheets_data: Vec<(String, Vec<Vec<String>>)> = match ext.as_str() {
+        "csv" => vec![("Sheet1".to_string(), read_csv_rows(path)?)],
+        "xlsx" => read_xlsx_sheets(path)?,
+        _ => return Err(format!("Unsupported import format '.{ext}'. Use .csv or .xlsx.")),
+    };
+    let mut previews = Vec::new();
+    for (sheet_name, rows) in sheets_data {
+        if rows.is_empty() {
+            continue;
+        }
+        let header = &rows[0];
+        let data = &rows[1..];
+        let entity_type = infer_entity_type(header);
+        let mut columns = Vec::new();
+        for (i, h) in header.iter().enumerate() {
+            let values: Vec<String> = data
+                .iter()
+                .filter_map(|r| r.get(i))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .take(20)
+                .collect();
+            columns.push(classify_column(&conn, &entity_type, h, &values)?);
+        }
+        previews.push(SheetPreview {
+            sheet_name,
+            entity_type,
+            columns,
+            row_count: data.len(),
+        });
+    }
+    Ok(ReferenceImportPreview {
+        file_path: file_path.clone(),
+        sheets: previews,
+    })
+}
+
+fn find_or_create_company(conn: &Connection, actor_id: &str, name: &str) -> Result<String, String> {
+    let cid: Option<String> = conn
+        .query_row(
+            "SELECT id FROM companies WHERE upper(name) = upper(?1)",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("company lookup failed: {e}"))?;
+    if let Some(id) = cid {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO companies (id, name, status, extra_fields, created_at, updated_at) VALUES (?1, ?2, 'active', NULL, ?3, ?3)",
+        params![id, name, now_iso()],
+    )
+    .map_err(|e| format!("company create failed: {e}"))?;
+    append_audit(conn, actor_id, "created_company", Some(&id), Some(serde_json::json!({ "name": name })))?;
+    Ok(id)
+}
+
+fn find_or_create_driver(conn: &Connection, actor_id: &str, name: &str) -> Result<String, String> {
+    let did: Option<String> = conn
+        .query_row(
+            "SELECT id FROM drivers WHERE upper(name) = upper(?1)",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("driver lookup failed: {e}"))?;
+    if let Some(id) = did {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO drivers (id, name, status, extra_fields, created_at, updated_at) VALUES (?1, ?2, 'active', NULL, ?3, ?3)",
+        params![id, name, now_iso()],
+    )
+    .map_err(|e| format!("driver create failed: {e}"))?;
+    append_audit(conn, actor_id, "created_driver", Some(&id), Some(serde_json::json!({ "name": name })))?;
+    Ok(id)
+}
+
+/// Apply one row using a confirmed field_key → column-index map. Vehicles
+/// upsert by plate and auto-create their companies/drivers by name; custom
+/// field values land in `extra_fields`. Returns Ok(true) on create.
+fn apply_import_row_combined(
+    conn: &Connection,
+    actor_id: &str,
+    entity_type: &str,
+    cols: &HashMap<String, usize>,
+    row: &[String],
+) -> Result<bool, String> {
+    let get = |key: &str| -> Option<String> {
+        cols.get(key)
+            .and_then(|&i| row.get(i))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let status = get("status").unwrap_or_else(|| "active".to_string());
+    if status != "active" && status != "inactive" {
+        return Err(format!("Invalid status '{status}'"));
+    }
+    // Custom values: every mapped key that isn't a standard key for the entity.
+    let standard: Vec<&str> = match entity_type {
+        "vehicle" => vec!["plate_number", "company", "driver", "registered_capacity", "capacity_unit", "status"],
+        _ => vec!["name", "status"],
+    };
+    let mut extra = serde_json::Map::new();
+    for key in cols.keys() {
+        if !standard.contains(&key.as_str()) {
+            if let Some(v) = get(key) {
+                extra.insert(key.clone(), serde_json::Value::String(v));
+            }
+        }
+    }
+    let extra_json = if extra.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extra).to_string())
+    };
+    match entity_type {
+        "company" => {
+            let name = get("name").ok_or_else(|| "Company name is required.".to_string())?;
+            let existing: Option<String> = conn
+                .query_row("SELECT id FROM companies WHERE upper(name) = upper(?1)", params![name], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match existing {
+                Some(id) => {
+                    conn.execute(
+                        "UPDATE companies SET status = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![status, extra_json, now_iso(), id],
+                    )
+                    .map_err(|e| format!("company update failed: {e}"))?;
+                    Ok(false)
+                }
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO companies (id, name, status, extra_fields, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                        params![id, name, status, extra_json, now_iso()],
+                    )
+                    .map_err(|e| format!("company create failed: {e}"))?;
+                    append_audit(conn, actor_id, "created_company", Some(&id), Some(serde_json::json!({ "name": name })))?;
+                    Ok(true)
+                }
+            }
+        }
+        "driver" => {
+            let name = get("name").ok_or_else(|| "Driver name is required.".to_string())?;
+            let existing: Option<String> = conn
+                .query_row("SELECT id FROM drivers WHERE upper(name) = upper(?1)", params![name], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match existing {
+                Some(id) => {
+                    conn.execute(
+                        "UPDATE drivers SET status = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![status, extra_json, now_iso(), id],
+                    )
+                    .map_err(|e| format!("driver update failed: {e}"))?;
+                    Ok(false)
+                }
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO drivers (id, name, status, extra_fields, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                        params![id, name, status, extra_json, now_iso()],
+                    )
+                    .map_err(|e| format!("driver create failed: {e}"))?;
+                    append_audit(conn, actor_id, "created_driver", Some(&id), Some(serde_json::json!({ "name": name })))?;
+                    Ok(true)
+                }
+            }
+        }
+        _ => {
+            let plate = normalize_plate(&get("plate_number").ok_or_else(|| "Plate number is required.".to_string())?);
+            if plate.is_empty() {
+                return Err("Plate number is required.".to_string());
+            }
+            let company_id = match get("company") {
+                Some(cname) => Some(find_or_create_company(conn, actor_id, &cname)?),
+                None => None,
+            };
+            let driver_id = match get("driver") {
+                Some(dname) => Some(find_or_create_driver(conn, actor_id, &dname)?),
+                None => None,
+            };
+            let capacity = match get("registered_capacity") {
+                Some(v) => Some(v.parse::<f64>().map_err(|_| format!("Invalid capacity '{v}'"))?),
+                None => None,
+            };
+            let unit = normalize_capacity_unit(&get("capacity_unit").unwrap_or_else(|| "litres".to_string()))?;
+            let existing: Option<String> = conn
+                .query_row("SELECT id FROM vehicles WHERE upper(plate_number) = upper(?1)", params![plate], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match existing {
+                Some(id) => {
+                    conn.execute(
+                        "UPDATE vehicles SET company_id = ?1, registered_capacity = ?2, capacity_unit = ?3,
+                                default_driver_id = ?4, status = ?5, extra_fields = ?6, updated_at = ?7
+                         WHERE id = ?8",
+                        params![company_id, capacity, unit, driver_id, status, extra_json, now_iso(), id],
+                    )
+                    .map_err(|e| format!("vehicle update failed: {e}"))?;
+                    Ok(false)
+                }
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO vehicles (id, plate_number, company_id, registered_capacity, capacity_unit,
+                                default_driver_id, status, extra_fields, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                        params![id, plate, company_id, capacity, unit, driver_id, status, extra_json, now_iso()],
+                    )
+                    .map_err(|e| format!("vehicle create failed: {e}"))?;
+                    append_audit(conn, actor_id, "created_vehicle", Some(&id), Some(serde_json::json!({ "plate_number": plate })))?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+fn ensure_custom_field(
+    conn: &Connection,
+    actor_id: &str,
+    entity_type: &str,
+    key: &str,
+    label: &str,
+    field_type: &str,
+    is_required: bool,
+) -> Result<(), String> {
+    if !VALID_FIELD_TYPES.contains(&field_type) {
+        return Err(format!("Invalid field type '{field_type}'."));
+    }
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT id FROM field_definitions WHERE entity_type = ?1 AND field_key = ?2",
+            params![entity_type, key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("field_definitions lookup failed: {e}"))?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO field_definitions
+            (id, entity_type, field_key, field_label, field_type, is_required, sort_order, is_standard, is_hidden, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?8)",
+        params![id, entity_type, key, label, field_type, is_required as i32, 100, now],
+    )
+    .map_err(|e| format!("field_definitions create failed: {e}"))?;
+    append_audit(
+        conn,
+        actor_id,
+        "created_field_definition",
+        Some(&id),
+        Some(serde_json::json!({ "entity_type": entity_type, "field_key": key, "field_label": label })),
+    )?;
+    Ok(())
+}
+
+fn summary_for<'a>(summary: &'a mut CombinedImportSummary, entity: &str) -> &'a mut ReferenceImportSummary {
+    match entity {
+        "company" => &mut summary.companies,
+        "driver" => &mut summary.drivers,
+        _ => &mut summary.vehicles,
+    }
+}
+
+/// Apply a confirmed combined import: create any new custom fields, then upsert
+/// every row by plate (vehicles) or name (companies/drivers). Per-row failures
+/// are collected per entity instead of aborting.
+#[tauri::command]
+pub fn reference_import_combined(
+    state: State<AppState>,
+    actor_id: String,
+    request: ReferenceImportRequest,
+) -> Result<CombinedImportSummary, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    let path = std::path::Path::new(&request.file_path);
+    if !path.exists() {
+        return Err(format!("Import file not found: {}", request.file_path));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let sheets_data: Vec<(String, Vec<Vec<String>>)> = match ext.as_str() {
+        "csv" => vec![("Sheet1".to_string(), read_csv_rows(path)?)],
+        "xlsx" => read_xlsx_sheets(path)?,
+        _ => return Err(format!("Unsupported import format '.{ext}'. Use .csv or .xlsx.")),
+    };
+    let mut summary = CombinedImportSummary {
+        companies: ReferenceImportSummary { entity_type: "company".into(), created: 0, updated: 0, skipped: 0, errors: Vec::new() },
+        drivers: ReferenceImportSummary { entity_type: "driver".into(), created: 0, updated: 0, skipped: 0, errors: Vec::new() },
+        vehicles: ReferenceImportSummary { entity_type: "vehicle".into(), created: 0, updated: 0, skipped: 0, errors: Vec::new() },
+    };
+    for sheet in &request.sheets {
+        let Some((_, rows)) = sheets_data.iter().find(|(name, _)| name == &sheet.sheet_name) else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        if !VALID_ENTITY_TYPES.contains(&sheet.entity_type.as_str()) {
+            summary_for(&mut summary, &sheet.entity_type)
+                .errors
+                .push(format!("{}: invalid entity type '{}'", sheet.sheet_name, sheet.entity_type));
+            continue;
+        }
+        // Resolve column mappings → field_key → column index; create new fields.
+        let header = &rows[0];
+        let mut colmap: HashMap<String, usize> = HashMap::new();
+        for col in &sheet.columns {
+            let Some(idx) = header.iter().position(|h| h == &col.header) else {
+                continue;
+            };
+            match col.mapping.as_str() {
+                "ignore" => {}
+                "new" => {
+                    let key = col.new_field_key.clone().unwrap_or_else(|| derive_field_key(&col.header, &[]));
+                    ensure_custom_field(
+                        &conn,
+                        &actor_id,
+                        &sheet.entity_type,
+                        &key,
+                        &col.header,
+                        col.new_field_type.as_deref().unwrap_or("text"),
+                        col.new_is_required.unwrap_or(false),
+                    )?;
+                    colmap.insert(key, idx);
+                }
+                key => {
+                    colmap.insert(key.to_string(), idx);
+                }
+            }
+        }
+        for (i, row) in rows.iter().enumerate().skip(1) {
+            let row_no = i + 2; // header is row 1
+            match apply_import_row_combined(&conn, &actor_id, &sheet.entity_type, &colmap, row) {
+                Ok(true) => summary_for(&mut summary, &sheet.entity_type).created += 1,
+                Ok(false) => summary_for(&mut summary, &sheet.entity_type).updated += 1,
+                Err(e) => {
+                    let s = summary_for(&mut summary, &sheet.entity_type);
+                    s.errors.push(format!("{} row {row_no}: {e}", sheet.sheet_name));
+                    s.skipped += 1;
+                }
+            }
+        }
+    }
+    append_audit(
+        &conn,
+        &actor_id,
+        "reference_imported_combined",
+        None,
+        Some(serde_json::json!({
+            "file": request.file_path,
+            "companies": summary.companies.created + summary.companies.updated,
+            "drivers": summary.drivers.created + summary.drivers.updated,
+            "vehicles": summary.vehicles.created + summary.vehicles.updated,
+            "errors": summary.companies.errors.len() + summary.drivers.errors.len() + summary.vehicles.errors.len(),
         })),
     )?;
     Ok(summary)

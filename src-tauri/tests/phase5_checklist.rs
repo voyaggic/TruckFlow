@@ -20,7 +20,10 @@ use truckflow_lib::archive;
 use truckflow_lib::capture::{ingest_read, set_capture_settings, SimulatorSource};
 use truckflow_lib::commands;
 use truckflow_lib::db::{open_db, AppState};
-use truckflow_lib::models::{AnprFrame, AnprRead, ReportFilters, SessionUser, VehicleView};
+use truckflow_lib::models::{
+    AnprFrame, AnprRead, ColumnInfo, ConfirmedColumn, ConfirmedSheet, ReferenceImportRequest,
+    ReportFilters, SessionUser, VehicleView,
+};
 use truckflow_lib::reference;
 use truckflow_lib::reporting;
 use truckflow_lib::sync::{
@@ -907,4 +910,161 @@ fn reference_export_then_import_round_trips_custom_fields() {
     assert_eq!(summary3.created, 0, "vehicle skipped");
     assert_eq!(summary3.errors.len(), 1, "one per-row error reported");
     assert!(summary3.errors[0].contains("Nope Corp"));
+}
+
+// ---------------------------------------------------------------------------
+// Combined reference import/export (one workbook, all entity types)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn combined_export_then_import_round_trips_all_entities() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    // Custom fields on vehicle + company so extra_fields survive the round trip.
+    reference::create_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        "vehicle".into(),
+        "fleet_no".into(),
+        "Fleet No".into(),
+        "text".into(),
+        false,
+        None,
+    )
+    .expect("create vehicle field def");
+    reference::create_field_definition(
+        ctx.state(),
+        admin.id.clone(),
+        "company".into(),
+        "region".into(),
+        "Region".into(),
+        "text".into(),
+        false,
+        None,
+    )
+    .expect("create company field def");
+
+    let company = reference::create_company(
+        ctx.state(),
+        admin.id.clone(),
+        "Acme Waste".into(),
+        Some(r#"{"region":"North"}"#.into()),
+    )
+    .unwrap();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "D. Singh".into(), None).unwrap();
+    reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "DL 4G 8834".into(),
+        Some(company.id.clone()),
+        Some(20.0),
+        "litres".into(),
+        Some(driver.id.clone()),
+        Some(r#"{"fleet_no":"A-4412"}"#.into()),
+    )
+    .unwrap();
+
+    let tmp = TempDb::new();
+    let out_path = tmp.dir.join("combined.xlsx");
+    let path = reference::reference_export_combined(
+        ctx.state(),
+        admin.id.clone(),
+        Some(out_path.to_string_lossy().into_owned()),
+    )
+    .expect("export combined xlsx");
+    assert!(std::path::Path::new(&path).exists());
+
+    // Preview classifies all three sheets and the custom columns.
+    let preview = reference::reference_import_preview(ctx.state(), admin.id.clone(), path.clone()).expect("preview");
+    assert_eq!(preview.sheets.len(), 3, "one sheet per entity");
+    let vehicle_sheet = preview.sheets.iter().find(|s| s.entity_type == "vehicle").expect("vehicle sheet");
+    assert_eq!(vehicle_sheet.row_count, 1);
+    assert!(
+        vehicle_sheet
+            .columns
+            .iter()
+            .any(|c| matches!(c, ColumnInfo::Standard { field_key, .. } if field_key == "plate_number")),
+        "plate column classified as standard"
+    );
+    assert!(
+        vehicle_sheet
+            .columns
+            .iter()
+            .any(|c| matches!(c, ColumnInfo::ExistingCustom { field_key, .. } if field_key == "fleet_no")),
+        "fleet_no classified as existing custom field"
+    );
+    let company_sheet = preview.sheets.iter().find(|s| s.entity_type == "company").expect("company sheet");
+    assert!(
+        company_sheet
+            .columns
+            .iter()
+            .any(|c| matches!(c, ColumnInfo::ExistingCustom { field_key, .. } if field_key == "region")),
+        "region classified as existing custom field"
+    );
+
+    // Confirm the auto classification and apply the import back into the same DB.
+    let sheets: Vec<ConfirmedSheet> = preview
+        .sheets
+        .iter()
+        .map(|s| ConfirmedSheet {
+            sheet_name: s.sheet_name.clone(),
+            entity_type: s.entity_type.clone(),
+            columns: s
+                .columns
+                .iter()
+                .map(|c| match c {
+                    ColumnInfo::Standard { header, field_key, .. } => ConfirmedColumn {
+                        header: header.clone(),
+                        mapping: field_key.clone(),
+                        new_field_key: None,
+                        new_field_type: None,
+                        new_is_required: None,
+                    },
+                    ColumnInfo::ExistingCustom { header, field_key, .. } => ConfirmedColumn {
+                        header: header.clone(),
+                        mapping: field_key.clone(),
+                        new_field_key: None,
+                        new_field_type: None,
+                        new_is_required: None,
+                    },
+                    ColumnInfo::NewCustom { header, field_key, field_type, is_required, .. } => ConfirmedColumn {
+                        header: header.clone(),
+                        mapping: "new".into(),
+                        new_field_key: Some(field_key.clone()),
+                        new_field_type: Some(field_type.clone()),
+                        new_is_required: Some(*is_required),
+                    },
+                })
+                .collect(),
+        })
+        .collect();
+    let req = ReferenceImportRequest {
+        file_path: path.clone(),
+        sheets,
+    };
+    let summary = reference::reference_import_combined(ctx.state(), admin.id.clone(), req).expect("apply combined import");
+    assert_eq!(summary.vehicles.updated, 1, "same DB → vehicle updated, not duplicated");
+    assert_eq!(summary.companies.updated, 1);
+    assert_eq!(summary.drivers.updated, 1);
+    assert_eq!(summary.vehicles.created, 0);
+    assert!(summary.vehicles.errors.is_empty(), "vehicle errors: {:?}", summary.vehicles.errors);
+    assert!(summary.companies.errors.is_empty(), "company errors: {:?}", summary.companies.errors);
+
+    // Custom field values survived the full round trip.
+    let companies = reference::list_companies(ctx.state(), None).unwrap();
+    let acme = companies.iter().find(|c| c.name == "Acme Waste").unwrap();
+    assert_eq!(
+        acme.extra_fields.as_ref().and_then(|m| m.get("region")).and_then(|v| v.as_str()),
+        Some("North"),
+        "company custom field preserved"
+    );
+    let vehicles = reference::list_vehicles(ctx.state(), None).unwrap();
+    let v = vehicles.iter().find(|v| v.plate_number == "DL4G8834").unwrap();
+    assert_eq!(v.company_name.as_deref(), Some("Acme Waste"));
+    assert_eq!(
+        v.extra_fields.as_ref().and_then(|m| m.get("fleet_no")).and_then(|v| v.as_str()),
+        Some("A-4412"),
+        "vehicle custom field preserved"
+    );
 }

@@ -523,6 +523,13 @@ pub struct FieldDefinition {
     pub field_label: String,
     pub field_type: String, // text | number | boolean | mixed
     pub is_required: bool,
+    /// True for the seeded built-in fields (plate, company, driver, name…).
+    /// Standard fields map to real database columns; custom fields map to the
+    /// `extra_fields` JSON column.
+    pub is_standard: bool,
+    /// Hidden fields are excluded from forms, import, and export. Standard
+    /// fields are hidden (never hard-deleted) because they back real columns.
+    pub is_hidden: bool,
     pub sort_order: i32,
     pub created_at: String,
     pub updated_at: String,
@@ -537,4 +544,89 @@ pub struct ReferenceImportSummary {
     pub updated: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Combined reference import/export (one spreadsheet, all entity types)
+// ---------------------------------------------------------------------------
+
+/// How a spreadsheet header has been classified during import preview.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ColumnInfo {
+    /// A recognised standard column (plate_number, company, name…).
+    Standard {
+        header: String,
+        field_key: String,
+        sample_values: Vec<String>,
+    },
+    /// A custom field already defined in the database.
+    ExistingCustom {
+        header: String,
+        field_key: String,
+        field_type: String,
+        sample_values: Vec<String>,
+    },
+    /// A header that matches nothing yet and needs confirmation.
+    NewCustom {
+        header: String,
+        field_key: String,
+        field_type: String,
+        is_required: bool,
+        sample_values: Vec<String>,
+    },
+}
+
+/// One worksheet of the uploaded spreadsheet preview.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SheetPreview {
+    pub sheet_name: String,
+    /// "company" | "driver" | "vehicle" | "unknown" (admin picks when unknown).
+    pub entity_type: String,
+    pub columns: Vec<ColumnInfo>,
+    pub row_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceImportPreview {
+    pub file_path: String,
+    pub sheets: Vec<SheetPreview>,
+}
+
+/// A column mapping confirmed by the admin before applying the import.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfirmedColumn {
+    pub header: String,
+    /// "ignore" | existing field key | "new" (create a new custom field).
+    pub mapping: String,
+    pub new_field_key: Option<String>,
+    pub new_field_type: Option<String>,
+    pub new_is_required: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfirmedSheet {
+    pub sheet_name: String,
+    pub entity_type: String,
+    pub columns: Vec<ConfirmedColumn>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceImportRequest {
+    pub file_path: String,
+    pub sheets: Vec<ConfirmedSheet>,
+}
+
+/// Full summary covering all three entity types in a combined import.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CombinedImportSummary {
+    pub companies: ReferenceImportSummary,
+    pub drivers: ReferenceImportSummary,
+    pub vehicles: ReferenceImportSummary,
 }

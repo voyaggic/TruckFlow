@@ -504,6 +504,58 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 15 {
+        // Field definitions become the single source of truth for the
+        // reference-database schema: the built-in fields (plate, company,
+        // driver, capacity, name) are seeded as *standard* definitions so
+        // admins can rename their labels, change their type, or hide them,
+        // while custom fields stay fully dynamic. `is_hidden` lets standard
+        // fields be removed from the UI/import/export without dropping the
+        // real column they map to.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE field_definitions ADD COLUMN is_standard INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE field_definitions ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0;
+            "#,
+        )
+        .map_err(|e| format!("migration 15 alter failed: {e}"))?;
+        let now = now_iso();
+        // Seed the built-in fields (only when not already present — the unique
+        // index on (entity_type, field_key) makes this safe to re-run).
+        let seeds: &[(&str, &str, &str, &str, i32, bool)] = &[
+            ("vehicle", "plate_number", "Plate", "text", 0, true),
+            ("vehicle", "company", "Company", "text", 1, false),
+            ("vehicle", "driver", "Driver", "text", 2, false),
+            ("vehicle", "registered_capacity", "Capacity (L)", "number", 3, false),
+            ("vehicle", "capacity_unit", "Capacity Unit", "text", 4, false),
+            ("vehicle", "status", "Status", "text", 5, false),
+            ("company", "name", "Company Name", "text", 0, true),
+            ("company", "status", "Status", "text", 1, false),
+            ("driver", "name", "Driver Name", "text", 0, true),
+            ("driver", "status", "Status", "text", 1, false),
+        ];
+        for (entity_type, field_key, field_label, field_type, sort_order, is_required) in seeds {
+            conn.execute(
+                "INSERT OR IGNORE INTO field_definitions
+                    (id, entity_type, field_key, field_label, field_type, is_required, sort_order, is_standard, is_hidden, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?8, ?8)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    entity_type,
+                    field_key,
+                    field_label,
+                    field_type,
+                    *is_required as i32,
+                    sort_order,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("migration 15 seed failed: {e}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 15;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 

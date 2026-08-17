@@ -240,7 +240,7 @@ export const api = {
   updateFieldDefinition: (
     actorId: string,
     fieldId: string,
-    changes: Partial<Pick<FieldDefinition, "field_label" | "field_type" | "is_required" | "sort_order">>,
+    changes: Partial<Pick<FieldDefinition, "field_label" | "field_type" | "is_required" | "sort_order" | "is_hidden">>,
   ) =>
     invoke<void>("update_field_definition", {
       actorId,
@@ -249,6 +249,7 @@ export const api = {
       fieldType: changes.field_type ?? null,
       isRequired: changes.is_required ?? null,
       sortOrder: changes.sort_order ?? null,
+      isHidden: changes.is_hidden ?? null,
     }),
 
   deleteFieldDefinition: (actorId: string, fieldId: string) =>

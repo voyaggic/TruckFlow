@@ -4,16 +4,23 @@ import { api } from "../lib/api";
 import type {
   AuditEntry,
   AuditFilters,
+  ColumnInfo,
+  CombinedImportSummary,
   CompanyView,
+  ConfirmedColumn,
+  ConfirmedSheet,
   DriverView,
   FieldDefinition,
   ListPermissionItem,
   OfficerActivityView,
   PasswordResetRequestView,
   ReferenceEntityType,
+  ReferenceImportPreview,
+  ReferenceImportRequest,
   ReferenceImportSummary,
   RolePresetView,
   SessionUser,
+  SheetPreview,
   TripView,
   UserView,
   VehicleView,
@@ -1094,6 +1101,8 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"vehicles" | "companies" | "drivers" | "fields">("vehicles");
+  const [importPreview, setImportPreview] = useState<ReferenceImportPreview | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -1145,6 +1154,41 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       setTimeout(() => onNotice(""), 5000);
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const exportAll = async () => {
+    setError(null);
+    try {
+      const filePath = await save({
+        defaultPath: `truckflow-reference-${new Date().toISOString().slice(0, 10)}.xlsx`,
+        filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+      });
+      if (!filePath) return; // cancelled
+      const path = await api.referenceExportCombined(actor.id, filePath);
+      onNotice(`Reference database exported to ${path}`);
+      setTimeout(() => onNotice(""), 5000);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const startImport = async () => {
+    setError(null);
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "CSV or Excel", extensions: ["csv", "xlsx"] }],
+      });
+      if (typeof picked !== "string") return; // cancelled
+      setImportBusy(true);
+      const preview = await api.referenceImportPreview(actor.id, picked);
+      setImportPreview(preview);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setImportBusy(false);
     }
   };
 
@@ -1200,7 +1244,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
             Drivers ({drivers.length})
           </button>
           <button className={tab === "fields" ? "active" : ""} onClick={() => setTab("fields")}>
-            Custom Fields
+            Fields
           </button>
         </div>
       </div>
@@ -1208,6 +1252,16 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       {error && <div className="error-banner">{error}</div>}
 
       <div className="row between" style={{ flexWrap: "wrap", gap: 8 }}>
+        <div className="seg" style={{ flexWrap: "wrap" }}>
+          <button className="primary" onClick={exportAll}>
+            ⬇ Export all (one Excel file)
+          </button>
+          <button className="primary" onClick={startImport} disabled={importBusy}>
+            ⬆ Import spreadsheet…
+          </button>
+        </div>
+      </div>
+      <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
         <div className="seg" style={{ flexWrap: "wrap" }}>
           <button onClick={() => exportTo("company", "companies", "csv")}>Export companies CSV</button>
           <button onClick={() => exportTo("company", "companies", "xlsx")}>Export companies XLSX</button>
@@ -1289,6 +1343,305 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       {tab === "fields" && (
         <FieldManager actor={actor} onNotice={onNotice} onChanged={refresh} />
       )}
+
+      {importPreview && (
+        <ImportWizard
+          actor={actor}
+          preview={importPreview}
+          fields={{ vehicle: vehicleFields, company: companyFields, driver: driverFields }}
+          onClose={() => setImportPreview(null)}
+          onApplied={(summary) => {
+            const parts: string[] = [];
+            for (const [label, s] of [
+              ["Companies", summary.companies],
+              ["Drivers", summary.drivers],
+              ["Vehicles", summary.vehicles],
+            ] as const) {
+              if (s.created || s.updated || s.skipped) parts.push(`${label}: ${s.created} created, ${s.updated} updated, ${s.skipped} skipped`);
+            }
+            const errs = [...summary.companies.errors, ...summary.drivers.errors, ...summary.vehicles.errors];
+            if (errs.length) {
+              setError(`${parts.join(" · ")}. Errors:\n${errs.slice(0, 10).join("\n")}`);
+            } else {
+              onNotice(`Import complete — ${parts.join(" · ")}`);
+              setTimeout(() => onNotice(""), 8000);
+            }
+            refresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Import wizard — map the columns of the admin's own spreadsheet, then apply
+// ---------------------------------------------------------------------------
+
+interface ColConfig {
+  mapping: string; // field key | "new" | "ignore"
+  newKey: string;
+  newType: "text" | "number" | "boolean" | "mixed";
+  newRequired: boolean;
+}
+
+interface SheetConfig {
+  entity: ReferenceEntityType;
+  columns: Record<string, ColConfig>;
+}
+
+const FIELD_TYPE_LABELS: Record<string, string> = {
+  text: "Text",
+  number: "Number",
+  boolean: "Yes / No",
+  mixed: "Mixed",
+};
+
+/** Standard field keys the backend understands per entity. */
+const STANDARD_KEYS: Record<ReferenceEntityType, { key: string; label: string }[]> = {
+  vehicle: [
+    { key: "plate_number", label: "Plate number" },
+    { key: "company", label: "Company" },
+    { key: "driver", label: "Driver" },
+    { key: "registered_capacity", label: "Registered capacity" },
+    { key: "capacity_unit", label: "Capacity unit" },
+    { key: "status", label: "Status" },
+  ],
+  company: [
+    { key: "name", label: "Name" },
+    { key: "status", label: "Status" },
+  ],
+  driver: [
+    { key: "name", label: "Name" },
+    { key: "status", label: "Status" },
+  ],
+};
+
+function defaultMappingFor(entity: ReferenceEntityType, col: ColumnInfo, fields: FieldDefinition[]): ColConfig {
+  const valid = new Set([...STANDARD_KEYS[entity].map((s) => s.key), ...fields.filter((f) => !f.is_hidden).map((f) => f.field_key)]);
+  let mapping: string;
+  if (col.kind === "standard" && valid.has(col.field_key)) {
+    mapping = col.field_key;
+  } else if (col.kind === "existing_custom" && valid.has(col.field_key)) {
+    mapping = col.field_key;
+  } else {
+    mapping = "new";
+  }
+  return {
+    mapping,
+    newKey: col.kind === "new_custom" ? col.field_key : "",
+    newType: col.kind === "new_custom" ? col.field_type : "text",
+    newRequired: col.kind === "new_custom" ? col.is_required : false,
+  };
+}
+
+function ImportWizard({
+  actor,
+  preview,
+  fields,
+  onClose,
+  onApplied,
+}: {
+  actor: SessionUser;
+  preview: ReferenceImportPreview;
+  fields: Record<ReferenceEntityType, FieldDefinition[]>;
+  onClose: () => void;
+  onApplied: (s: CombinedImportSummary) => void;
+}) {
+  const resolveEntity = (e: string): ReferenceEntityType =>
+    e === "vehicle" || e === "company" || e === "driver" ? e : "company";
+
+  const [configs, setConfigs] = useState<SheetConfig[]>(() =>
+    preview.sheets.map((s) => {
+      const entity = resolveEntity(s.entity_type);
+      return {
+        entity,
+        columns: Object.fromEntries(s.columns.map((c) => [c.header, defaultMappingFor(entity, c, fields[entity])])),
+      };
+    }),
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const setCol = (sheetIdx: number, header: string, patch: Partial<ColConfig>) => {
+    setConfigs((prev) =>
+      prev.map((c, i) =>
+        i === sheetIdx ? { ...c, columns: { ...c.columns, [header]: { ...c.columns[header], ...patch } } } : c,
+      ),
+    );
+  };
+
+  const changeEntity = (sheetIdx: number, entity: ReferenceEntityType, sheet: SheetPreview) => {
+    setConfigs((prev) =>
+      prev.map((c, i) =>
+        i === sheetIdx
+          ? {
+              entity,
+              columns: Object.fromEntries(
+                sheet.columns.map((col) => [col.header, defaultMappingFor(entity, col, fields[entity])]),
+              ),
+            }
+          : c,
+      ),
+    );
+  };
+
+  const apply = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const sheets: ConfirmedSheet[] = preview.sheets.map((sheet, si) => ({
+        sheet_name: sheet.sheet_name,
+        entity_type: configs[si].entity,
+        columns: sheet.columns.map((col): ConfirmedColumn => {
+          const cfg = configs[si].columns[col.header];
+          if (cfg.mapping === "ignore") return { header: col.header, mapping: "ignore" };
+          if (cfg.mapping === "new") {
+            return {
+              header: col.header,
+              mapping: "new",
+              new_field_key: cfg.newKey || col.header.toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+              new_field_type: cfg.newType,
+              new_is_required: cfg.newRequired,
+            };
+          }
+          return { header: col.header, mapping: cfg.mapping };
+        }),
+      }));
+      const request: ReferenceImportRequest = { file_path: preview.file_path, sheets };
+      const summary = await api.referenceImportCombined(actor.id, request);
+      onApplied(summary);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, marginTop: 10 }}>
+      <div className="row between">
+        <div className="section-title" style={{ fontSize: 14 }}>
+          Import — review &amp; map columns
+        </div>
+        <button className="ghost small" onClick={onClose}>
+          ✕
+        </button>
+      </div>
+      <p className="muted small">
+        For each sheet, choose what each column maps to. Columns you don't want can be ignored. "Create new field"
+        adds a new field to the database — it will appear in the forms next to the standard fields after importing.
+      </p>
+      {error && <div className="error-banner">{error}</div>}
+
+      {preview.sheets.map((sheet, si) => {
+        const cfg = configs[si];
+        const customKeys = fields[cfg.entity].filter((f) => !f.is_hidden).map((f) => f.field_key);
+        const options = [
+          ...STANDARD_KEYS[cfg.entity].filter((s) => !customKeys.includes(s.key)).map((s) => ({ value: s.key, label: `${s.label} (standard)` })),
+          ...fields[cfg.entity].filter((f) => !f.is_hidden && !STANDARD_KEYS[cfg.entity].some((s) => s.key === f.field_key)).map((f) => ({ value: f.field_key, label: `${f.field_label} (existing field)` })),
+          { value: "new", label: "＋ Create new field…" },
+          { value: "ignore", label: "✕ Ignore (don't import)" },
+        ];
+        return (
+          <div key={sheet.sheet_name} className="stack" style={{ borderTop: "1px solid var(--border)", paddingTop: 10, marginTop: 10 }}>
+            <div className="row between" style={{ flexWrap: "wrap", gap: 8 }}>
+              <div className="section-title" style={{ fontSize: 13 }}>
+                Sheet: <b>{sheet.sheet_name}</b> — {sheet.row_count} data rows
+              </div>
+              <div className="field" style={{ margin: 0 }}>
+                <label>Import as</label>
+                <select value={cfg.entity} onChange={(e) => changeEntity(si, e.target.value as ReferenceEntityType, sheet)}>
+                  <option value="vehicle">Vehicles</option>
+                  <option value="company">Companies</option>
+                  <option value="driver">Drivers</option>
+                </select>
+              </div>
+            </div>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Spreadsheet column</th>
+                  <th>Example values</th>
+                  <th>Maps to</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sheet.columns.map((col) => {
+                  const colCfg = cfg.columns[col.header];
+                  return (
+                    <tr key={col.header}>
+                      <td>
+                        <b>{col.header}</b>
+                        {col.kind !== "new_custom" && (
+                          <span className="badge" style={{ marginLeft: 6 }}>
+                            {col.kind === "standard" ? "Standard" : "Existing field"}
+                          </span>
+                        )}
+                      </td>
+                      <td className="muted small">{(col.sample_values ?? []).slice(0, 3).join(", ") || "—"}</td>
+                      <td>
+                        <div className="stack" style={{ gap: 6 }}>
+                          <select
+                            value={colCfg.mapping}
+                            onChange={(e) => setCol(si, col.header, { mapping: e.target.value })}
+                          >
+                            {options.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                          {colCfg.mapping === "new" && (
+                            <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                              <input
+                                style={{ maxWidth: 160 }}
+                                value={colCfg.newKey}
+                                onChange={(e) => setCol(si, col.header, { newKey: e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_") })}
+                                placeholder="field key"
+                              />
+                              <select
+                                style={{ width: 110 }}
+                                value={colCfg.newType}
+                                onChange={(e) => setCol(si, col.header, { newType: e.target.value as ColConfig["newType"] })}
+                              >
+                                {Object.entries(FIELD_TYPE_LABELS).map(([v, l]) => (
+                                  <option key={v} value={v}>
+                                    {l}
+                                  </option>
+                                ))}
+                              </select>
+                              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                                <input
+                                  type="checkbox"
+                                  checked={colCfg.newRequired}
+                                  onChange={(e) => setCol(si, col.header, { newRequired: e.target.checked })}
+                                  style={{ width: "auto" }}
+                                />
+                                required
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+
+      <div className="row">
+        <button className="primary" onClick={apply} disabled={busy}>
+          {busy ? "Importing…" : "Apply import"}
+        </button>
+        <button className="ghost" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }
@@ -1381,6 +1734,11 @@ function VehicleTable({
     setEditingId(null);
   };
 
+  const visibleDefs = fieldDefs.filter((fd) => !fd.is_hidden);
+  const stdDefs = visibleDefs.filter((fd) => fd.is_standard);
+  const customDefs = visibleDefs.filter((fd) => !fd.is_standard);
+  const showUnit = stdDefs.some((fd) => fd.field_key === "capacity_unit");
+
   return (
     <div className="stack">
       {(adding || editingId) && (
@@ -1388,92 +1746,92 @@ function VehicleTable({
           <div className="section-title" style={{ fontSize: 14 }}>
             {editingId ? "Edit vehicle" : "Register vehicle"}
           </div>
-          <div className="row">
-            <div className="field" style={{ margin: 0 }}>
-              <label>Plate</label>
-              <input value={plate} onChange={(e) => setPlate(e.target.value.toUpperCase())} placeholder="A123AB" />
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label>Company</label>
-              <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
-                <option value="">—</option>
-                {companies
-                  .filter((c) => c.status === "active")
-                  .map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-              </select>
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label>Capacity (L)</label>
-              <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
-                <input
-                  style={{ flex: 1 }}
-                  value={capacity}
-                  onChange={(e) => setCapacity(e.target.value)}
-                  placeholder="25"
-                />
-                <select
-                  style={{ width: 120 }}
-                  value={capacityUnit}
-                  onChange={(e) => setCapacityUnit(e.target.value)}
-                >
-                  <option value="litres">Litres</option>
-                  <option value="cubic_meters">m³</option>
-                  <option value="gallons">Gallons</option>
-                  <option value="tonnes">Tonnes</option>
-                  <option value="kg">kg</option>
-                </select>
-              </div>
-            </div>
-            <div className="field" style={{ margin: 0 }}>
-              <label>Default driver</label>
-              <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
-                <option value="">—</option>
-                {drivers
-                  .filter((d) => d.status === "active")
-                  .map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.name}
-                    </option>
-                  ))}
-              </select>
-            </div>
-          </div>
-          {fieldDefs.length > 0 && (
-            <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {fieldDefs.map((fd) => (
-                <div key={fd.id} className="field" style={{ margin: 0, minWidth: 160 }}>
-                  <label>
-                    {fd.field_label}
-                    {fd.is_required && <span style={{ color: "var(--danger, #d32f2f)" }}> *</span>}
-                  </label>
-                  {fd.field_type === "boolean" ? (
-                    <select
-                      value={extraFields[fd.field_key] != null ? String(extraFields[fd.field_key]) : ""}
-                      onChange={(e) => setExtraFields({ ...extraFields, [fd.field_key]: e.target.value === "true" })}
-                    >
+          <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
+            {stdDefs.map((fd) => {
+              const req = fd.is_required ? <span style={{ color: "var(--danger, #d32f2f)" }}> *</span> : null;
+              if (fd.field_key === "plate_number") {
+                return (
+                  <div key={fd.id} className="field" style={{ margin: 0 }}>
+                    <label>{fd.field_label}{req}</label>
+                    <input value={plate} onChange={(e) => setPlate(e.target.value.toUpperCase())} placeholder="A123AB" />
+                  </div>
+                );
+              }
+              if (fd.field_key === "company") {
+                return (
+                  <div key={fd.id} className="field" style={{ margin: 0 }}>
+                    <label>{fd.field_label}{req}</label>
+                    <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
                       <option value="">—</option>
-                      <option value="true">Yes</option>
-                      <option value="false">No</option>
+                      {companies
+                        .filter((c) => c.status === "active")
+                        .map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
                     </select>
-                  ) : fd.field_type === "number" ? (
-                    <input
-                      type="number"
-                      value={extraFields[fd.field_key] != null ? String(extraFields[fd.field_key]) : ""}
-                      onChange={(e) => setExtraFields({ ...extraFields, [fd.field_key]: e.target.value === "" ? null : Number(e.target.value) })}
-                      placeholder={fd.field_label}
-                    />
-                  ) : (
-                    <input
-                      value={extraFields[fd.field_key] != null ? String(extraFields[fd.field_key]) : ""}
-                      onChange={(e) => setExtraFields({ ...extraFields, [fd.field_key]: e.target.value || null })}
-                      placeholder={fd.field_label}
-                    />
-                  )}
-                </div>
+                  </div>
+                );
+              }
+              if (fd.field_key === "driver") {
+                return (
+                  <div key={fd.id} className="field" style={{ margin: 0 }}>
+                    <label>{fd.field_label}{req}</label>
+                    <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
+                      <option value="">—</option>
+                      {drivers
+                        .filter((d) => d.status === "active")
+                        .map((d) => (
+                          <option key={d.id} value={d.id}>
+                            {d.name}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                );
+              }
+              if (fd.field_key === "registered_capacity") {
+                return (
+                  <div key={fd.id} className="field" style={{ margin: 0 }}>
+                    <label>{fd.field_label}{req}</label>
+                    <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+                      <input
+                        style={{ flex: 1 }}
+                        value={capacity}
+                        onChange={(e) => setCapacity(e.target.value)}
+                        placeholder="25"
+                      />
+                      {showUnit && (
+                        <select
+                          style={{ width: 120 }}
+                          value={capacityUnit}
+                          onChange={(e) => setCapacityUnit(e.target.value)}
+                        >
+                          <option value="litres">Litres</option>
+                          <option value="cubic_meters">m³</option>
+                          <option value="gallons">Gallons</option>
+                          <option value="tonnes">Tonnes</option>
+                          <option value="kg">kg</option>
+                        </select>
+                      )}
+                    </div>
+                  </div>
+                );
+              }
+              if (fd.field_key === "capacity_unit") return null; // rendered inside the capacity row
+              return null;
+            })}
+          </div>
+          {customDefs.length > 0 && (
+            <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
+              {customDefs.map((fd) => (
+                <DynamicFieldInput
+                  key={fd.id}
+                  fd={fd}
+                  value={extraFields[fd.field_key]}
+                  onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })}
+                />
               ))}
             </div>
           )}
@@ -1597,6 +1955,9 @@ function CompanyTable({
     setName("");
   };
 
+  const customDefs = fieldDefs.filter((fd) => !fd.is_hidden && !fd.is_standard);
+  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.field_key === "name" && !fd.is_hidden);
+
   return (
     <div className="stack">
       {canRegister && (
@@ -1608,11 +1969,19 @@ function CompanyTable({
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
           <div className="row">
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Company name" style={{ maxWidth: 300 }} />
+            <div className="field" style={{ margin: 0, flex: 1, maxWidth: 300 }}>
+              {nameDef && (
+                <label>
+                  {nameDef.field_label}
+                  {nameDef.is_required && <span style={{ color: "var(--danger, #d32f2f)" }}> *</span>}
+                </label>
+              )}
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder={nameDef?.field_label ?? "Company name"} />
+            </div>
           </div>
-          {fieldDefs.length > 0 && (
+          {customDefs.length > 0 && (
             <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {fieldDefs.map((fd) => (
+              {customDefs.map((fd) => (
                 <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
               ))}
             </div>
@@ -1718,6 +2087,9 @@ function DriverTable({
     setName("");
   };
 
+  const customDefs = fieldDefs.filter((fd) => !fd.is_hidden && !fd.is_standard);
+  const nameDef = fieldDefs.find((fd) => fd.is_standard && fd.field_key === "name" && !fd.is_hidden);
+
   return (
     <div className="stack">
       {canRegister && (
@@ -1729,11 +2101,19 @@ function DriverTable({
       {(adding || editingId) && (
         <div className="stack" style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}>
           <div className="row">
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Driver name" style={{ maxWidth: 300 }} />
+            <div className="field" style={{ margin: 0, flex: 1, maxWidth: 300 }}>
+              {nameDef && (
+                <label>
+                  {nameDef.field_label}
+                  {nameDef.is_required && <span style={{ color: "var(--danger, #d32f2f)" }}> *</span>}
+                </label>
+              )}
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder={nameDef?.field_label ?? "Driver name"} />
+            </div>
           </div>
-          {fieldDefs.length > 0 && (
+          {customDefs.length > 0 && (
             <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
-              {fieldDefs.map((fd) => (
+              {customDefs.map((fd) => (
                 <DynamicFieldInput key={fd.id} fd={fd} value={extraFields[fd.field_key]} onChange={(v) => setExtraFields({ ...extraFields, [fd.field_key]: v })} />
               ))}
             </div>
@@ -1891,6 +2271,7 @@ function FieldManager({
   const [newLabel, setNewLabel] = useState("");
   const [newType, setNewType] = useState("text");
   const [newRequired, setNewRequired] = useState(false);
+  const [showHidden, setShowHidden] = useState(false);
 
   const refreshFields = useCallback(async () => {
     try {
@@ -1974,14 +2355,28 @@ function FieldManager({
   };
 
   const deleteField = async (fd: FieldDefinition) => {
-    const ok = window.confirm(
-      `Delete the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]}?\n\nExisting data in this field will be kept in the records but the field will no longer appear in the forms.`,
-    );
+    const msg = fd.is_standard
+      ? `Remove the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]}?\n\nStandard fields are hidden, not deleted — your existing records and history are untouched. You can restore it later.`
+      : `Delete the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]}?\n\nExisting data in this field will be kept in the records but the field will no longer appear in the forms.`;
+    const ok = window.confirm(msg);
     if (!ok) return;
     setError(null);
     try {
       await api.deleteFieldDefinition(actor.id, fd.id);
-      onNotice(`Field "${fd.field_label}" removed.`);
+      onNotice(`Field "${fd.field_label}" ${fd.is_standard ? "hidden" : "removed"}.`);
+      setTimeout(() => onNotice(""), 4000);
+      await refreshFields();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const restoreField = async (fd: FieldDefinition) => {
+    setError(null);
+    try {
+      await api.updateFieldDefinition(actor.id, fd.id, { is_hidden: false });
+      onNotice(`Field "${fd.field_label}" restored.`);
       setTimeout(() => onNotice(""), 4000);
       await refreshFields();
       onChanged();
@@ -1993,16 +2388,28 @@ function FieldManager({
   return (
     <div className="stack">
       <p className="muted small">
-        Add custom fields to the registration forms. These fields appear when adding or editing a record, and their
-        values are saved alongside the standard fields. You can add as many fields as you need.
+        These fields drive the registration forms, exports, and imports. The standard fields (Plate, Company, Driver,
+        Capacity…) are here too — rename them, change their type, or remove them so the system matches how your
+        operation actually records vehicles. Add as many custom fields as you need.
       </p>
 
-      <div className="seg" style={{ alignSelf: "flex-start" }}>
-        {Object.entries(ENTITY_LABELS).map(([key, label]) => (
-          <button key={key} className={entityTab === key ? "active" : ""} onClick={() => setEntityTab(key)}>
-            {label}
-          </button>
-        ))}
+      <div className="row" style={{ flexWrap: "wrap", gap: 8, alignItems: "flex-end" }}>
+        <div className="seg" style={{ alignSelf: "flex-start" }}>
+          {Object.entries(ENTITY_LABELS).map(([key, label]) => (
+            <button key={key} className={entityTab === key ? "active" : ""} onClick={() => setEntityTab(key)}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={showHidden}
+            onChange={(e) => setShowHidden(e.target.checked)}
+            style={{ width: "auto" }}
+          />
+          Show hidden fields
+        </label>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
@@ -2083,8 +2490,7 @@ function FieldManager({
 
       {fields.length === 0 ? (
         <p className="muted small">
-          No custom fields yet. The registration form uses only the standard fields (Plate, Company, Capacity, Driver).
-          Add custom fields above to extend it.
+          No fields defined yet for {ENTITY_LABELS[entityTab]}. Add fields above.
         </p>
       ) : (
         <table className="table">
@@ -2098,28 +2504,40 @@ function FieldManager({
             </tr>
           </thead>
           <tbody>
-            {fields.map((fd) => (
-              <tr key={fd.id}>
-                <td><b>{fd.field_label}</b></td>
-                <td className="muted small" style={{ fontFamily: "monospace" }}>{fd.field_key}</td>
-                <td>
-                  <span className="badge">
-                    {FIELD_TYPE_OPTIONS.find((o) => o.value === fd.field_type)?.label ?? fd.field_type}
-                  </span>
-                </td>
-                <td>{fd.is_required ? <span className="badge active">Yes</span> : "No"}</td>
-                <td>
-                  <div className="row" style={{ gap: 6 }}>
-                    <button className="ghost small" onClick={() => startEdit(fd)}>
-                      Edit
-                    </button>
-                    <button className="ghost small" onClick={() => deleteField(fd)}>
-                      Delete
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
+            {fields
+              .filter((fd) => showHidden || !fd.is_hidden)
+              .map((fd) => (
+                <tr key={fd.id} style={fd.is_hidden ? { opacity: 0.55 } : undefined}>
+                  <td>
+                    <b>{fd.field_label}</b>{" "}
+                    {fd.is_standard && <span className="badge">Standard</span>}
+                    {fd.is_hidden && <span className="badge">Hidden</span>}
+                  </td>
+                  <td className="muted small" style={{ fontFamily: "monospace" }}>{fd.field_key}</td>
+                  <td>
+                    <span className="badge">
+                      {FIELD_TYPE_OPTIONS.find((o) => o.value === fd.field_type)?.label ?? fd.field_type}
+                    </span>
+                  </td>
+                  <td>{fd.is_required ? <span className="badge active">Yes</span> : "No"}</td>
+                  <td>
+                    <div className="row" style={{ gap: 6 }}>
+                      <button className="ghost small" onClick={() => startEdit(fd)} disabled={fd.is_hidden}>
+                        Edit
+                      </button>
+                      {fd.is_hidden ? (
+                        <button className="ghost small" onClick={() => restoreField(fd)}>
+                          Restore
+                        </button>
+                      ) : (
+                        <button className="ghost small" onClick={() => deleteField(fd)}>
+                          {fd.is_standard ? "Remove" : "Delete"}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
           </tbody>
         </table>
       )}
