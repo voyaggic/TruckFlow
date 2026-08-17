@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../lib/api";
+import { useReferenceFields } from "../lib/referenceFields";
 import type {
   CompanyView,
   FrameEvidence,
@@ -53,6 +54,7 @@ function toEndOfDay(d: Date): string {
 }
 
 export default function Reporting({ user }: { user: SessionUser }) {
+  const { label } = useReferenceFields();
   const [preset, setPreset] = useState<PresetKey>("7d");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -282,8 +284,8 @@ export default function Reporting({ user }: { user: SessionUser }) {
               <table className="table" style={{ marginTop: 10 }}>
                 <thead>
                   <tr>
-                    <th>Plate</th>
-                    <th>Company</th>
+                    <th>{label("vehicle", "plate_number")}</th>
+                    <th>{label("vehicle", "company")}</th>
                     <th>Trips</th>
                     <th>Total capacity</th>
                   </tr>
@@ -324,9 +326,9 @@ export default function Reporting({ user }: { user: SessionUser }) {
               <table className="table" style={{ marginTop: 10 }}>
                 <thead>
                   <tr>
-                    <th>Plate</th>
-                    <th>Company</th>
-                    <th>Driver</th>
+                    <th>{label("vehicle", "plate_number")}</th>
+                    <th>{label("vehicle", "company")}</th>
+                    <th>{label("vehicle", "driver")}</th>
                     <th>Time in</th>
                     <th>Source</th>
                     <th>Confidence</th>

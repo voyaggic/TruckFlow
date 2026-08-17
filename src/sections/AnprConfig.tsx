@@ -2,6 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { useReferenceFields } from "../lib/referenceFields";
 import type {
   AnprConfigView,
   CameraSourceView,
@@ -770,6 +771,7 @@ function ModelPanel({
 // ---------------------------------------------------------------------------
 
 function CandidatePanel({ candidates }: { candidates: TrainingCandidateView[] }) {
+  const { label } = useReferenceFields();
   return (
     <div className="card stack">
       <div className="section-title" style={{ fontSize: 15 }}>
@@ -784,7 +786,7 @@ function CandidatePanel({ candidates }: { candidates: TrainingCandidateView[] })
         <table className="table">
           <thead>
             <tr>
-              <th>Plate</th>
+              <th>{label("vehicle", "plate_number")}</th>
               <th>Reason</th>
               <th>Source trip</th>
               <th>Captured</th>

@@ -26,6 +26,7 @@ import type {
 } from "../lib/types";
 import PasswordChecklist from "../components/PasswordChecklist";
 import SyncPanel from "./SyncPanel";
+import { useReferenceFields } from "../lib/referenceFields";
 
 type AdminTabId = "users" | "reference" | "trips" | "sync" | "oversight";
 
@@ -120,6 +121,7 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
 // ---------------------------------------------------------------------------
 
 function TripArchive({ actor }: { actor: SessionUser }) {
+  const { label } = useReferenceFields();
   const [view, setView] = useState<"active" | "archived">("active");
   const [trips, setTrips] = useState<TripView[] | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
@@ -266,9 +268,9 @@ function TripArchive({ actor }: { actor: SessionUser }) {
           <thead>
             <tr>
               <th></th>
-              <th>Plate</th>
+              <th>{label("vehicle", "plate_number")}</th>
               <th>Time in</th>
-              <th>Company</th>
+              <th>{label("vehicle", "company")}</th>
               <th>Receipt</th>
               <th>Status</th>
             </tr>
@@ -1091,6 +1093,7 @@ function EditUserForm({
 // ---------------------------------------------------------------------------
 
 function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUser; onNotice: (msg: string) => void; canRegister: boolean }) {
+  const { refresh: refreshRefFields } = useReferenceFields();
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
   const [vehicles, setVehicles] = useState<VehicleView[]>([]);
@@ -1122,7 +1125,9 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+    // Keep the rest of the app in sync with renamed labels app-wide.
+    refreshRefFields();
+  }, [refreshRefFields]);
 
   useEffect(() => {
     refresh();
@@ -1613,6 +1618,7 @@ function VehicleTable({
   const [capacityUnit, setCapacityUnit] = useState<string>("litres");
   const [driverId, setDriverId] = useState<string>("");
   const [extraFields, setExtraFields] = useState<Record<string, unknown>>({});
+  const { label } = useReferenceFields();
 
   const startAdd = () => {
     setAdding(true);
@@ -1791,10 +1797,10 @@ function VehicleTable({
         <table className="table">
           <thead>
             <tr>
-              <th>Plate</th>
-              <th>Company</th>
-              <th>Capacity</th>
-              <th>Default driver</th>
+              <th>{label("vehicle", "plate_number")}</th>
+              <th>{label("vehicle", "company")}</th>
+              <th>{label("vehicle", "registered_capacity")}</th>
+              <th>{label("vehicle", "driver")}</th>
               <th>Status</th>
               <th />
             </tr>
@@ -1868,6 +1874,7 @@ function CompanyTable({
   onStatus: (id: string, status: "active" | "inactive") => void;
   onDelete: (id: string) => void;
 }) {
+  const { label } = useReferenceFields();
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState("");
@@ -1939,7 +1946,7 @@ function CompanyTable({
         <table className="table">
           <thead>
             <tr>
-              <th>Name</th>
+              <th>{label("company", "name")}</th>
               <th>Status</th>
               <th />
             </tr>
@@ -2009,6 +2016,7 @@ function DriverTable({
   onStatus: (id: string, status: "active" | "inactive") => void;
   onDelete: (id: string) => void;
 }) {
+  const { label } = useReferenceFields();
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState("");
@@ -2080,7 +2088,7 @@ function DriverTable({
         <table className="table">
           <thead>
             <tr>
-              <th>Name</th>
+              <th>{label("driver", "name")}</th>
               <th>Status</th>
               <th />
             </tr>

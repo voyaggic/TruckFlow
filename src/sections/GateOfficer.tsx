@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
+import { useReferenceFields } from "../lib/referenceFields";
 import type {
   AnprStatus,
   CaptureSettings,
@@ -21,6 +22,7 @@ const REASON_LABELS: Record<string, string> = {
 };
 
 export default function GateOfficer({ user, canResolve }: { user: SessionUser; canResolve: boolean }) {
+  const { label } = useReferenceFields();
   const [today, setToday] = useState<TripView[]>([]);
   const [queued, setQueued] = useState<TripView[]>([]);
   const [anpr, setAnpr] = useState<AnprStatus | null>(null);
@@ -241,19 +243,19 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
             </div>
             <div className="entry-grid">
               <div>
-                <div className="muted small">Plate</div>
+                <div className="muted small">{label("vehicle", "plate_number")}</div>
                 <div className="plate-font">{current.plate_number}</div>
               </div>
               <div>
-                <div className="muted small">Company</div>
+                <div className="muted small">{label("vehicle", "company")}</div>
                 <div>{current.company_name ?? "—"}</div>
               </div>
               <div>
-                <div className="muted small">Driver</div>
+                <div className="muted small">{label("vehicle", "driver")}</div>
                 <div>{current.driver_name ?? "—"}</div>
               </div>
               <div>
-                <div className="muted small">Capacity</div>
+                <div className="muted small">{label("vehicle", "registered_capacity")}</div>
                 <div>{current.capacity_at_trip != null ? `${current.capacity_at_trip} t` : "—"}</div>
               </div>
               <div>
@@ -311,7 +313,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               value={manualPlate}
               onChange={(e) => setManualPlate(e.target.value.toUpperCase())}
               onKeyDown={(e) => e.key === "Enter" && manualLog()}
-              placeholder="Plate, e.g. A123AB"
+              placeholder={`${label("vehicle", "plate_number")}, e.g. A123AB`}
             />
             <button className="primary" onClick={manualLog} disabled={!manualPlate.trim()}>
               Log trip
@@ -329,7 +331,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               value={simPlate}
               onChange={(e) => setSimPlate(e.target.value.toUpperCase())}
               onKeyDown={(e) => e.key === "Enter" && simulate()}
-              placeholder="Plate"
+              placeholder={label("vehicle", "plate_number")}
             />
             <input
               style={{ width: 70 }}
@@ -399,10 +401,10 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
           <table className="table" style={{ marginTop: 10 }}>
             <thead>
               <tr>
-                <th>Plate</th>
-                <th>Company</th>
-                <th>Driver</th>
-                <th>Capacity</th>
+                <th>{label("vehicle", "plate_number")}</th>
+                <th>{label("vehicle", "company")}</th>
+                <th>{label("vehicle", "driver")}</th>
+                <th>{label("vehicle", "registered_capacity")}</th>
                 <th>Time</th>
                 <th>Source</th>
                 <th>Status</th>
@@ -506,6 +508,7 @@ function ResolveScreen({
   onDecline: (trip: TripView) => void;
   onDone: (message: string, trip: TripView | null) => Promise<void>;
 }) {
+  const { label } = useReferenceFields();
   const [frames, setFrames] = useState<FrameEvidence[]>([]);
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
@@ -704,7 +707,7 @@ function ResolveScreen({
 
             <div className="entry-grid" style={{ marginTop: 12 }}>
               <div>
-                <div className="muted small">Company</div>
+                <div className="muted small">{label("vehicle", "company")}</div>
                 <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
                   <option value="">— none —</option>
                   {companies.map((c) => (
@@ -715,7 +718,7 @@ function ResolveScreen({
                 </select>
               </div>
               <div>
-                <div className="muted small">Driver</div>
+                <div className="muted small">{label("vehicle", "driver")}</div>
                 <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
                   <option value="">— none —</option>
                   {drivers.map((d) => (
@@ -726,7 +729,7 @@ function ResolveScreen({
                 </select>
               </div>
               <div>
-                <div className="muted small">Capacity at trip (t)</div>
+                <div className="muted small">{label("vehicle", "registered_capacity")} at trip</div>
                 <input value={capacity} onChange={(e) => setCapacity(e.target.value)} placeholder="20" />
               </div>
               <div>
@@ -757,7 +760,7 @@ function ResolveScreen({
           <>
             <div className="entry-grid" style={{ marginTop: 10 }}>
               <div>
-                <div className="muted small">Plate (new vehicle) *</div>
+                <div className="muted small">{label("vehicle", "plate_number")} (new vehicle) *</div>
                 <input
                   className="plate-input"
                   value={newPlate}
@@ -766,7 +769,7 @@ function ResolveScreen({
                 />
               </div>
               <div>
-                <div className="muted small">Company</div>
+                <div className="muted small">{label("vehicle", "company")}</div>
                 <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
                   <option value="">— none —</option>
                   {companies.map((c) => (
@@ -777,7 +780,7 @@ function ResolveScreen({
                 </select>
               </div>
               <div>
-                <div className="muted small">Driver</div>
+                <div className="muted small">{label("vehicle", "driver")}</div>
                 <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
                   <option value="">— none —</option>
                   {drivers.map((d) => (
