@@ -64,16 +64,50 @@ fn read_vehicle(row: &rusqlite::Row) -> rusqlite::Result<VehicleView> {
 /// the paper log column is "Capacity(L)" (00-project-overview.md §3).
 pub const CAPACITY_UNITS: &[&str] = &["litres", "cubic_meters", "gallons", "tonnes", "kg"];
 
+/// Map common abbreviations / spellings of a unit onto the canonical list
+/// (m3 → cubic_meters, L → litres, t → tonnes, g → grams…). Returns the
+/// canonical unit when recognized, otherwise None.
+pub fn alias_capacity_unit(unit: &str) -> Option<String> {
+    let u = unit.trim().to_lowercase().replace(['\u{a0}', '\u{2009}'], " ");
+    let u = u.trim();
+    if CAPACITY_UNITS.contains(&u) {
+        return Some(u.to_string());
+    }
+    // Normalise unicode/superscript and spacing before matching aliases.
+    let u = u.replace('³', "3").replace('\u{b3}', "3").replace(' ', "");
+    let u = match u.as_str() {
+        "m3" | "m^3" | "mtr3" | "cubicm" | "cubicmeter" | "cum" | "cbm" => "cubic_meters",
+        "l" | "ltr" | "lts" | "liter" | "litre" | "lt" => "litres",
+        "t" | "tn" | "ton" | "metricton" | "metrictonnes" | "metrictonne" => "tonnes",
+        "kg" | "kgs" | "kilo" | "kilogram" | "kilograms" => "kg",
+        "g" | "gr" | "gram" | "grams" => "grams",
+        "gal" | "gallon" | "gallons" | "usgal" | "impgal" => "gallons",
+        "cm" | "centimeter" | "centimeters" => "cm",
+        "m" | "meter" | "metre" | "meters" | "metres" => "m",
+        "km" | "kilometer" | "kilometre" | "kilometers" | "kilometres" => "km",
+        "h" | "hr" | "hrs" | "hour" | "hours" => "hours",
+        "min" | "mins" | "minute" | "minutes" => "minutes",
+        "s" | "sec" | "secs" | "second" | "seconds" => "seconds",
+        _ => return None,
+    };
+    Some(u.to_string())
+}
+
 pub fn normalize_capacity_unit(unit: &str) -> Result<String, String> {
-    let unit = unit.trim().to_lowercase();
-    if CAPACITY_UNITS.contains(&unit.as_str()) {
-        Ok(unit)
-    } else {
-        Err(format!(
+    match alias_capacity_unit(unit) {
+        Some(u) => Ok(u),
+        None => Err(format!(
             "Unsupported capacity unit '{unit}'. Choose one of: {}.",
             CAPACITY_UNITS.join(", ")
-        ))
+        )),
     }
+}
+
+/// Lenient version for imports: maps known abbreviations to canonical units
+/// and returns None (caller stores the raw value in a custom field) when the
+/// unit is genuinely unknown.
+pub fn normalize_capacity_unit_lenient(unit: &str) -> Option<String> {
+    alias_capacity_unit(unit)
 }
 
 
@@ -2298,13 +2332,16 @@ fn apply_import_row_combined(
             }
         }
     }
-    let extra_json = if extra.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(extra).to_string())
+    let extra_json_for = |extra: &serde_json::Map<String, serde_json::Value>| -> Option<String> {
+        if extra.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(extra.clone()).to_string())
+        }
     };
     match entity_type {
         "company" => {
+            let extra_json = extra_json_for(&extra);
             let name = get("name").ok_or_else(|| {
                 "Company name is required. Fix: make sure every row has a name in the 'name' column (or map the right column to it in the mapping screen)."
                     .to_string()
@@ -2335,6 +2372,7 @@ fn apply_import_row_combined(
             }
         }
         "driver" => {
+            let extra_json = extra_json_for(&extra);
             let name = get("name").ok_or_else(|| {
                 "Driver name is required. Fix: make sure every row has a name in the 'name' column (or map the right column to it in the mapping screen)."
                     .to_string()
@@ -2380,15 +2418,30 @@ fn apply_import_row_combined(
                 Some(dname) => Some(find_or_create_driver(conn, actor_id, &dname)?),
                 None => None,
             };
+            // Lenient value handling: bad capacity values and unknown units are
+            // captured in custom fields rather than failing the whole row, so a
+            // spreadsheet with a few odd cells still imports everything else.
             let capacity = match get("registered_capacity") {
-                Some(v) => Some(
-                    v.parse::<f64>().map_err(|_| {
-                        format!("Invalid capacity '{v}'. Fix: the capacity column must contain only numbers (e.g. 30000) — correct the value in the spreadsheet and import again.")
-                    })?,
-                ),
-                None => None,
+                Some(v) if !v.trim().is_empty() => match v.trim().parse::<f64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        extra.insert("registered_capacity_raw".into(), serde_json::Value::String(v.trim().to_string()));
+                        None
+                    }
+                },
+                _ => None,
             };
-            let unit = normalize_capacity_unit(&get("capacity_unit").unwrap_or_else(|| "litres".to_string()))?;
+            let unit = match get("capacity_unit") {
+                Some(u) if !u.trim().is_empty() => match normalize_capacity_unit_lenient(&u) {
+                    Some(canon) => canon,
+                    None => {
+                        extra.insert("capacity_unit_raw".into(), serde_json::Value::String(u.trim().to_string()));
+                        "litres".to_string()
+                    }
+                },
+                _ => "litres".to_string(),
+            };
+            let extra_json = extra_json_for(&extra);
             let existing: Option<String> = conn
                 .query_row("SELECT id FROM vehicles WHERE upper(plate_number) = upper(?1)", params![plate], |r| r.get(0))
                 .optional()
@@ -2642,6 +2695,28 @@ mod alias_tests {
         assert_eq!(standard_key_for("company", "location"), None);
         assert_eq!(standard_key_for("vehicle", "insurance_expiry"), None);
         assert_eq!(standard_key_for("vehicle", "route"), None);
+    }
+
+    #[test]
+    fn unit_abbreviations_map_to_canonical() {
+        use super::{alias_capacity_unit, normalize_capacity_unit};
+        assert_eq!(alias_capacity_unit("m3"), Some("cubic_meters".to_string()));
+        assert_eq!(alias_capacity_unit("m³"), Some("cubic_meters".to_string()));
+        assert_eq!(alias_capacity_unit("M3"), Some("cubic_meters".to_string()));
+        assert_eq!(alias_capacity_unit("L"), Some("litres".to_string()));
+        assert_eq!(alias_capacity_unit("litre"), Some("litres".to_string()));
+        assert_eq!(alias_capacity_unit("t"), Some("tonnes".to_string()));
+        assert_eq!(alias_capacity_unit("g"), Some("grams".to_string()));
+        assert_eq!(alias_capacity_unit("gal"), Some("gallons".to_string()));
+        assert_eq!(alias_capacity_unit("hrs"), Some("hours".to_string()));
+        // Canonical units pass through
+        assert_eq!(alias_capacity_unit("litres"), Some("litres".to_string()));
+        assert_eq!(alias_capacity_unit("cubic_meters"), Some("cubic_meters".to_string()));
+        // Genuinely unknown units return None (lenient import captures them)
+        assert_eq!(alias_capacity_unit("barrels"), None);
+        assert_eq!(alias_capacity_unit(""), None);
+        // normalize_capacity_unit accepts the aliases too
+        assert_eq!(normalize_capacity_unit("m3").unwrap(), "cubic_meters");
     }
 
     #[test]
