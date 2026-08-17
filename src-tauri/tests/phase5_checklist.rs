@@ -1195,3 +1195,31 @@ fn deleting_company_unlinks_vehicles_but_keeps_them() {
     assert_eq!(v.company_id, None, "company unlinked from vehicle");
 }
 
+// ---------------------------------------------------------------------------
+// Entity display names (Vehicles / Companies / Drivers) — rename propagates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entity_labels_rename_and_are_persisted() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+
+    // Defaults exist for all three entities.
+    let labels = reference::list_entity_labels(ctx.state()).unwrap();
+    assert_eq!(labels.get("vehicle").map(String::as_str), Some("Vehicles"));
+    assert_eq!(labels.get("company").map(String::as_str), Some("Companies"));
+    assert_eq!(labels.get("driver").map(String::as_str), Some("Drivers"));
+
+    // Rename vehicle → "Trucks"; persists across reads.
+    reference::set_entity_label(ctx.state(), admin.id.clone(), "vehicle".into(), "Trucks".into()).unwrap();
+    let labels = reference::list_entity_labels(ctx.state()).unwrap();
+    assert_eq!(labels.get("vehicle").map(String::as_str), Some("Trucks"));
+    assert_eq!(labels.get("company").map(String::as_str), Some("Companies"), "other entities untouched");
+
+    // Exported vehicle worksheet picks up the renamed label.
+    let temp = std::env::temp_dir().join(format!("tf-entity-label-{}.xlsx", uuid::Uuid::new_v4()));
+    let path = reference::reference_export_combined(ctx.state(), admin.id.clone(), Some(temp.to_str().unwrap().to_string())).unwrap();
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_file(&path);
+}
+

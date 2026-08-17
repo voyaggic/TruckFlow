@@ -54,7 +54,7 @@ function toEndOfDay(d: Date): string {
 }
 
 export default function Reporting({ user }: { user: SessionUser }) {
-  const { label } = useReferenceFields();
+  const { label, entityLabel } = useReferenceFields();
   const [preset, setPreset] = useState<PresetKey>("7d");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -210,9 +210,9 @@ export default function Reporting({ user }: { user: SessionUser }) {
               <input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)} disabled={preset !== "custom"} />
             </label>
             <label className="muted small">
-              Company{" "}
+              {entityLabel("company")}{" "}
               <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
-                <option value="">All companies</option>
+                <option value="">All {entityLabel("company").toLowerCase()}</option>
                 {companies.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
@@ -232,7 +232,7 @@ export default function Reporting({ user }: { user: SessionUser }) {
         <>
           <div className="stat-grid">
             <StatCard label="Total trips" value={dashboard.summary.total_trips} onClick={openDrill} />
-            <StatCard label="Active companies" value={dashboard.summary.active_companies} />
+            <StatCard label={`Active ${entityLabel("company").toLowerCase()}`} value={dashboard.summary.active_companies} />
             <StatCard label="Avg trips / day" value={dashboard.summary.avg_trips_per_day.toFixed(1)} />
             <div className="stat-card">
               <div className="muted small">vs prior period</div>
@@ -258,9 +258,11 @@ export default function Reporting({ user }: { user: SessionUser }) {
               )}
             </div>
             <div className="card">
-              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Top companies</h3>
+              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Top {entityLabel("company").toLowerCase()}</h3>
               {dashboard.top_companies.length === 0 ? (
-                <p className="muted small">No company activity in the selected range.</p>
+                <p className="muted small">
+                  No {entityLabel("company").toLowerCase()} activity in the selected range.
+                </p>
               ) : (
                 <BarChart data={dashboard.top_companies.map((c) => ({ label: c.company_name, value: c.count }))} />
               )}

@@ -1,8 +1,10 @@
-// Shared reference-field definitions for the whole app. Every screen reads
-// field labels from here instead of hardcoding "Plate / Company / Driver…",
-// so renaming a field in Admin → Fields propagates everywhere.
+// Shared reference-field definitions + entity display names for the whole app.
+// Every screen reads labels from here instead of hardcoding
+// "Plate / Company / Driver…" or "Vehicles / Companies / Drivers", so
+// renaming a field or entity in Admin → Fields propagates everywhere.
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import type { FieldDefinition, ReferenceEntityType } from "./types";
+import type { EntityLabels, FieldDefinition, ReferenceEntityType } from "./types";
+import { DEFAULT_ENTITY_LABELS } from "./types";
 import { api } from "./api";
 
 /** Fallback labels used when a field definition isn't loaded (or was deleted). */
@@ -20,12 +22,15 @@ interface ReferenceFieldsValue {
   fields: Record<ReferenceEntityType, FieldDefinition[]>;
   /** Label for a field given its binding (standard) or key (custom). */
   label: (entity: ReferenceEntityType, key: string) => string;
+  /** Display name for an entity (Vehicles / Companies / Drivers). */
+  entityLabel: (entity: ReferenceEntityType) => string;
   refresh: () => Promise<void>;
 }
 
 const ReferenceFieldsContext = createContext<ReferenceFieldsValue>({
   fields: { vehicle: [], company: [], driver: [] },
   label: (_entity, key) => DEFAULT_LABELS[key] ?? key,
+  entityLabel: (entity) => DEFAULT_ENTITY_LABELS[entity],
   refresh: async () => {},
 });
 
@@ -35,15 +40,18 @@ export function ReferenceFieldsProvider({ children }: { children: ReactNode }) {
     company: [],
     driver: [],
   });
+  const [entityLabels, setEntityLabels] = useState<EntityLabels>({ ...DEFAULT_ENTITY_LABELS });
 
   const refresh = useCallback(async () => {
     try {
-      const [vf, cf, df] = await Promise.all([
+      const [vf, cf, df, labels] = await Promise.all([
         api.listFieldDefinitions("vehicle"),
         api.listFieldDefinitions("company"),
         api.listFieldDefinitions("driver"),
+        api.listEntityLabels(),
       ]);
       setFields({ vehicle: vf, company: cf, driver: df });
+      setEntityLabels({ ...DEFAULT_ENTITY_LABELS, ...labels });
     } catch {
       // Fall back to default labels until the next successful load.
     }
@@ -62,7 +70,16 @@ export function ReferenceFieldsProvider({ children }: { children: ReactNode }) {
     [fields],
   );
 
-  return <ReferenceFieldsContext.Provider value={{ fields, label, refresh }}>{children}</ReferenceFieldsContext.Provider>;
+  const entityLabel = useCallback(
+    (entity: ReferenceEntityType) => entityLabels[entity] ?? DEFAULT_ENTITY_LABELS[entity],
+    [entityLabels],
+  );
+
+  return (
+    <ReferenceFieldsContext.Provider value={{ fields, label, entityLabel, refresh }}>
+      {children}
+    </ReferenceFieldsContext.Provider>
+  );
 }
 
 export function useReferenceFields() {

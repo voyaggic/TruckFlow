@@ -462,6 +462,15 @@ export interface FieldDefinition {
 export type ReferenceEntityType = "company" | "driver" | "vehicle";
 export type ReferenceFileFormat = "csv" | "xlsx";
 
+/** User-editable display names for the three reference entities. */
+export type EntityLabels = Record<ReferenceEntityType, string>;
+
+export const DEFAULT_ENTITY_LABELS: EntityLabels = {
+  vehicle: "Vehicles",
+  company: "Companies",
+  driver: "Drivers",
+};
+
 export interface ReferenceImportSummary {
   entity_type: ReferenceEntityType;
   created: number;

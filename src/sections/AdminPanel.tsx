@@ -1093,7 +1093,7 @@ function EditUserForm({
 // ---------------------------------------------------------------------------
 
 function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUser; onNotice: (msg: string) => void; canRegister: boolean }) {
-  const { refresh: refreshRefFields } = useReferenceFields();
+  const { refresh: refreshRefFields, entityLabel } = useReferenceFields();
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
   const [vehicles, setVehicles] = useState<VehicleView[]>([]);
@@ -1195,13 +1195,13 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
         </div>
         <div className="seg" style={{ flexWrap: "wrap" }}>
           <button className={tab === "vehicles" ? "active" : ""} onClick={() => setTab("vehicles")}>
-            Vehicles ({vehicles.length})
+            {entityLabel("vehicle")} ({vehicles.length})
           </button>
           <button className={tab === "companies" ? "active" : ""} onClick={() => setTab("companies")}>
-            Companies ({companies.length})
+            {entityLabel("company")} ({companies.length})
           </button>
           <button className={tab === "drivers" ? "active" : ""} onClick={() => setTab("drivers")}>
-            Drivers ({drivers.length})
+            {entityLabel("driver")} ({drivers.length})
           </button>
           <button className={tab === "fields" ? "active" : ""} onClick={() => setTab("fields")}>
             Fields
@@ -1301,9 +1301,9 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
           onApplied={(summary) => {
             const parts: string[] = [];
             for (const [label, s] of [
-              ["Companies", summary.companies],
-              ["Drivers", summary.drivers],
-              ["Vehicles", summary.vehicles],
+              [entityLabel("company"), summary.companies],
+              [entityLabel("driver"), summary.drivers],
+              [entityLabel("vehicle"), summary.vehicles],
             ] as const) {
               if (s.created || s.updated || s.skipped) parts.push(`${label}: ${s.created} created, ${s.updated} updated, ${s.skipped} skipped`);
             }
@@ -1379,6 +1379,7 @@ function ImportWizard({
   onClose: () => void;
   onApplied: (s: CombinedImportSummary) => void;
 }) {
+  const { entityLabel } = useReferenceFields();
   const resolveEntity = (e: string): ReferenceEntityType =>
     e === "vehicle" || e === "company" || e === "driver" ? e : "company";
 
@@ -1461,9 +1462,42 @@ function ImportWizard({
         </button>
       </div>
       <p className="muted small">
-        For each sheet, choose what each column maps to. Columns you don't want can be ignored. "Create new field"
-        adds a new field to the database — it will appear in the forms next to the standard fields after importing.
+        Columns that match existing fields were matched automatically. For anything else, choose what each column
+        maps to below — or ignore it. Columns set to "Create new field" are added to the database and appear in the
+        forms next to the standard fields after importing.
       </p>
+      {(() => {
+        const newCols: { sheet: string; header: string }[] = [];
+        preview.sheets.forEach((sheet, si) => {
+          const cfg = configs[si];
+          sheet.columns.forEach((col) => {
+            if (col.kind === "new_custom" && cfg.columns[col.header]?.mapping === "new") {
+              newCols.push({ sheet: sheet.sheet_name, header: col.header });
+            }
+          });
+        });
+        if (newCols.length === 0) return null;
+        return (
+          <div
+            className="stack"
+            style={{
+              border: "1px solid var(--accent, #2e7d32)",
+              borderRadius: "var(--radius)",
+              padding: 12,
+              background: "color-mix(in srgb, var(--accent, #2e7d32) 8%, transparent)",
+            }}
+          >
+            <div className="small" style={{ fontWeight: 600 }}>
+              {newCols.length} new column{newCols.length > 1 ? "s" : ""} not in the reference database
+            </div>
+            <p className="muted small" style={{ margin: "4px 0 0" }}>
+              {newCols.map((c) => `"${c.header}" (${c.sheet})`).join(", ")}. Add {newCols.length > 1 ? "them" : "it"} as
+              new field{newCols.length > 1 ? "s" : ""}? They're set to "Create new field" below — adjust the field
+              key/type, or choose "Ignore" for any column you don't need.
+            </p>
+          </div>
+        );
+      })()}
       {error && <div className="error-banner">{error}</div>}
 
       {preview.sheets.map((sheet, si) => {
@@ -1487,9 +1521,9 @@ function ImportWizard({
               <div className="field" style={{ margin: 0 }}>
                 <label>Import as</label>
                 <select value={cfg.entity} onChange={(e) => changeEntity(si, e.target.value as ReferenceEntityType, sheet)}>
-                  <option value="vehicle">Vehicles</option>
-                  <option value="company">Companies</option>
-                  <option value="driver">Drivers</option>
+                  <option value="vehicle">{entityLabel("vehicle")}</option>
+                  <option value="company">{entityLabel("company")}</option>
+                  <option value="driver">{entityLabel("driver")}</option>
                 </select>
               </div>
             </div>
@@ -2226,6 +2260,7 @@ function FieldManager({
   onNotice: (msg: string) => void;
   onChanged: () => void;
 }) {
+  const { entityLabel, refresh: refreshRefFields } = useReferenceFields();
   const [entityTab, setEntityTab] = useState<string>("vehicle");
   const [fields, setFields] = useState<FieldDefinition[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -2235,6 +2270,10 @@ function FieldManager({
   const [newLabel, setNewLabel] = useState("");
   const [newType, setNewType] = useState("text");
   const [newRequired, setNewRequired] = useState(false);
+  // Entity display-name editing (rename Vehicles → e.g. Trucks, app-wide).
+  const [renamingEntity, setRenamingEntity] = useState<string | null>(null);
+  const [entityNameDraft, setEntityNameDraft] = useState("");
+  const [savingName, setSavingName] = useState(false);
 
   const refreshFields = useCallback(async () => {
     try {
@@ -2251,9 +2290,38 @@ function FieldManager({
     setEditingId(null);
   }, [refreshFields]);
 
+  const startRename = (key: string) => {
+    setRenamingEntity(key);
+    setEntityNameDraft(entityLabel(key as ReferenceEntityType));
+  };
+
+  const saveEntityName = async () => {
+    if (!renamingEntity) return;
+    const name = entityNameDraft.trim();
+    if (!name) {
+      setError("The display name can't be empty.");
+      return;
+    }
+    setSavingName(true);
+    setError(null);
+    try {
+      await api.setEntityLabel(actor.id, renamingEntity, name);
+      onNotice(`"${ENTITY_LABELS[renamingEntity]}" renamed to "${name}" — updated everywhere in the app.`);
+      setTimeout(() => onNotice(""), 5000);
+      setRenamingEntity(null);
+      await refreshRefFields();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingName(false);
+    }
+  };
+
   const startAdd = () => {
     setAdding(true);
     setEditingId(null);
+    setRenamingEntity(null);
     setNewKey("");
     setNewLabel("");
     setNewType("text");
@@ -2263,6 +2331,7 @@ function FieldManager({
   const startEdit = (fd: FieldDefinition) => {
     setAdding(false);
     setEditingId(fd.id);
+    setRenamingEntity(null);
     setNewKey(fd.field_key);
     setNewLabel(fd.field_label);
     setNewType(fd.field_type);
@@ -2285,7 +2354,7 @@ function FieldManager({
         newRequired,
         fields.length,
       );
-      onNotice(`Field "${newLabel.trim()}" added to ${ENTITY_LABELS[entityTab]}.`);
+      onNotice(`Field "${newLabel.trim()}" added to ${entityLabel(entityTab as ReferenceEntityType)}.`);
       setTimeout(() => onNotice(""), 4000);
       setAdding(false);
       await refreshFields();
@@ -2320,7 +2389,7 @@ function FieldManager({
 
   const deleteField = async (fd: FieldDefinition) => {
     const ok = window.confirm(
-      `Delete the "${fd.field_label}" field from ${ENTITY_LABELS[entityTab]} permanently?\n\nIt disappears from the registration forms and from import/export. Your existing records keep their data — only the field definition is removed. This cannot be undone.`,
+      `Delete the "${fd.field_label}" field from ${entityLabel(entityTab as ReferenceEntityType)} permanently?\n\nIt disappears from the registration forms and from import/export. Your existing records keep their data — only the field definition is removed. This cannot be undone.`,
     );
     if (!ok) return;
     setError(null);
@@ -2343,13 +2412,58 @@ function FieldManager({
         operation actually records vehicles. Add as many custom fields as you need.
       </p>
 
-      <div className="seg" style={{ alignSelf: "flex-start" }}>
-        {Object.entries(ENTITY_LABELS).map(([key, label]) => (
-          <button key={key} className={entityTab === key ? "active" : ""} onClick={() => setEntityTab(key)}>
-            {label}
+      <div className="stack" style={{ gap: 6 }}>
+        <div className="seg" style={{ alignSelf: "flex-start" }}>
+          {Object.entries(ENTITY_LABELS).map(([key, _label]) => (
+            <button
+              key={key}
+              className={entityTab === key ? "active" : ""}
+              onClick={() => {
+                setEntityTab(key);
+                setRenamingEntity(null);
+              }}
+            >
+              {entityLabel(key as ReferenceEntityType)}
+            </button>
+          ))}
+          <button
+            className="ghost small"
+            style={{ marginLeft: 8, border: "none" }}
+            onClick={() => startRename(entityTab)}
+            title="Rename this entity everywhere in the app"
+          >
+            ✎ Rename {entityLabel(entityTab as ReferenceEntityType)}
           </button>
-        ))}
+        </div>
+        <p className="muted small" style={{ margin: 0 }}>
+          Renaming an entity changes its name everywhere — the tabs here, the Gate screen, reports, and exports —
+          just like renaming a field does.
+        </p>
       </div>
+
+      {renamingEntity && (
+        <div
+          className="stack"
+          style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 12, maxWidth: 480 }}
+        >
+          <div className="section-title" style={{ fontSize: 14 }}>
+            Rename {ENTITY_LABELS[renamingEntity]}
+          </div>
+          <p className="muted small" style={{ margin: 0 }}>
+            This name is used everywhere in the app (tabs, gate screen, reports, exports). Pick the name your
+            operation actually uses — e.g. "Trucks", "Fleets", "Suppliers".
+          </p>
+          <input value={entityNameDraft} onChange={(e) => setEntityNameDraft(e.target.value)} placeholder="New display name" />
+          <div className="row">
+            <button className="primary" onClick={saveEntityName} disabled={savingName || !entityNameDraft.trim()}>
+              {savingName ? "Saving…" : "Save name"}
+            </button>
+            <button className="ghost" onClick={() => setRenamingEntity(null)} disabled={savingName}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {error && <div className="error-banner">{error}</div>}
 
@@ -2429,7 +2543,7 @@ function FieldManager({
 
       {fields.length === 0 ? (
         <p className="muted small">
-          No fields defined yet for {ENTITY_LABELS[entityTab]}. Add fields above.
+          No fields defined yet for {entityLabel(entityTab as ReferenceEntityType)}. Add fields above.
         </p>
       ) : (
         <table className="table">

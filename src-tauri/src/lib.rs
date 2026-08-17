@@ -83,6 +83,8 @@ pub fn run() {
             reference::reference_export_combined,
             reference::reference_import_preview,
             reference::reference_import_combined,
+            reference::list_entity_labels,
+            reference::set_entity_label,
             capture::simulate_read,
             capture::manual_entry,
             capture::approve_trip,

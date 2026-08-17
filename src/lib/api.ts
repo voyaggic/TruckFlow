@@ -278,6 +278,13 @@ export const api = {
   referenceImport: (actorId: string, entityType: ReferenceEntityType, filePath: string) =>
     invoke<ReferenceImportSummary>("reference_import", { actorId, entityType, filePath }),
 
+  // --- Entity display names (Vehicles / Companies / Drivers) ---
+
+  listEntityLabels: () => invoke<Record<string, string>>("list_entity_labels"),
+
+  setEntityLabel: (actorId: string, entityType: string, label: string) =>
+    invoke<string>("set_entity_label", { actorId, entityType, label }),
+
   // --- Combined reference database import/export (single file, all entities) ---
   referenceExportCombined: (actorId: string, targetPath?: string) =>
     invoke<string>("reference_export_combined", {

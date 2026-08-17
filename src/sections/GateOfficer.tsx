@@ -14,15 +14,23 @@ import type {
   VehicleView,
 } from "../lib/types";
 
-const REASON_LABELS: Record<string, string> = {
-  multiple_matches: "Multiple possible matches",
-  no_match: "No match — possible new vehicle",
-  low_confidence: "Low confidence read",
-  pending_approval: "Awaiting officer approval",
-};
+function reasonLabel(reason: string, entityLabel: string): string {
+  switch (reason) {
+    case "multiple_matches":
+      return "Multiple possible matches";
+    case "no_match":
+      return `No match — possible new ${entityLabel.toLowerCase()}`;
+    case "low_confidence":
+      return "Low confidence read";
+    case "pending_approval":
+      return "Awaiting officer approval";
+    default:
+      return reason;
+  }
+}
 
 export default function GateOfficer({ user, canResolve }: { user: SessionUser; canResolve: boolean }) {
-  const { label } = useReferenceFields();
+  const { label, entityLabel } = useReferenceFields();
   const [today, setToday] = useState<TripView[]>([]);
   const [queued, setQueued] = useState<TripView[]>([]);
   const [anpr, setAnpr] = useState<AnprStatus | null>(null);
@@ -239,7 +247,9 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               <span className={`badge ${current.status === "queued" ? "pin" : current.status === "logged" ? "active" : "disabled"}`}>
                 {statusLabel(current.status)}
               </span>
-              {current.reason && <span className="badge">{REASON_LABELS[current.reason] ?? current.reason}</span>}
+              {current.reason && (
+                <span className="badge">{reasonLabel(current.reason, entityLabel("vehicle"))}</span>
+              )}
             </div>
             <div className="entry-grid">
               <div>
@@ -367,7 +377,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               <div key={t.id} className="row between queue-item">
                 <div className="row">
                   <span className="plate-font">{t.plate_number}</span>
-                  <span className="badge">{REASON_LABELS[t.reason ?? ""] ?? t.reason}</span>
+                  <span className="badge">{reasonLabel(t.reason ?? "", entityLabel("vehicle"))}</span>
                   <span className="muted small">{fmtTime(t.time_in)}</span>
                 </div>
                 {canResolve ? (
@@ -508,7 +518,7 @@ function ResolveScreen({
   onDecline: (trip: TripView) => void;
   onDone: (message: string, trip: TripView | null) => Promise<void>;
 }) {
-  const { label } = useReferenceFields();
+  const { label, entityLabel } = useReferenceFields();
   const [frames, setFrames] = useState<FrameEvidence[]>([]);
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
@@ -648,7 +658,7 @@ function ResolveScreen({
         </div>
 
         <div className="row" style={{ margin: "10px 0", gap: 8 }}>
-          <span className="badge pin">{REASON_LABELS[trip.reason ?? ""] ?? trip.reason}</span>
+          <span className="badge pin">{reasonLabel(trip.reason ?? "", entityLabel("vehicle"))}</span>
           <span className="muted small">
             Best guess: <b>{trip.plate_number}</b>
           </span>
@@ -743,7 +753,7 @@ function ResolveScreen({
                 Confirm & log trip
               </button>
               <button className="ghost" onClick={() => setRegisterNew(true)} disabled={busy}>
-                New vehicle / none of these
+                New {entityLabel("vehicle").toLowerCase()} / none of these
               </button>
               <button className="danger" onClick={() => setConfirmingDiscard(true)} disabled={busy}>
                 Discard
@@ -760,7 +770,9 @@ function ResolveScreen({
           <>
             <div className="entry-grid" style={{ marginTop: 10 }}>
               <div>
-                <div className="muted small">{label("vehicle", "plate_number")} (new vehicle) *</div>
+                <div className="muted small">
+                  {label("vehicle", "plate_number")} (new {entityLabel("vehicle").toLowerCase()}) *
+                </div>
                 <input
                   className="plate-input"
                   value={newPlate}

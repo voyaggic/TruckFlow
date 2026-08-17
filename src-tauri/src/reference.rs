@@ -1293,6 +1293,75 @@ pub fn reference_import(
 }
 
 // ---------------------------------------------------------------------------
+// Entity display names (Vehicles / Companies / Drivers — user-editable)
+// ---------------------------------------------------------------------------
+
+fn default_entity_label(entity_type: &str) -> &'static str {
+    match entity_type {
+        "company" => "Companies",
+        "driver" => "Drivers",
+        _ => "Vehicles",
+    }
+}
+
+fn entity_label(conn: &Connection, entity_type: &str) -> String {
+    conn.query_row(
+        "SELECT label FROM entity_labels WHERE entity_type = ?1",
+        params![entity_type],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| default_entity_label(entity_type).to_string())
+}
+
+#[tauri::command]
+pub fn list_entity_labels(state: State<AppState>) -> Result<HashMap<String, String>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT entity_type, label FROM entity_labels")
+        .map_err(|e| format!("entity_labels list failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| format!("entity_labels list failed: {e}"))?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|e| format!("entity_labels read failed: {e}"))
+}
+
+#[tauri::command]
+pub fn set_entity_label(
+    state: State<AppState>,
+    actor_id: String,
+    entity_type: String,
+    label: String,
+) -> Result<String, String> {
+    if !VALID_ENTITY_TYPES.contains(&entity_type.as_str()) {
+        return Err(format!(
+            "Invalid entity type '{entity_type}'. Must be one of: {}.",
+            VALID_ENTITY_TYPES.join(", ")
+        ));
+    }
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("Display name is required.".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
+    conn.execute(
+        "INSERT INTO entity_labels (entity_type, label, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(entity_type) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at",
+        params![entity_type, label, now_iso()],
+    )
+    .map_err(|e| format!("entity_labels update failed: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "updated_entity_label",
+        Some(&entity_type),
+        Some(serde_json::json!({ "entity_type": entity_type, "label": label })),
+    )?;
+    Ok(label)
+}
+
+// ---------------------------------------------------------------------------
 // Combined reference import/export (one spreadsheet, all entity types)
 // ---------------------------------------------------------------------------
 
@@ -1420,8 +1489,7 @@ pub fn reference_export_combined(
         std::fs::create_dir_all(parent).map_err(|e| format!("export dir create failed: {e}"))?;
     }
     let mut workbook = rust_xlsxwriter::Workbook::new();
-    let sheets: &[(&str, &str)] = &[("company", "Companies"), ("driver", "Drivers"), ("vehicle", "Vehicles")];
-    for (entity_type, sheet_name) in sheets {
+    for entity_type in ["company", "driver", "vehicle"] {
         let fields = visible_fields(&conn, entity_type)?;
         if fields.is_empty() {
             continue;
@@ -1433,7 +1501,7 @@ pub fn reference_export_combined(
         let rows = entity_row_maps(&conn, entity_type)?;
         let worksheet = workbook.add_worksheet();
         worksheet
-            .set_name(*sheet_name)
+            .set_name(entity_label(&conn, entity_type))
             .map_err(|e| format!("worksheet name failed: {e}"))?;
         for (ci, label) in labels.iter().enumerate() {
             let _ = worksheet.write_string(0, ci as u16, label);
@@ -1755,7 +1823,9 @@ fn apply_import_row_combined(
     };
     let status = get("status").unwrap_or_else(|| "active".to_string());
     if status != "active" && status != "inactive" {
-        return Err(format!("Invalid status '{status}'"));
+        return Err(format!(
+            "Invalid status '{status}'. Fix: the status column must contain only 'active' or 'inactive' — correct the value in the spreadsheet and import again."
+        ));
     }
     // Custom values: every mapped key that isn't a standard key for the entity.
     let standard: Vec<&str> = match entity_type {
@@ -1777,7 +1847,10 @@ fn apply_import_row_combined(
     };
     match entity_type {
         "company" => {
-            let name = get("name").ok_or_else(|| "Company name is required.".to_string())?;
+            let name = get("name").ok_or_else(|| {
+                "Company name is required. Fix: make sure every row has a name in the 'name' column (or map the right column to it in the mapping screen)."
+                    .to_string()
+            })?;
             let existing: Option<String> = conn
                 .query_row("SELECT id FROM companies WHERE upper(name) = upper(?1)", params![name], |r| r.get(0))
                 .optional()
@@ -1804,7 +1877,10 @@ fn apply_import_row_combined(
             }
         }
         "driver" => {
-            let name = get("name").ok_or_else(|| "Driver name is required.".to_string())?;
+            let name = get("name").ok_or_else(|| {
+                "Driver name is required. Fix: make sure every row has a name in the 'name' column (or map the right column to it in the mapping screen)."
+                    .to_string()
+            })?;
             let existing: Option<String> = conn
                 .query_row("SELECT id FROM drivers WHERE upper(name) = upper(?1)", params![name], |r| r.get(0))
                 .optional()
@@ -1831,9 +1907,12 @@ fn apply_import_row_combined(
             }
         }
         _ => {
-            let plate = normalize_plate(&get("plate_number").ok_or_else(|| "Plate number is required.".to_string())?);
+            let plate = normalize_plate(&get("plate_number").ok_or_else(|| {
+                "Plate number is required. Fix: every row needs a value in the plate column (or map the right column to it in the mapping screen)."
+                    .to_string()
+            })?);
             if plate.is_empty() {
-                return Err("Plate number is required.".to_string());
+                return Err("Plate number is required. Fix: every row needs a plate value — correct the empty cells in the spreadsheet and import again.".to_string());
             }
             let company_id = match get("company") {
                 Some(cname) => Some(find_or_create_company(conn, actor_id, &cname)?),
@@ -1844,7 +1923,11 @@ fn apply_import_row_combined(
                 None => None,
             };
             let capacity = match get("registered_capacity") {
-                Some(v) => Some(v.parse::<f64>().map_err(|_| format!("Invalid capacity '{v}'"))?),
+                Some(v) => Some(
+                    v.parse::<f64>().map_err(|_| {
+                        format!("Invalid capacity '{v}'. Fix: the capacity column must contain only numbers (e.g. 30000) — correct the value in the spreadsheet and import again.")
+                    })?,
+                ),
                 None => None,
             };
             let unit = normalize_capacity_unit(&get("capacity_unit").unwrap_or_else(|| "litres".to_string()))?;

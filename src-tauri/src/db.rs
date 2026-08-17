@@ -571,6 +571,32 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 17 {
+        // Display names for the three reference entities (Vehicles / Companies /
+        // Drivers) become user-editable so the whole app reflects the operation's
+        // own vocabulary. Keys stay fixed (vehicle/company/driver).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS entity_labels (
+                entity_type TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .map_err(|e| format!("migration 17 failed: {e}"))?;
+        let now = now_iso();
+        for (et, label) in [("vehicle", "Vehicles"), ("company", "Companies"), ("driver", "Drivers")] {
+            conn.execute(
+                "INSERT OR IGNORE INTO entity_labels (entity_type, label, updated_at) VALUES (?1, ?2, ?3)",
+                params![et, label, now],
+            )
+            .map_err(|e| format!("migration 17 seed failed: {e}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 17;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
