@@ -482,13 +482,17 @@ pub fn normalize_plate(raw: &str) -> String {
 pub fn delete_company(state: State<AppState>, actor_id: String, company_id: String) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
-    let n = conn
-        .execute(
-            "UPDATE vehicles SET company_id = NULL, updated_at = ?2 WHERE company_id = ?1",
-            params![company_id, now_iso()],
-        )
-        .map_err(|e| format!("company unlink failed: {e}"))?;
-    let _ = n;
+    conn.execute(
+        "UPDATE vehicles SET company_id = NULL, updated_at = ?2 WHERE company_id = ?1",
+        params![company_id, now_iso()],
+    )
+    .map_err(|e| format!("company unlink failed: {e}"))?;
+    // Trips keep the company's name as a snapshot but must not keep the FK.
+    conn.execute(
+        "UPDATE trips SET company_id = NULL WHERE company_id = ?1",
+        params![company_id],
+    )
+    .map_err(|e| format!("trip company unlink failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM companies WHERE id = ?1", params![company_id])
         .map_err(|e| format!("company delete failed: {e}"))?;
@@ -508,6 +512,13 @@ pub fn delete_driver(state: State<AppState>, actor_id: String, driver_id: String
         params![driver_id, now_iso()],
     )
     .map_err(|e| format!("driver unlink failed: {e}"))?;
+    // Trips keep the driver's name as a snapshot but must not keep the FK,
+    // otherwise deleting the driver fails the foreign-key constraint.
+    conn.execute(
+        "UPDATE trips SET driver_id = NULL WHERE driver_id = ?1",
+        params![driver_id],
+    )
+    .map_err(|e| format!("trip driver unlink failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM drivers WHERE id = ?1", params![driver_id])
         .map_err(|e| format!("driver delete failed: {e}"))?;

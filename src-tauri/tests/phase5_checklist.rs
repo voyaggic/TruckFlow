@@ -1201,6 +1201,52 @@ fn deleting_company_unlinks_vehicles_but_keeps_them() {
     assert_eq!(v.company_id, None, "company unlinked from vehicle");
 }
 
+/// A driver (or company) that appears in past trips must still be deletable:
+/// trips keep the name snapshot but their FK is cleared first.
+#[test]
+fn deleting_driver_with_trip_history_does_not_fail_foreign_key() {
+    let ctx = TestCtx::new();
+    let admin = ctx.create_admin();
+    let driver = reference::create_driver(ctx.state(), admin.id.clone(), "Trip Driver".into(), None).unwrap();
+    let company = reference::create_company(ctx.state(), admin.id.clone(), "Trip Co".into(), None).unwrap();
+    let vehicle = reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "KDH100X".into(),
+        Some(company.id.clone()),
+        Some(20.0),
+        "litres".into(),
+        Some(driver.id.clone()),
+        None,
+    )
+    .unwrap();
+    // Log a manual trip that references the driver and company.
+    let trip = truckflow_lib::capture::manual_entry_impl(
+        &ctx.conn(),
+        &admin.id,
+        "KDH100X",
+        &ctx.frames_dir(),
+    )
+    .expect("manual entry matches vehicle")
+    .trip
+    .expect("trip logged");
+    // Attach the driver/company FKs to the trip like a real resolution does.
+    ctx.conn()
+        .execute(
+            "UPDATE trips SET driver_id = ?1, company_id = ?2 WHERE id = ?3",
+            rusqlite::params![driver.id, company.id, trip.id],
+        )
+        .unwrap();
+    // Both must now delete cleanly (before the fix: FOREIGN KEY constraint failed).
+    reference::delete_driver(ctx.state(), admin.id.clone(), driver.id.clone()).expect("driver with trips deletable");
+    reference::delete_company(ctx.state(), admin.id.clone(), company.id.clone()).expect("company with trips deletable");
+    let remaining: i64 = ctx
+        .conn()
+        .query_row("SELECT count(*) FROM drivers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0, "driver row gone");
+}
+
 // ---------------------------------------------------------------------------
 // Entity display names (Vehicles / Companies / Drivers) — rename propagates
 // ---------------------------------------------------------------------------
