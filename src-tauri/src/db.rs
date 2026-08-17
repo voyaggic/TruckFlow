@@ -654,6 +654,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 19 {
+        // Custom fields can be measurements with a unit (Fuel in litres, weight
+        // in kg, length in cm…). `field_type = 'measurement'` pairs with the
+        // new `field_unit` column.
+        conn.execute_batch(
+            "ALTER TABLE field_definitions ADD COLUMN field_unit TEXT;",
+        )
+        .map_err(|e| format!("migration 19 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 19;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 

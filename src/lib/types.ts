@@ -445,8 +445,10 @@ export interface FieldDefinition {
   entity_type: string;
   field_key: string;
   field_label: string;
-  field_type: "text" | "number" | "boolean" | "mixed";
+  field_type: "text" | "number" | "boolean" | "mixed" | "measurement";
   is_required: boolean;
+  /** Unit for measurement fields (litres, kg, cm…). Null otherwise. */
+  field_unit: string | null;
   /** Seeded built-in fields (plate, company, name…) back real columns. */
   is_standard: boolean;
   /** Hidden fields are excluded from forms/import/export. */

@@ -1855,6 +1855,12 @@ function VehicleTable({
               <th>{label("vehicle", "company")}</th>
               <th>{label("vehicle", "registered_capacity")}</th>
               <th>{label("vehicle", "driver")}</th>
+              {customDefs.map((fd) => (
+                <th key={fd.id}>
+                  {fd.field_label}
+                  {fd.field_type === "measurement" && fd.field_unit ? ` (${unitShort(fd.field_unit)})` : ""}
+                </th>
+              ))}
               <th>Status</th>
               <th />
             </tr>
@@ -1866,6 +1872,9 @@ function VehicleTable({
                 <td>{v.company_name ?? "—"}</td>
                 <td>{v.registered_capacity != null ? `${v.registered_capacity} t` : "—"}</td>
                 <td>{v.default_driver_name ?? "—"}</td>
+                {customDefs.map((fd) => (
+                  <td key={fd.id}>{fmtCellValue(v.extra_fields?.[fd.field_key], fd)}</td>
+                ))}
                 <td>
                   <span className={`badge ${v.status}`}>{v.status}</span>
                 </td>
@@ -2001,6 +2010,12 @@ function CompanyTable({
           <thead>
             <tr>
               <th>{label("company", "name")}</th>
+              {customDefs.map((fd) => (
+                <th key={fd.id}>
+                  {fd.field_label}
+                  {fd.field_type === "measurement" && fd.field_unit ? ` (${unitShort(fd.field_unit)})` : ""}
+                </th>
+              ))}
               <th>Status</th>
               <th />
             </tr>
@@ -2009,6 +2024,9 @@ function CompanyTable({
             {companies.map((c) => (
               <tr key={c.id}>
                 <td>{c.name}</td>
+                {customDefs.map((fd) => (
+                  <td key={fd.id}>{fmtCellValue(c.extra_fields?.[fd.field_key], fd)}</td>
+                ))}
                 <td>
                   <span className={`badge ${c.status}`}>{c.status}</span>
                 </td>
@@ -2143,6 +2161,12 @@ function DriverTable({
           <thead>
             <tr>
               <th>{label("driver", "name")}</th>
+              {customDefs.map((fd) => (
+                <th key={fd.id}>
+                  {fd.field_label}
+                  {fd.field_type === "measurement" && fd.field_unit ? ` (${unitShort(fd.field_unit)})` : ""}
+                </th>
+              ))}
               <th>Status</th>
               <th />
             </tr>
@@ -2151,6 +2175,9 @@ function DriverTable({
             {drivers.map((d) => (
               <tr key={d.id}>
                 <td>{d.name}</td>
+                {customDefs.map((fd) => (
+                  <td key={fd.id}>{fmtCellValue(d.extra_fields?.[fd.field_key], fd)}</td>
+                ))}
                 <td>
                   <span className={`badge ${d.status}`}>{d.status}</span>
                 </td>
@@ -2380,7 +2407,7 @@ function GenericRecordsTable({
 // ---------------------------------------------------------------------------
 
 /** Reusable input that renders based on a field definition's type. */
-function DynamicFieldInput({
+export function DynamicFieldInput({
   fd,
   value,
   onChange,
@@ -2405,18 +2432,21 @@ function DynamicFieldInput({
       </div>
     );
   }
-  if (fd.field_type === "number") {
+  if (fd.field_type === "number" || fd.field_type === "measurement") {
     return (
       <div className="field" style={{ margin: 0, minWidth: 140 }}>
         <label>
           {fd.field_label}
+          {fd.field_type === "measurement" && fd.field_unit && (
+            <span className="muted small" style={{ fontWeight: 400 }}> ({unitShort(fd.field_unit)})</span>
+          )}
           {fd.is_required && <span style={{ color: "var(--danger, #d32f2f)" }}> *</span>}
         </label>
         <input
           type="number"
           value={strVal}
           onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
-          placeholder={fd.field_label}
+          placeholder={fd.field_type === "measurement" && fd.field_unit ? `e.g. 100 ${unitShort(fd.field_unit)}` : fd.field_label}
         />
       </div>
     );
@@ -2441,7 +2471,54 @@ const FIELD_TYPE_OPTIONS: { value: string; label: string; desc: string }[] = [
   { value: "number", label: "Number", desc: "Numeric values only (e.g. Year, Weight)" },
   { value: "boolean", label: "Yes / No", desc: "True or false toggle (e.g. Insured, Active)" },
   { value: "mixed", label: "Mixed", desc: "Letters, numbers, and symbols (e.g. Plate, Code)" },
+  { value: "measurement", label: "Measurement", desc: "A value with a unit (e.g. Fuel in litres, Weight in kg)" },
 ];
+
+const MEASUREMENT_UNIT_OPTIONS: { value: string; label: string }[] = [
+  { value: "litres", label: "Litres (L)" },
+  { value: "cubic_meters", label: "Cubic metres (m³)" },
+  { value: "gallons", label: "Gallons" },
+  { value: "tonnes", label: "Tonnes (t)" },
+  { value: "kg", label: "Kilograms (kg)" },
+  { value: "grams", label: "Grams (g)" },
+  { value: "cm", label: "Centimetres (cm)" },
+  { value: "m", label: "Metres (m)" },
+  { value: "km", label: "Kilometres (km)" },
+  { value: "hours", label: "Hours" },
+  { value: "minutes", label: "Minutes" },
+  { value: "seconds", label: "Seconds" },
+];
+
+/** Short display for a unit, e.g. "litres" → "L". */
+function unitShort(unit: string | null | undefined): string {
+  switch (unit) {
+    case "litres": return "L";
+    case "cubic_meters": return "m³";
+    case "gallons": return "gal";
+    case "tonnes": return "t";
+    case "kg": return "kg";
+    case "grams": return "g";
+    case "cm": return "cm";
+    case "m": return "m";
+    case "km": return "km";
+    case "hours": return "hrs";
+    case "minutes": return "min";
+    case "seconds": return "s";
+    default: return unit ?? "";
+  }
+}
+
+/** Format a custom-field value for a table cell (booleans, measurements…). */
+function fmtCellValue(v: unknown, fd: FieldDefinition): string {
+  if (v == null || v === "") return "—";
+  if (fd.field_type === "boolean") {
+    return String(v) === "true" ? "Yes" : String(v) === "false" ? "No" : String(v);
+  }
+  if (fd.field_type === "measurement" && fd.field_unit) {
+    return `${v} ${unitShort(fd.field_unit)}`;
+  }
+  return String(v);
+}
 
 function FieldManager({
   actor,
@@ -2461,6 +2538,7 @@ function FieldManager({
   const [newKey, setNewKey] = useState("");
   const [newLabel, setNewLabel] = useState("");
   const [newType, setNewType] = useState("text");
+  const [newUnit, setNewUnit] = useState("litres");
   const [newRequired, setNewRequired] = useState(false);
   // Entity display-name editing (rename Vehicles → e.g. Trucks, app-wide).
   const [renamingEntity, setRenamingEntity] = useState<string | null>(null);
@@ -2585,6 +2663,7 @@ function FieldManager({
     setNewKey("");
     setNewLabel("");
     setNewType("text");
+    setNewUnit("litres");
     setNewRequired(false);
   };
 
@@ -2595,6 +2674,7 @@ function FieldManager({
     setNewKey(fd.field_key);
     setNewLabel(fd.field_label);
     setNewType(fd.field_type);
+    setNewUnit(fd.field_unit ?? "litres");
     setNewRequired(fd.is_required);
   };
 
@@ -2613,6 +2693,7 @@ function FieldManager({
         newType,
         newRequired,
         fields.length,
+        newType === "measurement" ? newUnit : null,
       );
       onNotice(`Field "${newLabel.trim()}" added to ${entityLabel(entityTab as ReferenceEntityType)}.`);
       setTimeout(() => onNotice(""), 4000);
@@ -2636,6 +2717,7 @@ function FieldManager({
         field_label: newLabel.trim(),
         field_type: newType as FieldDefinition["field_type"],
         is_required: newRequired,
+        field_unit: newType === "measurement" ? newUnit : null,
       });
       onNotice(`Field "${newLabel.trim()}" updated.`);
       setTimeout(() => onNotice(""), 4000);
@@ -2840,6 +2922,18 @@ function FieldManager({
                 ))}
               </select>
             </div>
+            {newType === "measurement" && (
+              <div className="field" style={{ margin: 0, minWidth: 150 }}>
+                <label>Unit</label>
+                <select value={newUnit} onChange={(e) => setNewUnit(e.target.value)}>
+                  {MEASUREMENT_UNIT_OPTIONS.map((u) => (
+                    <option key={u.value} value={u.value}>
+                      {u.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             <div className="field" style={{ margin: 0 }}>
               <label>&nbsp;</label>
               <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
@@ -2904,6 +2998,7 @@ function FieldManager({
                 <td>
                   <span className="badge">
                     {FIELD_TYPE_OPTIONS.find((o) => o.value === fd.field_type)?.label ?? fd.field_type}
+                    {fd.field_type === "measurement" && fd.field_unit ? ` (${unitShort(fd.field_unit)})` : ""}
                   </span>
                 </td>
                 <td>{fd.is_required ? <span className="badge active">Yes</span> : "No"}</td>

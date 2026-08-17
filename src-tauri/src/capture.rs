@@ -1175,6 +1175,7 @@ pub fn resolve_queued_new(
     capacity_unit: String,
     default_driver_id: Option<String>,
     confirm_duplicate_plate: bool,
+    extra_fields: Option<String>,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let trip = resolve_queued_new_impl(
@@ -1187,6 +1188,7 @@ pub fn resolve_queued_new(
         capacity_unit,
         default_driver_id,
         confirm_duplicate_plate,
+        extra_fields,
     )?;
     drop(conn);
     emit_capture_update(&app);
@@ -1205,6 +1207,7 @@ pub fn resolve_queued_new_impl(
     capacity_unit: String,
     default_driver_id: Option<String>,
     confirm_duplicate_plate: bool,
+    extra_fields: Option<String>,
 ) -> Result<TripView, String> {
     let plate = crate::reference::normalize_plate(plate_number);
     if plate.is_empty() {
@@ -1230,9 +1233,9 @@ pub fn resolve_queued_new_impl(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
     conn.execute(
-        "INSERT INTO vehicles (id, plate_number, company_id, registered_capacity, capacity_unit, default_driver_id, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)",
-        params![id, plate, company_id, registered_capacity, unit, default_driver_id, now],
+        "INSERT INTO vehicles (id, plate_number, company_id, registered_capacity, capacity_unit, default_driver_id, status, extra_fields, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8)",
+        params![id, plate, company_id, registered_capacity, unit, default_driver_id, extra_fields, now],
     )
     .map_err(|e| format!("vehicle creation failed: {e}"))?;
     append_audit(
@@ -1240,7 +1243,7 @@ pub fn resolve_queued_new_impl(
         officer_id,
         "registered_vehicle_at_resolution",
         Some(&id),
-        Some(serde_json::json!({ "plate_number": plate, "company_id": company_id, "registered_capacity": registered_capacity, "capacity_unit": unit })),
+        Some(serde_json::json!({ "plate_number": plate, "company_id": company_id, "registered_capacity": registered_capacity, "capacity_unit": unit, "extra_fields": extra_fields })),
     )?;
     let mut vehicle = VehicleView {
         id,
@@ -1252,7 +1255,9 @@ pub fn resolve_queued_new_impl(
         default_driver_id,
         default_driver_name: None,
         status: "active".to_string(),
-        extra_fields: None,
+        extra_fields: extra_fields
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
         created_at: now,
     };
     if let Some(cid) = &vehicle.company_id {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { useReferenceFields } from "../lib/referenceFields";
+import { DynamicFieldInput } from "./AdminPanel";
 import type {
   AnprStatus,
   CaptureSettings,
@@ -518,12 +519,15 @@ function ResolveScreen({
   onDecline: (trip: TripView) => void;
   onDone: (message: string, trip: TripView | null) => Promise<void>;
 }) {
-  const { label, entityLabel } = useReferenceFields();
+  const { label, entityLabel, fieldsFor } = useReferenceFields();
+  const vehicleDefs = fieldsFor("vehicle");
+  const customVehicleDefs = vehicleDefs.filter((fd) => !fd.is_hidden && !fd.is_standard);
   const [frames, setFrames] = useState<FrameEvidence[]>([]);
   const [companies, setCompanies] = useState<CompanyView[]>([]);
   const [drivers, setDrivers] = useState<DriverView[]>([]);
   const [vehicles, setVehicles] = useState<VehicleView[]>([]);
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(trip.vehicle_id);
+  const [extraFields, setExtraFields] = useState<Record<string, unknown>>({});
   const [companyId, setCompanyId] = useState<string>(trip.company_id ?? "");
   const [driverId, setDriverId] = useState<string>(trip.driver_id ?? "");
   const [capacity, setCapacity] = useState<string>(
@@ -572,6 +576,7 @@ function ResolveScreen({
     setDriverId(v.default_driver_id ?? "");
     setCapacity(v.registered_capacity != null ? String(v.registered_capacity) : "");
     setCapacityUnit(v.capacity_unit ?? "litres");
+    setExtraFields(v.extra_fields ?? {});
     setRegisterNew(false);
     setDupWarning(null);
   };
@@ -618,6 +623,7 @@ function ResolveScreen({
         capacityUnit,
         driverId || null,
         confirmDuplicate,
+        extraFields,
       );
       await onDone(`Trip ${logged.plate_number} resolved — vehicle ${newPlate.trim().toUpperCase()} registered.`, logged);
     } catch (e) {
@@ -824,6 +830,14 @@ function ResolveScreen({
                   </select>
                 </div>
               </div>
+              {customVehicleDefs.map((fd) => (
+                <DynamicFieldInput
+                  key={fd.id}
+                  fd={fd}
+                  value={extraFields[fd.field_key]}
+                  onChange={(v) => setExtraFields((prev) => ({ ...prev, [fd.field_key]: v }))}
+                />
+              ))}
             </div>
             <p className="muted small" style={{ marginTop: 8 }}>
               Registers the vehicle in the reference database for all future trips.

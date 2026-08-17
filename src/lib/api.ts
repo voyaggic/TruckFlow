@@ -237,6 +237,7 @@ export const api = {
     fieldType: string,
     isRequired: boolean,
     sortOrder?: number,
+    fieldUnit?: string | null,
   ) =>
     invoke<FieldDefinition>("create_field_definition", {
       actorId,
@@ -246,12 +247,13 @@ export const api = {
       fieldType,
       isRequired,
       sortOrder: sortOrder ?? null,
+      fieldUnit: fieldUnit ?? null,
     }),
 
   updateFieldDefinition: (
     actorId: string,
     fieldId: string,
-    changes: Partial<Pick<FieldDefinition, "field_key" | "field_label" | "field_type" | "is_required" | "sort_order" | "is_hidden">>,
+    changes: Partial<Pick<FieldDefinition, "field_key" | "field_label" | "field_type" | "is_required" | "sort_order" | "is_hidden" | "field_unit">>,
   ) =>
     invoke<void>("update_field_definition", {
       actorId,
@@ -262,6 +264,7 @@ export const api = {
       isRequired: changes.is_required ?? null,
       sortOrder: changes.sort_order ?? null,
       isHidden: changes.is_hidden ?? null,
+      fieldUnit: changes.field_unit ?? null,
     }),
 
   deleteFieldDefinition: (actorId: string, fieldId: string) =>
@@ -414,6 +417,7 @@ export const api = {
     capacityUnit: string,
     defaultDriverId: string | null,
     confirmDuplicatePlate: boolean,
+    extraFields?: Record<string, unknown>,
   ) =>
     invoke<TripView>("resolve_queued_new", {
       tripId,
@@ -424,6 +428,7 @@ export const api = {
       capacityUnit,
       defaultDriverId,
       confirmDuplicatePlate,
+      extraFields: extraFields ? JSON.stringify(extraFields) : null,
     }),
 
   discardTrip: (tripId: string, officerId: string) =>

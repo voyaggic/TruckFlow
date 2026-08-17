@@ -328,6 +328,7 @@ fn register_new_vehicle_resolves_and_creates_reference_record() {
         "litres".into(),
         None,
         false,
+        None,
     )
     .expect("register new must resolve");
     assert_eq!(resolved.status, "logged");
@@ -368,6 +369,7 @@ fn register_new_warns_on_duplicate_plate() {
         "litres".into(),
         None,
         false,
+        None,
     )
     .expect_err("existing plate must trigger duplicate-plate warning");
     assert!(err.contains("already registered"), "warning must say the plate exists");
@@ -383,6 +385,7 @@ fn register_new_warns_on_duplicate_plate() {
         "litres".into(),
         None,
         true,
+        None,
     )
     .expect("confirmed reuse must resolve");
     assert_eq!(resolved.status, "logged");
@@ -651,3 +654,4 @@ fn candidate_rows(ctx: &TestCtx, trip_id: &str) -> Vec<(String, String)> {
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
+

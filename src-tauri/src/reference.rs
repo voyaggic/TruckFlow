@@ -544,7 +544,12 @@ pub fn delete_vehicle(state: State<AppState>, actor_id: String, vehicle_id: Stri
 // ---------------------------------------------------------------------------
 
 const VALID_ENTITY_TYPES: &[&str] = &["company", "vehicle", "driver"];
-const VALID_FIELD_TYPES: &[&str] = &["text", "number", "boolean", "mixed"];
+const VALID_FIELD_TYPES: &[&str] = &["text", "number", "boolean", "mixed", "measurement"];
+
+/// Common measurement units for `measurement` fields (fuel litres, weight kg…).
+const VALID_FIELD_UNITS: &[&str] = &[
+    "litres", "cubic_meters", "gallons", "tonnes", "kg", "grams", "cm", "m", "km", "hours", "minutes", "seconds",
+];
 
 fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
     Ok(FieldDefinition {
@@ -554,12 +559,13 @@ fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
         field_label: row.get(3)?,
         field_type: row.get(4)?,
         is_required: row.get::<_, i32>(5)? != 0,
-        is_standard: row.get::<_, i32>(6)? != 0,
-        is_hidden: row.get::<_, i32>(7)? != 0,
-        binding: row.get(8)?,
-        sort_order: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        field_unit: row.get(6)?,
+        is_standard: row.get::<_, i32>(7)? != 0,
+        is_hidden: row.get::<_, i32>(8)? != 0,
+        binding: row.get(9)?,
+        sort_order: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -567,7 +573,7 @@ fn read_field_def(row: &rusqlite::Row) -> rusqlite::Result<FieldDefinition> {
 fn list_field_defs_raw(conn: &Connection, entity_type: &str) -> Result<Vec<FieldDefinition>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, entity_type, field_key, field_label, field_type, is_required, is_standard, is_hidden, binding, sort_order, created_at, updated_at
+            "SELECT id, entity_type, field_key, field_label, field_type, is_required, field_unit, is_standard, is_hidden, binding, sort_order, created_at, updated_at
              FROM field_definitions WHERE entity_type = ?1
              ORDER BY is_standard DESC, sort_order, field_label",
         )
@@ -601,10 +607,20 @@ pub fn create_field_definition(
     field_type: String,
     is_required: bool,
     sort_order: Option<i32>,
+    field_unit: Option<String>,
 ) -> Result<FieldDefinition, String> {
     if !VALID_FIELD_TYPES.contains(&field_type.as_str()) {
         return Err(format!("Invalid field type '{field_type}'. Must be one of: {}.", VALID_FIELD_TYPES.join(", ")));
     }
+    let unit = if field_type == "measurement" {
+        let u = field_unit.unwrap_or_default().trim().to_lowercase().replace(' ', "_");
+        if u.is_empty() {
+            return Err("Measurement fields need a unit (e.g. litres, kg, cm).".to_string());
+        }
+        Some(u)
+    } else {
+        None
+    };
     let key = field_key.trim().to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
     if key.is_empty() {
         return Err("Field key is required.".to_string());
@@ -634,12 +650,12 @@ pub fn create_field_definition(
     let now = now_iso();
     let order = sort_order.unwrap_or(0);
     conn.execute(
-        "INSERT INTO field_definitions (id, entity_type, field_key, field_label, field_type, is_required, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        params![id, entity_type, key, label, field_type, is_required as i32, order, now],
+        "INSERT INTO field_definitions (id, entity_type, field_key, field_label, field_type, is_required, field_unit, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![id, entity_type, key, label, field_type, is_required as i32, unit, order, now],
     )
     .map_err(|e| format!("field_definitions create failed: {e}"))?;
-    append_audit(&conn, &actor_id, "created_field_definition", Some(&id), Some(serde_json::json!({ "entity_type": entity_type, "field_key": key, "field_label": label })))?;
+    append_audit(&conn, &actor_id, "created_field_definition", Some(&id), Some(serde_json::json!({ "entity_type": entity_type, "field_key": key, "field_label": label, "field_unit": unit })))?;
     Ok(FieldDefinition {
         id,
         entity_type,
@@ -647,6 +663,7 @@ pub fn create_field_definition(
         field_label: label,
         field_type,
         is_required,
+        field_unit: unit,
         is_standard: false,
         is_hidden: false,
         binding: None,
@@ -710,12 +727,19 @@ pub fn update_field_definition(
     is_required: Option<bool>,
     sort_order: Option<i32>,
     is_hidden: Option<bool>,
+    field_unit: Option<String>,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
     if let Some(ref ft) = field_type {
         if !VALID_FIELD_TYPES.contains(&ft.as_str()) {
             return Err(format!("Invalid field type '{ft}'. Must be one of: {}.", VALID_FIELD_TYPES.join(", ")));
+        }
+        if ft == "measurement" {
+            let u = field_unit.as_deref().unwrap_or("").trim();
+            if u.is_empty() {
+                return Err("Measurement fields need a unit (e.g. litres, kg, cm).".to_string());
+            }
         }
     }
     // Load the current row so a key rename can migrate its data.
@@ -782,6 +806,10 @@ pub fn update_field_definition(
         sets.push(format!("is_hidden = ?{idx}"));
         idx += 1;
     }
+    if field_type.is_some() || field_unit.is_some() {
+        sets.push(format!("field_unit = ?{idx}"));
+        idx += 1;
+    }
     let sql = format!("UPDATE field_definitions SET {} WHERE id = ?{idx}", sets.join(", "));
     let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now_iso())];
     if field_key.is_some() && key_used != old_key {
@@ -801,6 +829,14 @@ pub fn update_field_definition(
     }
     if let Some(hidden) = is_hidden {
         bound.push(Box::new(hidden as i32));
+    }
+    if field_type.is_some() || field_unit.is_some() {
+        let unit = if field_type.as_deref() == Some("measurement") {
+            Some(field_unit.as_deref().unwrap_or("").trim().to_lowercase().replace(' ', "_"))
+        } else {
+            None
+        };
+        bound.push(Box::new(unit));
     }
     bound.push(Box::new(field_id.clone()));
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
@@ -1599,7 +1635,7 @@ fn validate_record_data(conn: &Connection, entity_type: &str, data: &serde_json:
             }
         }
         if let Some(v) = obj.get(&fd.field_key) {
-            if fd.field_type == "number" && !v.is_null() {
+            if (fd.field_type == "number" || fd.field_type == "measurement") && !v.is_null() {
                 if let Some(s) = v.as_str() {
                     if !s.trim().is_empty() && s.parse::<f64>().is_err() {
                         return Err(format!(
@@ -2394,6 +2430,11 @@ fn ensure_custom_field(
     if !VALID_FIELD_TYPES.contains(&field_type) {
         return Err(format!("Invalid field type '{field_type}'."));
     }
+    let unit: Option<String> = if field_type == "measurement" {
+        Some(label.to_lowercase().replace(' ', "_"))
+    } else {
+        None
+    };
     let exists: Option<String> = conn
         .query_row(
             "SELECT id FROM field_definitions WHERE entity_type = ?1 AND field_key = ?2",
@@ -2409,9 +2450,9 @@ fn ensure_custom_field(
     let now = now_iso();
     conn.execute(
         "INSERT INTO field_definitions
-            (id, entity_type, field_key, field_label, field_type, is_required, sort_order, is_standard, is_hidden, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?8)",
-        params![id, entity_type, key, label, field_type, is_required as i32, 100, now],
+            (id, entity_type, field_key, field_label, field_type, is_required, field_unit, sort_order, is_standard, is_hidden, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?9)",
+        params![id, entity_type, key, label, field_type, is_required as i32, unit, 100, now],
     )
     .map_err(|e| format!("field_definitions create failed: {e}"))?;
     append_audit(

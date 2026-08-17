@@ -523,6 +523,9 @@ pub struct FieldDefinition {
     pub field_label: String,
     pub field_type: String, // text | number | boolean | mixed
     pub is_required: bool,
+    /// For measurement fields: the unit (litres, kg, cm…). Text/number/boolean
+    /// fields leave this null.
+    pub field_unit: Option<String>,
     /// True for the seeded built-in fields (plate, company, driver, name…).
     /// Standard fields map to real database columns; custom fields map to the
     /// `extra_fields` JSON column.
