@@ -769,8 +769,63 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// Standard fields the three core entities always need. Keyed by binding:
+/// the real column the field maps to (plate_number, name, status…).
+const STANDARD_FIELD_SKELETON: &[(&str, &str, &str, &str, i32, bool)] = &[
+    ("vehicle", "plate_number", "Plate", "text", 0, true),
+    ("vehicle", "company", "Company", "text", 1, false),
+    ("vehicle", "driver", "Driver", "text", 2, false),
+    ("vehicle", "registered_capacity", "Capacity (L)", "number", 3, false),
+    ("vehicle", "capacity_unit", "Capacity Unit", "text", 4, false),
+    ("vehicle", "status", "Status", "text", 5, false),
+    ("company", "name", "Company Name", "text", 0, true),
+    ("company", "status", "Status", "text", 1, false),
+    ("driver", "name", "Driver Name", "text", 0, true),
+    ("driver", "status", "Status", "text", 1, false),
+];
+
+/// Re-create any missing standard field definitions (INSERT OR IGNORE by
+/// binding). Runs on every launch so a deleted standard field can never
+/// silently break imports/forms/exports again.
+fn seed_standard_field_skeleton(conn: &Connection, now: &str) -> Result<(), String> {
+    for (entity_type, key, label, ftype, sort_order, is_required) in STANDARD_FIELD_SKELETON {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM field_definitions WHERE entity_type = ?1 AND binding = ?2",
+                params![entity_type, key],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("field skeleton lookup failed: {e}"))?;
+        if exists > 0 {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO field_definitions
+                (id, entity_type, field_key, field_label, field_type, is_required, sort_order,
+                 is_standard, is_hidden, binding, field_unit, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?3, NULL, ?8, ?8)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                entity_type,
+                key,
+                label,
+                ftype,
+                *is_required as i32,
+                sort_order,
+                now,
+            ],
+        )
+        .map_err(|e| format!("field skeleton seed failed: {e}"))?;
+    }
+    Ok(())
+}
+
 fn seed(conn: &Connection) -> Result<(), String> {
     let now = now_iso();
+    // The standard field skeleton (plate, name, status…) is required for the
+    // gate pipeline, imports and exports. Self-heal on every launch so a
+    // deleted standard field can never break the app again.
+    seed_standard_field_skeleton(conn, &now)?;
     // Permission catalog is INSERT OR IGNORE (never early-return) so new
     // permission keys reach existing databases too, not only fresh installs.
     for (id, key, min_auth, desc) in PERMISSION_CATALOG {

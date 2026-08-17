@@ -907,17 +907,35 @@ pub fn delete_field_definition(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, REF_PERM)?;
-    // Fields are deleted as a whole — standard and custom alike. The real
-    // database column behind a standard field is kept (history stays intact),
-    // but the field disappears from forms, import, and export everywhere.
-    let n = conn
-        .execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
-        .map_err(|e| format!("field_definitions delete failed: {e}"))?;
-    if n == 0 {
-        return Err("Field definition not found.".to_string());
+    // Standard fields back real database columns (plate_number, name, status…)
+    // that the gate pipeline, imports, exports and reports depend on — they
+    // cannot be deleted, only renamed/hidden. Custom fields delete freely.
+    let is_standard: Option<i32> = conn
+        .query_row(
+            "SELECT is_standard FROM field_definitions WHERE id = ?1",
+            params![field_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match is_standard {
+        None => Err("Field definition not found.".to_string()),
+        Some(1) => Err(
+            "This is a standard field the system needs (plate, name, status, capacity…). "
+                .to_string()
+                + "You can rename it or hide it from forms/import/export, but it can't be deleted.",
+        ),
+        Some(_) => {
+            let n = conn
+                .execute("DELETE FROM field_definitions WHERE id = ?1", params![field_id])
+                .map_err(|e| format!("field_definitions delete failed: {e}"))?;
+            if n == 0 {
+                return Err("Field definition not found.".to_string());
+            }
+            append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
+            Ok(())
+        }
     }
-    append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

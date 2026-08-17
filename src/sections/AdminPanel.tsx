@@ -1373,7 +1373,11 @@ function fieldMappingValue(f: FieldDefinition): string {
 function defaultMappingFor(col: ColumnInfo, fields: FieldDefinition[]): ColConfig {
   const valid = new Set(fields.filter((f) => !f.is_hidden).map(fieldMappingValue));
   let mapping: string;
-  if ((col.kind === "standard" || col.kind === "existing_custom") && valid.has(col.field_key)) {
+  // Standard columns are authoritative from the backend (hardcoded aliases) —
+  // keep the mapping even if the field definition was deleted from the DB.
+  if (col.kind === "standard") {
+    mapping = col.field_key;
+  } else if (col.kind === "existing_custom" && valid.has(col.field_key)) {
     mapping = col.field_key;
   } else {
     mapping = "new";
