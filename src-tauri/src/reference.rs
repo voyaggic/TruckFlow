@@ -2006,17 +2006,30 @@ fn infer_entity_type(header: &[String]) -> String {
 fn standard_key_for(entity_type: &str, h: &str) -> Option<&'static str> {
     match entity_type {
         "vehicle" => match h {
-            "plate_number" | "plate" | "license_plate" | "number_plate" | "reg_no" | "registration" | "plate_no" => Some("plate_number"),
-            "company" | "company_name" => Some("company"),
-            "driver" | "driver_name" => Some("driver"),
-            "registered_capacity" | "capacity" | "capacity_l" | "capacity_litres" => Some("registered_capacity"),
-            "capacity_unit" | "unit" => Some("capacity_unit"),
-            "status" => Some("status"),
+            "plate_number" | "plate" | "license_plate" | "number_plate"
+            | "reg_no" | "registration" | "plate_no" | "registration_number" => Some("plate_number"),
+            "company" | "company_name" | "fleet" | "fleet_name"
+            | "owner" | "owner_name" | "trucking_company" => Some("company"),
+            "driver" | "driver_name" | "truck_driver" | "chauffeur"
+            | "driver_full_name" => Some("driver"),
+            "registered_capacity" | "capacity" | "capacity_l"
+            | "capacity_litres" | "tonnage" | "payload" | "load_capacity" => Some("registered_capacity"),
+            "capacity_unit" | "unit" | "measurement_unit" => Some("capacity_unit"),
+            "status" | "operational" | "active" | "is_active"
+            | "operational_status" => Some("status"),
             _ => None,
         },
-        "company" | "driver" => match h {
-            "name" => Some("name"),
-            "status" => Some("status"),
+        "company" => match h {
+            "name" | "company_name" | "business_name" | "business"
+            | "organisation" | "organization" | "firm" | "enterprise"
+            | "trading_name" => Some("name"),
+            "status" | "operational" | "active" | "is_active" => Some("status"),
+            _ => None,
+        },
+        "driver" => match h {
+            "name" | "driver_name" | "full_name" | "chauffeur"
+            | "driver_full_name" | "trucker" => Some("name"),
+            "status" | "operational" | "active" | "is_active" => Some("status"),
             _ => None,
         },
         _ => match h {
@@ -2581,4 +2594,32 @@ pub fn reference_import_combined(
         })),
     )?;
     Ok(summary)
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::standard_key_for;
+
+    #[test]
+    fn renamed_headers_map_to_standard_keys() {
+        // Vehicles — different naming conventions
+        assert_eq!(standard_key_for("vehicle", "reg_no"), Some("plate_number"));
+        assert_eq!(standard_key_for("vehicle", "fleet"), Some("company"));
+        assert_eq!(standard_key_for("vehicle", "fleet_name"), Some("company"));
+        assert_eq!(standard_key_for("vehicle", "truck_driver"), Some("driver"));
+        assert_eq!(standard_key_for("vehicle", "tonnage"), Some("registered_capacity"));
+        assert_eq!(standard_key_for("vehicle", "operational"), Some("status"));
+        assert_eq!(standard_key_for("vehicle", "unit"), Some("capacity_unit"));
+        // Companies — different naming conventions
+        assert_eq!(standard_key_for("company", "business_name"), Some("name"));
+        assert_eq!(standard_key_for("company", "trading_name"), Some("name"));
+        assert_eq!(standard_key_for("company", "operational"), Some("status"));
+        // Drivers — different naming conventions
+        assert_eq!(standard_key_for("driver", "full_name"), Some("name"));
+        assert_eq!(standard_key_for("driver", "operational"), Some("status"));
+        // Headers that are genuinely new stay None (become custom fields)
+        assert_eq!(standard_key_for("company", "location"), None);
+        assert_eq!(standard_key_for("vehicle", "insurance_expiry"), None);
+        assert_eq!(standard_key_for("vehicle", "route"), None);
+    }
 }

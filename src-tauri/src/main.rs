@@ -17,10 +17,6 @@ use std::process::ExitCode;
 ///   truckflow db-path
 ///       Print the resolved database path (honours TRUCKFLOW_DB).
 ///
-///   truckflow seed-demo
-///       Populate the local database with realistic Kenyan demo data
-///       (companies, drivers, vehicles, several weeks of trips) for stress
-///       testing sync and reporting. Seeds once; safe to ignore afterwards.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -64,24 +60,8 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "seed-demo" => {
-            if args.len() != 2 {
-                eprintln!("usage: truckflow seed-demo");
-                return ExitCode::FAILURE;
-            }
-            match cli_seed_demo() {
-                Ok(msg) => {
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         _ => {
-            eprintln!("unknown command: {} (expected reset-admin | set-recovery-code | seed-demo | db-path)", args[1]);
+            eprintln!("unknown command: {} (expected reset-admin | set-recovery-code | db-path)", args[1]);
             ExitCode::FAILURE
         }
     }
@@ -120,10 +100,4 @@ fn cli_set_recovery_code() -> Result<String, String> {
     ))
 }
 
-fn cli_seed_demo() -> Result<String, String> {
-    let path = truckflow_lib::db::default_db_path();
-    let conn = truckflow_lib::db::open_db(&path).map_err(|e| format!("cannot open database at {}: {e}", path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| format!("cannot set busy timeout: {e}"))?;
-    truckflow_lib::seeds::seed_demo(&conn)
-}
+

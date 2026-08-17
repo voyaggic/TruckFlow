@@ -9,7 +9,6 @@ pub mod models;
 pub mod monitor;
 pub mod reference;
 pub mod reporting;
-pub mod seeds;
 pub mod sync;
 
 use std::sync::atomic::Ordering;
