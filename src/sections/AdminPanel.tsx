@@ -1786,27 +1786,31 @@ function VehicleTable({
                 return (
                   <div key={fd.id} className="field" style={{ margin: 0 }}>
                     <label>{fd.field_label}{req}</label>
-                    <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
-                      <input
-                        style={{ flex: 1 }}
-                        value={capacity}
-                        onChange={(e) => setCapacity(e.target.value)}
-                        placeholder="25"
-                      />
-                      {showUnit && (
-                        <select
-                          style={{ width: 120 }}
-                          value={capacityUnit}
-                          onChange={(e) => setCapacityUnit(e.target.value)}
-                        >
-                          <option value="litres">Litres</option>
-                          <option value="cubic_meters">m³</option>
-                          <option value="gallons">Gallons</option>
-                          <option value="tonnes">Tonnes</option>
-                          <option value="kg">kg</option>
-                        </select>
-                      )}
-                    </div>
+                  <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+                    <input
+                      style={{ flex: 1 }}
+                      value={capacity}
+                      onChange={(e) => setCapacity(e.target.value)}
+                      placeholder="25"
+                    />
+                    {showUnit && (
+                      <select
+                        style={{ width: 130 }}
+                        value={capacityUnit}
+                        onChange={(e) => setCapacityUnit(e.target.value)}
+                      >
+                        {MEASUREMENT_UNIT_GROUPS.map((g) => (
+                          <optgroup key={g.label} label={g.label}>
+                            {g.units.map((u) => (
+                              <option key={u.value} value={u.value}>
+                                {u.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    )}
+                  </div>
                   </div>
                 );
               }
@@ -1870,7 +1874,11 @@ function VehicleTable({
               <tr key={v.id}>
                 <td className="plate-font">{v.plate_number}</td>
                 <td>{v.company_name ?? "—"}</td>
-                <td>{v.registered_capacity != null ? `${v.registered_capacity} t` : "—"}</td>
+                <td>
+                  {v.registered_capacity != null
+                    ? `${v.registered_capacity} ${unitShort(v.capacity_unit || "litres")}`
+                    : "—"}
+                </td>
                 <td>{v.default_driver_name ?? "—"}</td>
                 {customDefs.map((fd) => (
                   <td key={fd.id}>{fmtCellValue(v.extra_fields?.[fd.field_key], fd)}</td>
@@ -2474,20 +2482,52 @@ const FIELD_TYPE_OPTIONS: { value: string; label: string; desc: string }[] = [
   { value: "measurement", label: "Measurement", desc: "A value with a unit (e.g. Fuel in litres, Weight in kg)" },
 ];
 
-const MEASUREMENT_UNIT_OPTIONS: { value: string; label: string }[] = [
-  { value: "litres", label: "Litres (L)" },
-  { value: "cubic_meters", label: "Cubic metres (m³)" },
-  { value: "gallons", label: "Gallons" },
-  { value: "tonnes", label: "Tonnes (t)" },
-  { value: "kg", label: "Kilograms (kg)" },
-  { value: "grams", label: "Grams (g)" },
-  { value: "cm", label: "Centimetres (cm)" },
-  { value: "m", label: "Metres (m)" },
-  { value: "km", label: "Kilometres (km)" },
-  { value: "hours", label: "Hours" },
-  { value: "minutes", label: "Minutes" },
-  { value: "seconds", label: "Seconds" },
+interface UnitOption {
+  value: string;
+  label: string;
+}
+
+interface UnitGroup {
+  label: string;
+  units: UnitOption[];
+}
+
+/** Measurement units grouped by category so the right one is easy to find. */
+export const MEASUREMENT_UNIT_GROUPS: UnitGroup[] = [
+  {
+    label: "Volume / Capacity",
+    units: [
+      { value: "litres", label: "Litres (L)" },
+      { value: "cubic_meters", label: "Cubic metres (m³)" },
+      { value: "gallons", label: "Gallons (gal)" },
+    ],
+  },
+  {
+    label: "Mass / Weight",
+    units: [
+      { value: "tonnes", label: "Tonnes (t)" },
+      { value: "kg", label: "Kilograms (kg)" },
+      { value: "grams", label: "Grams (g)" },
+    ],
+  },
+  {
+    label: "Length / Distance",
+    units: [
+      { value: "cm", label: "Centimetres (cm)" },
+      { value: "m", label: "Metres (m)" },
+      { value: "km", label: "Kilometres (km)" },
+    ],
+  },
+  {
+    label: "Time",
+    units: [
+      { value: "hours", label: "Hours" },
+      { value: "minutes", label: "Minutes" },
+      { value: "seconds", label: "Seconds" },
+    ],
+  },
 ];
+
 
 /** Short display for a unit, e.g. "litres" → "L". */
 function unitShort(unit: string | null | undefined): string {
@@ -2926,10 +2966,14 @@ function FieldManager({
               <div className="field" style={{ margin: 0, minWidth: 150 }}>
                 <label>Unit</label>
                 <select value={newUnit} onChange={(e) => setNewUnit(e.target.value)}>
-                  {MEASUREMENT_UNIT_OPTIONS.map((u) => (
-                    <option key={u.value} value={u.value}>
-                      {u.label}
-                    </option>
+                  {MEASUREMENT_UNIT_GROUPS.map((g) => (
+                    <optgroup key={g.label} label={g.label}>
+                      {g.units.map((u) => (
+                        <option key={u.value} value={u.value}>
+                          {u.label}
+                        </option>
+                      ))}
+                    </optgroup>
                   ))}
                 </select>
               </div>

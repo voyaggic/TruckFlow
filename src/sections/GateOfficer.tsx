@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { useReferenceFields } from "../lib/referenceFields";
-import { DynamicFieldInput } from "./AdminPanel";
+import { DynamicFieldInput, MEASUREMENT_UNIT_GROUPS } from "./AdminPanel";
 import type {
   AnprStatus,
   CaptureSettings,
@@ -818,15 +818,19 @@ function ResolveScreen({
                     placeholder="20"
                   />
                   <select
-                    style={{ width: 120 }}
+                    style={{ width: 140 }}
                     value={capacityUnit}
                     onChange={(e) => setCapacityUnit(e.target.value)}
                   >
-                    <option value="litres">Litres</option>
-                    <option value="cubic_meters">m³</option>
-                    <option value="gallons">Gallons</option>
-                    <option value="tonnes">Tonnes</option>
-                    <option value="kg">kg</option>
+                    {MEASUREMENT_UNIT_GROUPS.map((g) => (
+                      <optgroup key={g.label} label={g.label}>
+                        {g.units.map((u) => (
+                          <option key={u.value} value={u.value}>
+                            {u.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
                   </select>
                 </div>
               </div>
