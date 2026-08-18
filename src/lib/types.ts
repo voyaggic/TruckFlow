@@ -341,6 +341,12 @@ export interface SyncRunResult {
   last_run_at: string | null;
 }
 
+export interface SheetColumnEntry {
+  field_key: string;
+  header: string;
+  enabled: boolean;
+}
+
 export interface SyncStatusView {
   online: boolean;
   pg: PgSyncStateView;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { SessionUser, SyncStatusView } from "../lib/types";
+import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
 
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
@@ -51,6 +51,7 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
 
       <PostgresPanel status={status} totalPending={totalPending} busy={busy} actor={user} onRun={run} />
       <SheetsPanel status={status} busy={busy} actor={user} onRun={run} />
+      {status?.sheets?.configured && <ColumnMappingPanel actor={user} onRun={run} />}
     </div>
   );
 }
@@ -220,6 +221,151 @@ function PostgresPanel({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 6g — Sheet column mapping
+// ---------------------------------------------------------------------------
+
+function ColumnMappingPanel({
+  actor,
+  onRun,
+}: {
+  actor: SessionUser;
+  onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
+}) {
+  const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [editHeader, setEditHeader] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    api.getSheetColumnMapping().then((m) => {
+      setMapping(m);
+      const h: Record<string, string> = {};
+      m.forEach((e) => (h[e.field_key] = e.header));
+      setEditHeader(h);
+      setLoading(false);
+    });
+  }, []);
+
+  const save = () => {
+    const updated = mapping.map((e) => ({ ...e, header: editHeader[e.field_key] || e.header }));
+    onRun(
+      () => api.setSheetColumnMapping(actor.id, updated),
+      "Column mapping saved — next sync will use the new layout.",
+    );
+    setMapping(updated);
+  };
+
+  const toggle = (key: string) => {
+    setMapping((prev) => prev.map((e) => (e.field_key === key ? { ...e, enabled: !e.enabled } : e)));
+  };
+
+  const moveUp = (idx: number) => {
+    if (idx <= 0) return;
+    setMapping((prev) => {
+      const arr = [...prev];
+      [arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]];
+      return arr;
+    });
+  };
+
+  const moveDown = (idx: number) => {
+    setMapping((prev) => {
+      if (idx >= prev.length - 1) return prev;
+      const arr = [...prev];
+      [arr[idx], arr[idx + 1]] = [arr[idx + 1], arr[idx]];
+      return arr;
+    });
+  };
+
+  if (loading) return <p className="muted small">Loading column mapping…</p>;
+
+  const enabledCount = mapping.filter((e) => e.enabled).length;
+
+  return (
+    <div className="card stack" style={{ marginTop: 8 }}>
+      <div className="row between" style={{ alignItems: "center" }}>
+        <div className="section-title" style={{ fontSize: 15 }}>
+          Sheet columns
+        </div>
+        <span className="badge" style={{ fontSize: 12 }}>
+          {enabledCount} of {mapping.length} columns enabled
+        </span>
+      </div>
+      <p className="muted small">
+        Choose which fields appear in the Google Sheet, edit their column headers, and reorder them.
+        Disabled fields won't be exported. Changes take effect on the next sync.
+      </p>
+      <div className="stack" style={{ gap: 4 }}>
+        {mapping.map((entry, idx) => (
+          <div
+            key={entry.field_key}
+            className="row"
+            style={{
+              gap: 8,
+              alignItems: "center",
+              padding: "6px 8px",
+              borderRadius: 6,
+              background: entry.enabled ? "var(--card)" : "var(--card-muted)",
+              border: "1px solid var(--border)",
+              opacity: entry.enabled ? 1 : 0.6,
+            }}
+          >
+            <button
+              className="ghost small"
+              style={{ padding: "2px 6px", fontSize: 11 }}
+              onClick={() => moveUp(idx)}
+              disabled={idx === 0}
+              title="Move up"
+            >
+              ▲
+            </button>
+            <button
+              className="ghost small"
+              style={{ padding: "2px 6px", fontSize: 11 }}
+              onClick={() => moveDown(idx)}
+              disabled={idx === mapping.length - 1}
+              title="Move down"
+            >
+              ▼
+            </button>
+            <input
+              type="checkbox"
+              checked={entry.enabled}
+              onChange={() => toggle(entry.field_key)}
+              style={{ cursor: "pointer" }}
+            />
+            <span style={{ fontSize: 12, minWidth: 100, color: "var(--text-muted)", fontFamily: "monospace" }}>
+              {entry.field_key}
+            </span>
+            <input
+              type="text"
+              value={editHeader[entry.field_key] || ""}
+              onChange={(e) => setEditHeader((h) => ({ ...h, [entry.field_key]: e.target.value }))}
+              placeholder={entry.header}
+              style={{ flex: 1, fontSize: 13, padding: "3px 8px" }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="row" style={{ gap: 8 }}>
+        <button className="primary small" onClick={save}>
+          Save mapping
+        </button>
+        <button
+          className="ghost small"
+          onClick={() => {
+            const h: Record<string, string> = {};
+            mapping.forEach((e) => (h[e.field_key] = e.header));
+            setEditHeader(h);
+          }}
+        >
+          Reset edits
+        </button>
+      </div>
     </div>
   );
 }

@@ -41,6 +41,7 @@ import type {
   ReferenceImportPreview,
   ReferenceImportRequest,
   EntityRecordView,
+  SheetColumnEntry,
   SheetsStateView,
   SyncRunResult,
   SyncStatusView,
@@ -572,6 +573,12 @@ export const api = {
 
   clearExportedTrips: (actorId: string) =>
     invoke<SheetsStateView>("clear_exported_trips", { actorId }),
+
+  getSheetColumnMapping: () =>
+    invoke<SheetColumnEntry[]>("get_sheet_column_mapping"),
+
+  setSheetColumnMapping: (actorId: string, mapping: SheetColumnEntry[]) =>
+    invoke<SheetColumnEntry[]>("set_sheet_column_mapping", { actorId, mapping }),
 
   simulateConnectivity: (postgresOnline: boolean, sheetsOnline: boolean) =>
     invoke<void>("simulate_connectivity", { postgresOnline, sheetsOnline }),

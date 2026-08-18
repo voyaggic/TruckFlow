@@ -145,7 +145,8 @@ impl PostgresAdapter for MockPostgres {
 pub trait SheetsProvider: Send + Sync {
     fn label(&self) -> &str;
     fn connected(&self) -> bool;
-    fn push_trips(&self, rows: &[serde_json::Value]) -> Result<Vec<String>, String>;
+    fn push_trips(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String>;
+    fn set_sheet_mapping(&self, _mapping: &[crate::models::SheetColumnEntry]) {} // no-op for mocks
     fn simulate_connectivity(&self, _online: bool) -> Result<(), String> {
         Err("connectivity simulation is only available on the mock adapter".to_string())
     }
@@ -203,7 +204,7 @@ impl SheetsProvider for MockSheets {
     fn connected(&self) -> bool {
         self.online.load(Ordering::SeqCst)
     }
-    fn push_trips(&self, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
+    fn push_trips(&self, rows: &[serde_json::Value], _mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String> {
         if !self.connected() {
             return Err("Google Sheets unreachable (simulated revoked/offline)".to_string());
         }
@@ -375,6 +376,79 @@ fn get_setting(conn: &Connection, key: &str) -> Option<String> {
 // Google Sheets integration + sync
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Configurable sheet column mapping
+// ---------------------------------------------------------------------------
+
+/// All available field keys that can be mapped to sheet columns.
+pub const AVAILABLE_SHEET_FIELDS: &[(&str, &str)] = &[
+    ("id", "Trip ID"),
+    ("plate", "Plate"),
+    ("entry_time", "Entry time"),
+    ("exit_time", "Exit time"),
+    ("trip_status", "Trip status"),
+    ("company", "Company"),
+    ("driver", "Driver"),
+    ("capacity_at_trip", "Capacity"),
+    ("capacity_unit", "Unit"),
+    ("officer_name", "Officer"),
+    ("receipt_no", "Receipt no"),
+    ("confidence_score", "Confidence"),
+    ("capture_method", "Capture method"),
+    ("is_discharge_trip", "Discharge trip"),
+    ("created_at", "Created at"),
+    ("model_version", "Model version"),
+    ("ocr_engine", "OCR engine"),
+];
+
+/// The default column mapping when Google Sheets is first connected.
+pub fn default_sheet_mapping() -> Vec<crate::models::SheetColumnEntry> {
+    use crate::models::SheetColumnEntry;
+    let enabled_keys = [
+        "id", "plate", "entry_time", "exit_time",
+        "company", "driver", "capacity_at_trip", "capacity_unit", "officer_name",
+    ];
+    AVAILABLE_SHEET_FIELDS
+        .iter()
+        .map(|(key, label)| SheetColumnEntry {
+            field_key: key.to_string(),
+            header: label.to_string(),
+            enabled: enabled_keys.contains(key),
+        })
+        .collect()
+}
+
+/// Read the current sheet column mapping (from settings, or defaults).
+pub fn read_sheet_mapping(conn: &Connection) -> Vec<crate::models::SheetColumnEntry> {
+    get_setting(conn, "sheet_column_mapping")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(default_sheet_mapping)
+}
+
+#[tauri::command]
+pub fn get_sheet_column_mapping(state: State<AppState>) -> Result<Vec<crate::models::SheetColumnEntry>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(read_sheet_mapping(&conn))
+}
+
+#[tauri::command]
+pub fn set_sheet_column_mapping(
+    state: State<AppState>,
+    actor_id: String,
+    mapping: Vec<crate::models::SheetColumnEntry>,
+) -> Result<Vec<crate::models::SheetColumnEntry>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, "manage_integrations")?;
+    let json = serde_json::to_string(&mapping).map_err(|e| format!("serialize failed: {e}"))?;
+    set_setting(&conn, "sheet_column_mapping", &json)
+        .map_err(|e| format!("save mapping failed: {e}"))?;
+    append_audit(&conn, &actor_id, "updated_sheet_column_mapping", None, None)?;
+    drop(conn);
+    // Update the in-memory mapping on the sheets provider so the next sync uses it immediately.
+    state.sheets.set_sheet_mapping(&mapping);
+    Ok(mapping)
+}
+
 pub fn sheets_state_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> Result<SheetsStateView, String> {
     let (connected, target_sheet_id, shared_group, sync_frequency, last_synced_at, status) = conn
         .query_row(
@@ -440,13 +514,16 @@ fn sheet_trip_rows(conn: &Connection) -> Result<Vec<serde_json::Value>, String> 
     let mut stmt = conn
         .prepare(
             "SELECT t.id, COALESCE(v.plate_number, json_extract(t.resolution_notes, '$.plate'), '') AS plate,
-                    t.time_in, t.capacity_at_trip, t.capacity_unit, t.receipt_no, t.confidence_score,
+                    COALESCE(t.entry_time, t.time_in) AS entry_time, t.exit_time, t.trip_status,
+                    t.capacity_at_trip, t.capacity_unit, t.receipt_no, t.confidence_score,
                     t.capture_method, t.is_discharge_trip, t.created_at,
-                    COALESCE(c.name, '') AS company, COALESCE(d.name, '') AS driver
+                    COALESCE(c.name, '') AS company, COALESCE(d.name, '') AS driver,
+                    u.name AS officer_name, t.model_version, t.ocr_engine, t.status
              FROM trips t
              LEFT JOIN vehicles v ON v.id = t.vehicle_id
              LEFT JOIN companies c ON c.id = t.company_id
              LEFT JOIN drivers d ON d.id = t.driver_id
+             LEFT JOIN users u ON u.id = t.officer_id
              WHERE t.status = 'logged' AND t.pushed_to_sheets = 0
                AND (t.capture_method = 'auto' OR t.is_discharge_trip = 1)
              ORDER BY t.created_at ASC",
@@ -457,16 +534,22 @@ fn sheet_trip_rows(conn: &Connection) -> Result<Vec<serde_json::Value>, String> 
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "plate": r.get::<_, String>(1)?,
-                "time_in": r.get::<_, String>(2)?,
-                "capacity_at_trip": r.get::<_, Option<f64>>(3)?,
-                "capacity_unit": r.get::<_, String>(4)?,
-                "receipt_no": r.get::<_, Option<String>>(5)?,
-                "confidence_score": r.get::<_, Option<f64>>(6)?,
-                "capture_method": r.get::<_, String>(7)?,
-                "is_discharge_trip": r.get::<_, Option<bool>>(8)?,
-                "created_at": r.get::<_, String>(9)?,
-                "company": r.get::<_, String>(10)?,
-                "driver": r.get::<_, String>(11)?,
+                "entry_time": r.get::<_, String>(2)?,
+                "exit_time": r.get::<_, Option<String>>(3)?,
+                "trip_status": r.get::<_, Option<String>>(4)?,
+                "capacity_at_trip": r.get::<_, Option<f64>>(5)?,
+                "capacity_unit": r.get::<_, String>(6)?,
+                "receipt_no": r.get::<_, Option<String>>(7)?,
+                "confidence_score": r.get::<_, Option<f64>>(8)?,
+                "capture_method": r.get::<_, String>(9)?,
+                "is_discharge_trip": r.get::<_, Option<bool>>(10)?,
+                "created_at": r.get::<_, String>(11)?,
+                "company": r.get::<_, String>(12)?,
+                "driver": r.get::<_, String>(13)?,
+                "officer_name": r.get::<_, Option<String>>(14)?,
+                "model_version": r.get::<_, Option<String>>(15)?,
+                "ocr_engine": r.get::<_, Option<String>>(16)?,
+                "status": r.get::<_, String>(17)?,
             }))
         })
         .map_err(|e| format!("sheet rows failed: {e}"))?;
@@ -482,7 +565,8 @@ pub fn run_sheets_sync_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> R
     if pending > 0 && sheets.connected() {
         let rows = sheet_trip_rows(conn)?;
         if !rows.is_empty() {
-            let ids = sheets.push_trips(&rows).map_err(|e| format!("sheets push failed: {e}"))?;
+            let mapping = read_sheet_mapping(conn);
+            let ids = sheets.push_trips(&rows, &mapping).map_err(|e| format!("sheets push failed: {e}"))?;
             for id in ids {
                 conn.execute("UPDATE trips SET pushed_to_sheets = 1 WHERE id = ?1", params![id])
                     .map_err(|e| format!("sheets flag flip failed: {e}"))?;
@@ -1127,20 +1211,6 @@ fn pg_cell_to_json(row: &postgres::Row, i: usize) -> serde_json::Value {
 /// Column order for the exported sheet; keep in sync with `sheet_trip_rows`.
 /// The first column carries the trip id so the sheet can be pruned precisely
 /// (soft/hard-deleted rows) and invoice-makers can cross-reference a trip.
-const SHEET_HEADERS: &[&str] = &[
-    "Trip ID",
-    "Plate",
-    "Time in",
-    "Capacity",
-    "Unit",
-    "Receipt no",
-    "Confidence",
-    "Capture method",
-    "Discharge trip",
-    "Created at",
-    "Company",
-    "Driver",
-];
 
 fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1240,7 +1310,7 @@ fn sheet_meta(token: &str, sheet_id: &str) -> Result<String, String> {
 }
 
 /// Write the header row once, when the sheet's A1 cell is empty.
-fn ensure_headers(token: &str, sheet_id: &str, tab: &str) -> Result<(), String> {
+fn ensure_headers(token: &str, sheet_id: &str, tab: &str, mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> {
     let client = http_client()?;
     let range = format!("{tab}!A1");
     let get_url = format!(
@@ -1259,7 +1329,7 @@ fn ensure_headers(token: &str, sheet_id: &str, tab: &str) -> Result<(), String> 
     if !a1_empty {
         return Ok(());
     }
-    let headers: Vec<serde_json::Value> = SHEET_HEADERS.iter().map(|h| json!(h)).collect();
+    let headers: Vec<serde_json::Value> = mapping.iter().filter(|e| e.enabled).map(|e| json!(e.header)).collect();
     let body = json!({ "range": range, "majorDimension": "ROWS", "values": vec![headers] });
     let put_url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{}?valueInputOption=RAW",
@@ -1294,24 +1364,31 @@ fn opt_str(v: Option<&serde_json::Value>) -> serde_json::Value {
     }
 }
 
-fn sheet_cell(row: &serde_json::Value, header: &str) -> serde_json::Value {
-    match header {
-        "Trip ID" => opt_str(row.get("id")),
-        "Plate" => opt_str(row.get("plate")),
-        "Time in" => opt_str(row.get("time_in")),
-        "Capacity" => fmt_opt_num(row.get("capacity_at_trip")),
-        "Unit" => opt_str(row.get("capacity_unit")),
-        "Receipt no" => opt_str(row.get("receipt_no")),
-        "Confidence" => fmt_opt_num(row.get("confidence_score")),
-        "Capture method" => opt_str(row.get("capture_method")),
-        "Discharge trip" => match row.get("is_discharge_trip") {
+/// Map a field_key to the corresponding cell value in a trip row.
+fn field_key_to_value(row: &serde_json::Value, field_key: &str) -> serde_json::Value {
+    match field_key {
+        "id" => opt_str(row.get("id")),
+        "plate" => opt_str(row.get("plate")),
+        "entry_time" => opt_str(row.get("entry_time")),
+        "exit_time" => opt_str(row.get("exit_time")),
+        "trip_status" => opt_str(row.get("trip_status")),
+        "capacity_at_trip" => fmt_opt_num(row.get("capacity_at_trip")),
+        "capacity_unit" => opt_str(row.get("capacity_unit")),
+        "receipt_no" => opt_str(row.get("receipt_no")),
+        "confidence_score" => fmt_opt_num(row.get("confidence_score")),
+        "capture_method" => opt_str(row.get("capture_method")),
+        "is_discharge_trip" => match row.get("is_discharge_trip") {
             Some(serde_json::Value::Bool(true)) => json!("Yes"),
             Some(serde_json::Value::Bool(false)) => json!("No"),
             _ => json!(""),
         },
-        "Created at" => opt_str(row.get("created_at")),
-        "Company" => opt_str(row.get("company")),
-        "Driver" => opt_str(row.get("driver")),
+        "created_at" => opt_str(row.get("created_at")),
+        "company" => opt_str(row.get("company")),
+        "driver" => opt_str(row.get("driver")),
+        "officer_name" => opt_str(row.get("officer_name")),
+        "model_version" => opt_str(row.get("model_version")),
+        "ocr_engine" => opt_str(row.get("ocr_engine")),
+        "status" => opt_str(row.get("status")),
         _ => json!(""),
     }
 }
@@ -1334,6 +1411,7 @@ pub struct RealSheets {
     token: Mutex<Option<(String, i64)>>,
     last_fail: Mutex<Option<i64>>,
     last_err: Mutex<Option<String>>,
+    mapping: Mutex<Vec<crate::models::SheetColumnEntry>>,
 }
 
 impl RealSheets {
@@ -1343,7 +1421,11 @@ impl RealSheets {
             token: Mutex::new(None),
             last_fail: Mutex::new(None),
             last_err: Mutex::new(None),
+            mapping: Mutex::new(default_sheet_mapping()),
         }
+    }
+    pub fn set_mapping(&self, m: Vec<crate::models::SheetColumnEntry>) {
+        *self.mapping.lock().unwrap() = m;
     }
 
     fn set_error(&self, e: String) {
@@ -1384,7 +1466,8 @@ impl RealSheets {
             self.set_error(e.clone());
             e
         })?;
-        ensure_headers(&token, &c.sheet_id, &first).map_err(|e| {
+        let mapping = self.mapping.lock().unwrap().clone();
+        ensure_headers(&token, &c.sheet_id, &first, &mapping).map_err(|e| {
             self.set_error(e.clone());
             e
         })?;
@@ -1434,6 +1517,9 @@ impl SheetsProvider for RealSheets {
     fn label(&self) -> &str {
         "google-sheets"
     }
+    fn set_sheet_mapping(&self, mapping: &[crate::models::SheetColumnEntry]) {
+        *self.mapping.lock().unwrap() = mapping.to_vec();
+    }
     fn configured(&self) -> bool {
         self.creds.lock().unwrap().is_some()
     }
@@ -1449,7 +1535,7 @@ impl SheetsProvider for RealSheets {
         }
         self.ensure_validated().is_ok()
     }
-    fn push_trips(&self, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
+    fn push_trips(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1463,9 +1549,11 @@ impl SheetsProvider for RealSheets {
         // One batched request for the whole batch — NOT one request per row.
         // Per-row requests held the DB lock for minutes on a full backlog;
         // this is what kept the app "lugging" after launch.
+        // Use column mapping: only enabled fields, in mapping order, with custom headers.
+        let enabled_keys: Vec<&str> = mapping.iter().filter(|e| e.enabled).map(|e| e.field_key.as_str()).collect();
         let values: Vec<Vec<serde_json::Value>> = rows
             .iter()
-            .map(|row| SHEET_HEADERS.iter().map(|h| sheet_cell(row, h)).collect())
+            .map(|row| enabled_keys.iter().map(|k| field_key_to_value(row, k)).collect())
             .collect();
         let range = format!("{first_sheet}!A1");
         let url = format!(
@@ -1509,7 +1597,8 @@ impl SheetsProvider for RealSheets {
             self.set_error(e.clone());
             e
         })?;
-        ensure_headers(&token, &sid, &first_sheet).map_err(|e| {
+        let mapping = self.mapping.lock().unwrap().clone();
+        ensure_headers(&token, &sid, &first_sheet, &mapping).map_err(|e| {
             self.set_error(e.clone());
             e
         })?;
@@ -1636,6 +1725,8 @@ pub fn real_postgres(conn: &Connection) -> Arc<dyn PostgresAdapter> {
 /// them (failures surface in the Sync panel via `last_error`).
 pub fn real_sheets(conn: &Connection) -> Arc<dyn SheetsProvider> {
     let sheets = RealSheets::new();
+    // Load saved column mapping (or keep defaults if not set yet).
+    sheets.set_sheet_mapping(&read_sheet_mapping(conn));
     if let (Some(j), Some(sid)) = (
         get_setting(conn, "sheets_service_account_json"),
         get_setting(conn, "sheets_target_sheet_id"),
@@ -1960,11 +2051,11 @@ mod tests {
     }
 
     #[test]
-    fn sheet_cell_maps_row_to_columns() {
+    fn field_key_to_value_maps_row_to_columns() {
         let row = json!({
             "id": "x",
             "plate": "KDG 123A",
-            "time_in": "2026-01-01T10:00:00Z",
+            "entry_time": "2026-01-01T10:00:00Z",
             "capacity_at_trip": 40.0,
             "capacity_unit": "t",
             "receipt_no": null,
@@ -1975,11 +2066,11 @@ mod tests {
             "company": "Acme",
             "driver": "Jane",
         });
-        assert_eq!(sheet_cell(&row, "Plate"), json!("KDG 123A"));
-        assert_eq!(sheet_cell(&row, "Capacity"), json!("40"));
-        assert_eq!(sheet_cell(&row, "Confidence"), json!("0.97"));
-        assert_eq!(sheet_cell(&row, "Receipt no"), json!(""));
-        assert_eq!(sheet_cell(&row, "Discharge trip"), json!("Yes"));
-        assert_eq!(sheet_cell(&row, "Driver"), json!("Jane"));
+        assert_eq!(field_key_to_value(&row, "plate"), json!("KDG 123A"));
+        assert_eq!(field_key_to_value(&row, "capacity_at_trip"), json!("40"));
+        assert_eq!(field_key_to_value(&row, "confidence_score"), json!("0.97"));
+        assert_eq!(field_key_to_value(&row, "receipt_no"), json!(""));
+        assert_eq!(field_key_to_value(&row, "is_discharge_trip"), json!("Yes"));
+        assert_eq!(field_key_to_value(&row, "driver"), json!("Jane"));
     }
 }

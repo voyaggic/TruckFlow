@@ -141,6 +141,8 @@ pub fn run() {
             sync::set_sheets_retention,
             sync::set_trip_retention,
             sync::clear_exported_trips,
+            sync::get_sheet_column_mapping,
+            sync::set_sheet_column_mapping,
             reporting::report_dashboard,
             reporting::report_trips_drill,
             reporting::report_export,

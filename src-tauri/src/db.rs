@@ -693,16 +693,30 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         // photos split into entry_photo_refs / exit_photo_refs (never merged).
         // Old columns stay as a compatibility mirror so untouched code paths
         // keep working; all reads now use the new columns.
-        conn.execute_batch(
-            "ALTER TABLE trips ADD COLUMN entry_time TEXT;
-             ALTER TABLE trips ADD COLUMN exit_time TEXT;
-             ALTER TABLE trips ADD COLUMN trip_status TEXT NOT NULL DEFAULT 'complete';
-             ALTER TABLE trips ADD COLUMN entry_photo_refs TEXT;
-             ALTER TABLE trips ADD COLUMN exit_photo_refs TEXT;
-             ALTER TABLE trips ADD COLUMN sheet_row INTEGER;
-             ALTER TABLE trips ADD COLUMN sheet_exit_pushed INTEGER NOT NULL DEFAULT 0;",
-        )
-        .map_err(|e| format!("migration 21 failed: {e}"))?;
+        // Idempotent: only add columns that don't already exist.
+        let existing_cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(trips)")
+                .map_err(|e| format!("migration 21 pragma failed: {e}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("migration 21 query failed: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (col, typ, default) in &[
+            ("entry_time", "TEXT", None),
+            ("exit_time", "TEXT", None),
+            ("trip_status", "TEXT", Some("'complete'")),
+            ("entry_photo_refs", "TEXT", None),
+            ("exit_photo_refs", "TEXT", None),
+            ("sheet_row", "INTEGER", None),
+            ("sheet_exit_pushed", "INTEGER", Some("0")),
+        ] {
+            if !existing_cols.contains(&col.to_string()) {
+                let default_clause = default.map(|d| format!(" NOT NULL DEFAULT {d}")).unwrap_or_default();
+                conn.execute_batch(&format!("ALTER TABLE trips ADD COLUMN {col} {typ}{default_clause};"))
+                    .map_err(|e| format!("migration 21 add {col} failed: {e}"))?;
+            }
+        }
         // Historical rows were single-sighting events under the old model: they
         // are complete trips (verified activity that must keep counting).
         conn.execute(
