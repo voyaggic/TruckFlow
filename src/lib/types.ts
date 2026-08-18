@@ -210,7 +210,7 @@ export interface CaptureSettings {
 // ANPR Engine Configuration (08-anpr-integration.md §5 / §6)
 // ---------------------------------------------------------------------------
 
-export type OcrEngine = "paddleocr" | "easyocr";
+export type OcrEngine = "paddleocr" | "easyocr" | "cloud_provider";
 
 export interface AnprConfigView {
   active_ocr_engine: OcrEngine;
@@ -222,6 +222,35 @@ export interface AnprConfigView {
   save_recognition_images: boolean;
   retrain_candidate_threshold: number | null;
   is_capture_point: boolean;
+  /** Entry/exit matcher window in hours (09-anpr-page-complete-spec §4.3). */
+  max_pending_duration_hours: number | null;
+}
+
+/** A stored ANPR credential — only a masked preview is ever returned. */
+export interface AnprCredentialView {
+  id: string;
+  key_name: string;
+  masked_value: string;
+  has_value: boolean;
+  rotated_by: string | null;
+  rotated_at: string | null;
+  created_at: string;
+}
+
+/** One line of the Diagnostics dependency health report. */
+export interface DependencyHealthView {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** Diagnostics sub-tab aggregate. */
+export interface AnprDiagnosticsView {
+  dependencies: DependencyHealthView[];
+  storage_bytes: number;
+  storage_detail: string;
+  service_running: boolean;
+  error_log: HealthEventView[];
 }
 
 export interface CameraSourceView {

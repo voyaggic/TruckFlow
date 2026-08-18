@@ -11,7 +11,8 @@ use tauri::State;
 
 use crate::db::{append_audit, now_iso, ANPR_CONFIG_ID, AppState};
 use crate::models::{
-    AnprConfigView, CameraSourceView, ModelVersionView, TrainingCandidateView,
+    AnprConfigView, AnprCredentialView, AnprDiagnosticsView, CameraSourceView,
+    DependencyHealthView, ModelVersionView, TrainingCandidateView,
 };
 
 const CONFIG_PERM: &str = "manage_anpr_config";
@@ -45,7 +46,8 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
     conn.query_row(
         "SELECT active_ocr_engine, confidence_threshold_paddleocr, confidence_threshold_easyocr,
                 plate_vehicle_ratio_threshold, plate_format_rules, discharge_confirmation_required,
-                save_recognition_images, retrain_candidate_threshold, is_capture_point
+                save_recognition_images, retrain_candidate_threshold, is_capture_point,
+                max_pending_duration_hours
          FROM anpr_config WHERE id = ?1",
         params![ANPR_CONFIG_ID],
         |r| {
@@ -59,6 +61,7 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
                 save_recognition_images: r.get::<_, i64>(6)? != 0,
                 retrain_candidate_threshold: r.get(7)?,
                 is_capture_point: r.get::<_, i64>(8)? != 0,
+                max_pending_duration_hours: r.get(9)?,
             })
         },
     )
@@ -82,12 +85,18 @@ pub fn update_anpr_config(
     save_recognition_images: Option<bool>,
     retrain_candidate_threshold: Option<i64>,
     is_capture_point: Option<bool>,
+    max_pending_duration_hours: Option<f64>,
 ) -> Result<AnprConfigView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
     if let Some(engine) = &active_ocr_engine {
-        if engine != "paddleocr" && engine != "easyocr" {
+        if engine != "paddleocr" && engine != "easyocr" && engine != "cloud_provider" {
             return Err("Unknown OCR engine.".to_string());
+        }
+    }
+    if let Some(h) = max_pending_duration_hours {
+        if !(0.5..=8760.0).contains(&h) {
+            return Err("Max pending duration must be between 0.5 and 8760 hours.".to_string());
         }
     }
     for t in [&confidence_threshold_paddleocr, &confidence_threshold_easyocr] {
@@ -129,8 +138,9 @@ pub fn update_anpr_config(
             save_recognition_images = COALESCE(?7, save_recognition_images),
             retrain_candidate_threshold = COALESCE(?8, retrain_candidate_threshold),
             is_capture_point = COALESCE(?9, is_capture_point),
-            updated_by = ?10, updated_at = ?11
-         WHERE id = ?12",
+            max_pending_duration_hours = COALESCE(?10, max_pending_duration_hours),
+            updated_by = ?11, updated_at = ?12
+         WHERE id = ?13",
         params![
             engine,
             confidence_threshold_paddleocr,
@@ -141,6 +151,7 @@ pub fn update_anpr_config(
             save_recognition_images.map(|b| if b { 1 } else { 0 }),
             retrain_candidate_threshold,
             is_capture_point.map(|b| if b { 1 } else { 0 }),
+            max_pending_duration_hours,
             actor_id,
             now_iso(),
             ANPR_CONFIG_ID,
@@ -642,4 +653,283 @@ pub fn list_training_candidates(state: State<AppState>) -> Result<Vec<TrainingCa
         .map_err(|e| format!("training candidate list failed: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("training candidate read failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// anpr_credentials — API / license keys, masked + rotatable (§8 Credentials
+// sub-tab). Values are stored in the DB row (single-user desktop app) but
+// never returned in plaintext; only a masked preview ever leaves the backend.
+// ---------------------------------------------------------------------------
+
+/// Mask a secret for display: keep the first 4 and last 4 characters when the
+/// value is long enough, otherwise show only stars.
+fn mask_secret(value: &str) -> String {
+    let v = value.trim();
+    if v.len() <= 8 {
+        "••••".to_string()
+    } else {
+        format!("{}••••••••{}", &v[..4], &v[v.len() - 4..])
+    }
+}
+
+#[tauri::command]
+pub fn list_anpr_credentials(state: State<AppState>) -> Result<Vec<AnprCredentialView>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, key_name, key_value_ref, rotated_by, rotated_at, created_at
+             FROM anpr_credentials ORDER BY created_at ASC",
+        )
+        .map_err(|e| format!("credential list failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            let value: String = r.get(2)?;
+            Ok(AnprCredentialView {
+                id: r.get(0)?,
+                key_name: r.get(1)?,
+                masked_value: mask_secret(&value),
+                has_value: !value.trim().is_empty(),
+                rotated_by: r.get(3)?,
+                rotated_at: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("credential list failed: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("credential read failed: {e}"))
+}
+
+/// Create or overwrite a named credential (e.g. `cloud_anpr_api_key`).
+/// Overwrites are audit-logged as rotations with who/when provenance.
+#[tauri::command]
+pub fn set_anpr_credential(
+    state: State<AppState>,
+    actor_id: String,
+    key_name: String,
+    value: String,
+) -> Result<AnprCredentialView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let name = key_name.trim();
+    if name.is_empty() || value.trim().is_empty() {
+        return Err("Key name and value are required.".to_string());
+    }
+    let now = now_iso();
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM anpr_credentials WHERE key_name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE anpr_credentials SET key_value_ref = ?1, rotated_by = ?2, rotated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+            params![value.trim(), actor_id, now, id],
+        )
+        .map_err(|e| format!("credential update failed: {e}"))?;
+        append_audit(
+            &conn,
+            &actor_id,
+            "rotated_anpr_credential",
+            Some(&id),
+            Some(json!({ "key_name": name })),
+        )?;
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO anpr_credentials (id, key_name, key_value_ref, rotated_by, rotated_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, name, value.trim(), actor_id, now, now],
+        )
+        .map_err(|e| format!("credential create failed: {e}"))?;
+        append_audit(&conn, &actor_id, "added_anpr_credential", Some(&id), Some(json!({ "key_name": name })))?;
+    }
+    credential_by_id(&conn, name)
+}
+
+/// Remove a stored credential entirely (audit-logged).
+#[tauri::command]
+pub fn delete_anpr_credential(
+    state: State<AppState>,
+    actor_id: String,
+    key_name: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let name = key_name.trim();
+    let id: String = conn
+        .query_row(
+            "SELECT id FROM anpr_credentials WHERE key_name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .map_err(|_| format!("Credential '{name}' not found."))?;
+    conn.execute(
+        "DELETE FROM anpr_credentials WHERE id = ?1",
+        params![id],
+    )
+    .map_err(|e| format!("credential delete failed: {e}"))?;
+    append_audit(&conn, &actor_id, "deleted_anpr_credential", Some(&id), Some(json!({ "key_name": name })))?;
+    Ok(())
+}
+
+fn credential_by_id(conn: &Connection, key_name: &str) -> Result<AnprCredentialView, String> {
+    conn.query_row(
+        "SELECT id, key_name, key_value_ref, rotated_by, rotated_at, created_at
+         FROM anpr_credentials WHERE key_name = ?1",
+        params![key_name],
+        |r| {
+            let value: String = r.get(2)?;
+            Ok(AnprCredentialView {
+                id: r.get(0)?,
+                key_name: r.get(1)?,
+                masked_value: mask_secret(&value),
+                has_value: !value.trim().is_empty(),
+                rotated_by: r.get(3)?,
+                rotated_at: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        },
+    )
+    .map_err(|_| format!("Credential '{key_name}' not found."))
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics sub-tab (§1 Diagnostics, §3 dependency checks, §10)
+// ---------------------------------------------------------------------------
+
+/// Whether a program is available on PATH (e.g. ffmpeg). Returns (ok, detail).
+fn program_available(name: &str) -> (bool, String) {
+    use std::process::Command;
+    match Command::new(name).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(name).to_string();
+            (true, first)
+        }
+        Ok(_) => (false, format!("{name} found but returned an error")),
+        Err(_) => (false, format!("{name} not found on PATH")),
+    }
+}
+
+/// Approximate whether Python has OpenCV importable (the ANPR service's OCR
+/// dependency). Best-effort: `python -c "import cv2"`.
+fn python_opencv_available() -> (bool, String) {
+    use std::process::Command;
+    for cmd in ["python", "python3"] {
+        if let Ok(out) = Command::new(cmd)
+            .args(["-c", "import cv2; print(cv2.__version__)"])
+            .output()
+        {
+            if out.status.success() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return (true, format!("OpenCV {v} importable via {cmd}"));
+            }
+        }
+    }
+    (false, "OpenCV (cv2) not importable — install it for the ANPR service: pip install opencv-python".to_string())
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> i64 {
+    let mut total: i64 = 0;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size_bytes(&p);
+            } else if let Ok(md) = std::fs::metadata(&p) {
+                total += md.len() as i64;
+            }
+        }
+    }
+    total
+}
+
+fn human_bytes(bytes: i64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Full Diagnostics sub-tab payload: dependency health, storage usage, ANPR
+/// service reachability and the recent service error log. Gated on the same
+/// `manage_anpr_config` permission as the rest of the page.
+#[tauri::command]
+pub fn anpr_diagnostics(state: State<AppState>) -> Result<AnprDiagnosticsView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut deps: Vec<DependencyHealthView> = Vec::new();
+
+    let (ffmpeg_ok, ffmpeg_detail) = program_available("ffmpeg");
+    deps.push(DependencyHealthView { name: "ffmpeg".into(), ok: ffmpeg_ok, detail: ffmpeg_detail });
+    let (cv_ok, cv_detail) = python_opencv_available();
+    deps.push(DependencyHealthView { name: "OpenCV (cv2)".into(), ok: cv_ok, detail: cv_detail });
+
+    // ANPR service reachability (127.0.0.1:9800) — mirrors the live-test check.
+    let service_ok = std::net::TcpStream::connect("127.0.0.1:9800").is_ok();
+    deps.push(DependencyHealthView {
+        name: "ANPR service".into(),
+        ok: service_ok,
+        detail: if service_ok {
+            "Service reachable on port 9800".to_string()
+        } else {
+            "ANPR service not running — start anpr-service/main.py to capture plates".to_string()
+        },
+    });
+
+    // Storage: frames evidence dir + the SQLite database file (sibling of the
+    // frames dir inside the app-data directory).
+    let frames_bytes = dir_size_bytes(&state.frames_dir);
+    let db_bytes = state
+        .frames_dir
+        .parent()
+        .map(|d| d.join("truckflow.db"))
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let storage_total = frames_bytes + db_bytes;
+    let storage_detail = format!(
+        "{} captured frames + {} database = {} total",
+        human_bytes(frames_bytes),
+        human_bytes(db_bytes),
+        human_bytes(storage_total)
+    );
+
+    // Recent ANPR-service error log from system health events (component = anpr_service).
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, component, status, detail, detected_at, acknowledged_by, acknowledged_at, resolved_at
+             FROM system_health_events
+             WHERE component = 'anpr_service' AND status != 'ok'
+             ORDER BY detected_at DESC LIMIT 50",
+        )
+        .map_err(|e| format!("diagnostics error log failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(crate::models::HealthEventView {
+                id: r.get(0)?,
+                component: r.get(1)?,
+                status: r.get(2)?,
+                detail: r.get(3)?,
+                detected_at: r.get(4)?,
+                acknowledged_by: r.get(5)?,
+                acknowledged_at: r.get(6)?,
+                resolved_at: r.get(7)?,
+            })
+        })
+        .map_err(|e| format!("diagnostics error log failed: {e}"))?;
+    let error_log = rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("diagnostics error log read failed: {e}"))?;
+
+    Ok(AnprDiagnosticsView {
+        dependencies: deps,
+        storage_bytes: storage_total,
+        storage_detail,
+        service_running: service_ok,
+        error_log,
+    })
 }

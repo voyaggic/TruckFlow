@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AnprConfigView,
+  AnprCredentialView,
+  AnprDiagnosticsView,
   AnprRead,
   AnprStatus,
   AppStatus,
@@ -465,6 +467,7 @@ export const api = {
         | "save_recognition_images"
         | "retrain_candidate_threshold"
         | "is_capture_point"
+        | "max_pending_duration_hours"
       >
     >,
   ) =>
@@ -479,6 +482,7 @@ export const api = {
       saveRecognitionImages: changes.save_recognition_images ?? null,
       retrainCandidateThreshold: changes.retrain_candidate_threshold ?? null,
       isCapturePoint: changes.is_capture_point ?? null,
+      maxPendingDurationHours: changes.max_pending_duration_hours ?? null,
     }),
 
   listCameraSources: () => invoke<CameraSourceView[]>("list_camera_sources"),
@@ -520,6 +524,18 @@ export const api = {
     invoke<ModelVersionView>("rollback_model_version", { actorId, versionId }),
 
   listTrainingCandidates: () => invoke<TrainingCandidateView[]>("list_training_candidates"),
+
+  // --- ANPR credentials + diagnostics (09-anpr-page-complete-spec §1, §8) ---
+
+  listAnprCredentials: () => invoke<AnprCredentialView[]>("list_anpr_credentials"),
+
+  setAnprCredential: (actorId: string, keyName: string, value: string) =>
+    invoke<AnprCredentialView>("set_anpr_credential", { actorId, keyName, value }),
+
+  deleteAnprCredential: (actorId: string, keyName: string) =>
+    invoke<void>("delete_anpr_credential", { actorId, keyName }),
+
+  anprDiagnostics: () => invoke<AnprDiagnosticsView>("anpr_diagnostics"),
 
   // --- Sync & integrations (Phase 4, gated on manage_integrations) ---
 

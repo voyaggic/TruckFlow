@@ -213,7 +213,13 @@ pub fn anpr_confidence_trend(
     to: Option<String>,
 ) -> Result<Vec<ConfidenceTrendPoint>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, "view_system_health")?;
+    // Reachable from two places: the System Monitor page (view_system_health)
+    // and the ANPR Diagnostics sub-tab (manage_anpr_config, 09 §1).
+    let ok = has_permission(&conn, &actor_id, "view_system_health")?
+        || has_permission(&conn, &actor_id, "manage_anpr_config")?;
+    if !ok {
+        return Err("You do not have permission to perform this action.".to_string());
+    }
     let from = from.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
     let to = to.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
 
@@ -254,6 +260,18 @@ pub fn anpr_confidence_trend(
         out.push(r.map_err(|e| format!("trend read failed: {e}"))?);
     }
     Ok(out)
+}
+
+fn has_permission(conn: &Connection, actor_id: &str, key: &str) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM user_permissions up JOIN permissions p ON p.id = up.permission_id
+             WHERE up.user_id = ?1 AND p.key = ?2",
+            params![actor_id, key],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("permission check failed: {e}"))?;
+    Ok(count > 0)
 }
 
 /// Batch-delete health events so the incident history stays manageable.

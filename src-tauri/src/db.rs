@@ -666,6 +666,25 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 20 {
+        // ANPR page redesign (09-anpr-page-complete-spec.md §9): the
+        // entry/exit matcher needs a configurable max-pending window (hours)
+        // and the active engine enum now includes the optional cloud provider.
+        conn.execute_batch(
+            "ALTER TABLE anpr_config ADD COLUMN max_pending_duration_hours REAL;
+             ALTER TABLE camera_sources ADD COLUMN camera_role TEXT;
+             ALTER TABLE camera_sources ADD COLUMN redundant_of_camera_id TEXT;",
+        )
+        .map_err(|e| format!("migration 20 failed: {e}"))?;
+        conn.execute(
+            "UPDATE anpr_config SET max_pending_duration_hours = 24 WHERE max_pending_duration_hours IS NULL",
+            [],
+        )
+        .map_err(|e| format!("migration 20 default failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 20;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 

@@ -244,6 +244,46 @@ pub struct AnprConfigView {
     pub save_recognition_images: bool,
     pub retrain_candidate_threshold: Option<i64>,
     pub is_capture_point: bool,
+    /// Entry/exit matcher window (09-anpr-page-complete-spec.md §4.3): an open
+    /// trip older than this many hours is closed as `missed_exit` and the next
+    /// sighting starts a fresh entry. Null = default 24h applied at read time.
+    pub max_pending_duration_hours: Option<f64>,
+}
+
+/// A stored ANPR credential (API/license key). Values are stored encrypted-at-
+/// rest via key_value_ref and only ever surfaced masked (§8, Credentials tab).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AnprCredentialView {
+    pub id: String,
+    pub key_name: String,
+    /// Masked for display, e.g. "sk-••••••••wxyz". Never the plain value.
+    pub masked_value: String,
+    /// Whether a value is currently stored (vs. an empty placeholder row).
+    pub has_value: bool,
+    pub rotated_by: Option<String>,
+    pub rotated_at: Option<String>,
+    pub created_at: String,
+}
+
+/// One line of the Diagnostics sub-tab dependency health report (§3, §10).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DependencyHealthView {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Diagnostics sub-tab aggregate (§1 Diagnostics row, §3 dependency checks).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AnprDiagnosticsView {
+    pub dependencies: Vec<DependencyHealthView>,
+    pub storage_bytes: i64,
+    pub storage_detail: String,
+    pub service_running: bool,
+    pub error_log: Vec<HealthEventView>,
 }
 
 #[derive(Clone, Debug, Serialize)]

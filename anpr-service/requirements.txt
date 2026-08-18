@@ -1,0 +1,10 @@
+# Core (required) — frame capture + preview
+numpy>=1.24
+opencv-python>=4.8
+
+# OCR backends — install at least one for real plate reading.
+# Without any of these the service runs in deterministic mock mode
+# (pipeline still works end-to-end, but plates are synthetic).
+easyocr>=1.7        # pip install easyocr  (downloads models on first use)
+# paddlepaddle>=2.5  # uncomment for the PaddleOCR engine
+# paddleocr>=2.7     # uncomment for the PaddleOCR engine
