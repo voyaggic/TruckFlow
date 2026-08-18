@@ -146,6 +146,11 @@ pub trait SheetsProvider: Send + Sync {
     fn label(&self) -> &str;
     fn connected(&self) -> bool;
     fn push_trips(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String>;
+    fn ensure_header_row(&self, _mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> { Ok(()) }
+    fn push_new_rows(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String> {
+        self.push_trips(rows, mapping)
+    }
+    fn update_existing_rows(&self, _rows: &[serde_json::Value], _mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> { Ok(()) }
     fn set_sheet_mapping(&self, _mapping: &[crate::models::SheetColumnEntry]) {} // no-op for mocks
     fn simulate_connectivity(&self, _online: bool) -> Result<(), String> {
         Err("connectivity simulation is only available on the mock adapter".to_string())
@@ -510,24 +515,28 @@ fn pending_sheets_trips(conn: &Connection) -> Result<i64, String> {
     .map_err(|e| format!("sheets pending count failed: {e}"))
 }
 
-fn sheet_trip_rows(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+fn sheet_trip_rows_filtered(conn: &Connection, has_sheet_row: bool) -> Result<Vec<serde_json::Value>, String> {
+    let row_filter = if has_sheet_row { "t.sheet_row IS NOT NULL" } else { "t.sheet_row IS NULL" };
+    let sql = format!(
+        "SELECT t.id, COALESCE(v.plate_number, json_extract(t.resolution_notes, '$.plate'), '') AS plate,
+                COALESCE(t.entry_time, t.time_in) AS entry_time, t.exit_time, t.trip_status,
+                t.capacity_at_trip, t.capacity_unit, t.receipt_no, t.confidence_score,
+                t.capture_method, t.is_discharge_trip, t.created_at,
+                COALESCE(c.name, '') AS company, COALESCE(d.name, '') AS driver,
+                u.name AS officer_name, t.model_version, t.ocr_engine, t.status,
+                t.sheet_row
+         FROM trips t
+         LEFT JOIN vehicles v ON v.id = t.vehicle_id
+         LEFT JOIN companies c ON c.id = t.company_id
+         LEFT JOIN drivers d ON d.id = t.driver_id
+         LEFT JOIN users u ON u.id = t.officer_id
+         WHERE t.status = 'logged' AND t.pushed_to_sheets = 0
+           AND (t.capture_method = 'auto' OR t.is_discharge_trip = 1)
+           AND {row_filter}
+         ORDER BY t.created_at ASC",
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT t.id, COALESCE(v.plate_number, json_extract(t.resolution_notes, '$.plate'), '') AS plate,
-                    COALESCE(t.entry_time, t.time_in) AS entry_time, t.exit_time, t.trip_status,
-                    t.capacity_at_trip, t.capacity_unit, t.receipt_no, t.confidence_score,
-                    t.capture_method, t.is_discharge_trip, t.created_at,
-                    COALESCE(c.name, '') AS company, COALESCE(d.name, '') AS driver,
-                    u.name AS officer_name, t.model_version, t.ocr_engine, t.status
-             FROM trips t
-             LEFT JOIN vehicles v ON v.id = t.vehicle_id
-             LEFT JOIN companies c ON c.id = t.company_id
-             LEFT JOIN drivers d ON d.id = t.driver_id
-             LEFT JOIN users u ON u.id = t.officer_id
-             WHERE t.status = 'logged' AND t.pushed_to_sheets = 0
-               AND (t.capture_method = 'auto' OR t.is_discharge_trip = 1)
-             ORDER BY t.created_at ASC",
-        )
+        .prepare(&sql)
         .map_err(|e| format!("sheet rows failed: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -550,6 +559,7 @@ fn sheet_trip_rows(conn: &Connection) -> Result<Vec<serde_json::Value>, String> 
                 "model_version": r.get::<_, Option<String>>(15)?,
                 "ocr_engine": r.get::<_, Option<String>>(16)?,
                 "status": r.get::<_, String>(17)?,
+                "sheet_row": r.get::<_, Option<i64>>(18)?,
             }))
         })
         .map_err(|e| format!("sheet rows failed: {e}"))?;
@@ -563,15 +573,54 @@ pub fn run_sheets_sync_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> R
     let pending = pending_sheets_trips(conn)?;
     let mut pushed = 0i64;
     if pending > 0 && sheets.connected() {
-        let rows = sheet_trip_rows(conn)?;
-        if !rows.is_empty() {
-            let mapping = read_sheet_mapping(conn);
-            let ids = sheets.push_trips(&rows, &mapping).map_err(|e| format!("sheets push failed: {e}"))?;
-            for id in ids {
-                conn.execute("UPDATE trips SET pushed_to_sheets = 1 WHERE id = ?1", params![id])
+        let mapping = read_sheet_mapping(conn);
+        // Split into new rows (no sheet_row yet) and exit updates (have sheet_row).
+        let new_rows = sheet_trip_rows_filtered(conn, false)?;
+        let update_rows = sheet_trip_rows_filtered(conn, true)?;
+
+        // Always ensure headers are written before any data push.
+        sheets.ensure_header_row(&mapping)?;
+
+        // 1) Append new trips.
+        if !new_rows.is_empty() {
+            let acked = sheets.push_new_rows(&new_rows, &mapping)?;
+            for entry in acked {
+                // Parse "id:row" or plain "id" from the ack string.
+                let (id, sheet_row) = if let Some((id_str, row_str)) = entry.split_once(':') {
+                    (id_str.to_string(), row_str.parse::<i64>().unwrap_or(0))
+                } else {
+                    (entry, 0)
+                };
+                if sheet_row > 0 {
+                    conn.execute(
+                        "UPDATE trips SET pushed_to_sheets = 1, sheet_row = ?1 WHERE id = ?2",
+                        params![sheet_row, id],
+                    )
                     .map_err(|e| format!("sheets flag flip failed: {e}"))?;
+                } else {
+                    conn.execute("UPDATE trips SET pushed_to_sheets = 1 WHERE id = ?1", params![id])
+                        .map_err(|e| format!("sheets flag flip failed: {e}"))?;
+                }
             }
-            pushed = rows.len() as i64;
+            pushed += new_rows.len() as i64;
+        }
+
+        // 2) Update existing rows (exit matches).
+        if !update_rows.is_empty() {
+            sheets.update_existing_rows(&update_rows, &mapping)?;
+            for row in &update_rows {
+                if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                    conn.execute(
+                        "UPDATE trips SET pushed_to_sheets = 1, sheet_exit_pushed = 1 WHERE id = ?1",
+                        params![id],
+                    )
+                    .map_err(|e| format!("sheets exit-update flag flip failed: {e}"))?;
+                }
+            }
+            pushed += update_rows.len() as i64;
+        }
+
+        if pushed > 0 {
             conn.execute(
                 "UPDATE integrations SET last_synced_at = ?1, updated_at = ?1 WHERE type = 'google_sheets'",
                 params![now_iso()],
@@ -1576,6 +1625,111 @@ impl SheetsProvider for RealSheets {
             .collect();
         *self.last_err.lock().unwrap() = None;
         Ok(acked)
+    }
+    fn ensure_header_row(&self, mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> {
+        let creds = self.creds.lock().unwrap().clone().ok_or("Google Sheets is not configured")?;
+        let first_sheet = self.ensure_validated()?;
+        let token = self.access_token().map_err(|e| {
+            self.set_error(e.clone());
+            e
+        })?;
+        ensure_headers(&token, &creds.sheet_id, &first_sheet, mapping).map_err(|e| {
+            self.set_error(e.clone());
+            e
+        })?;
+        Ok(())
+    }
+    fn push_new_rows(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let creds = self.creds.lock().unwrap().clone().ok_or("Google Sheets is not configured")?;
+        let first_sheet = self.ensure_validated()?;
+        let token = self.access_token().map_err(|e| {
+            self.set_error(e.clone());
+            e
+        })?;
+        let client = http_client()?;
+        let enabled_keys: Vec<&str> = mapping.iter().filter(|e| e.enabled).map(|e| e.field_key.as_str()).collect();
+        let values: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|row| enabled_keys.iter().map(|k| field_key_to_value(row, k)).collect())
+            .collect();
+        let range = format!("{first_sheet}!A1");
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=INSERT_ROWS&includeValuesInResponse=true",
+            creds.sheet_id,
+            urlenc(&range)
+        );
+        let body = json!({ "range": range, "majorDimension": "ROWS", "values": values });
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("sheet append failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("sheet append rejected: {e}"))?;
+        let j: serde_json::Value = resp.json().map_err(|e| format!("sheet append response unreadable: {e}"))?;
+        let updated_range = j["updates"]["updatedRange"].as_str().unwrap_or("");
+        let start_row = updated_range.split('!').last()
+            .and_then(|r| r.split(':').next())
+            .and_then(|r| r.chars().skip_while(|c| c.is_alphabetic()).collect::<String>().parse::<i64>().ok())
+            .unwrap_or(0);
+        let acked: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let id = r["id"].as_str().unwrap_or_default().to_string();
+                // Encode sheet_row into the ack string as "id:row" so caller can store it.
+                if start_row > 0 {
+                    format!("{}:{}", id, start_row + i as i64)
+                } else {
+                    id
+                }
+            })
+            .collect();
+        *self.last_err.lock().unwrap() = None;
+        Ok(acked)
+    }
+    fn update_existing_rows(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let creds = self.creds.lock().unwrap().clone().ok_or("Google Sheets is not configured")?;
+        let first_sheet = self.ensure_validated()?;
+        let token = self.access_token().map_err(|e| {
+            self.set_error(e.clone());
+            e
+        })?;
+        let client = http_client()?;
+        let enabled_keys: Vec<&str> = mapping.iter().filter(|e| e.enabled).map(|e| e.field_key.as_str()).collect();
+        // Update each row at its tracked sheet_row position.
+        for row in rows {
+            let sheet_row = row.get("sheet_row").and_then(|v| v.as_i64()).unwrap_or(0);
+            if sheet_row <= 0 { continue; }
+            let values: Vec<serde_json::Value> = enabled_keys.iter().map(|k| field_key_to_value(row, k)).collect();
+            let col_count = enabled_keys.len();
+            // Convert column count to letter (0→A, 1→B, etc.)
+            let end_col = (b'A' + (col_count as u8).min(25)) as char;
+            let range = format!("{first_sheet}!A{sheet_row}:{end_col}{sheet_row}");
+            let url = format!(
+                "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=RAW",
+                creds.sheet_id,
+                urlenc(&range)
+            );
+            let body = json!({ "range": range, "majorDimension": "ROWS", "values": vec![values] });
+            client
+                .put(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("sheet update row {sheet_row} failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("sheet update row {sheet_row} rejected: {e}"))?;
+        }
+        *self.last_err.lock().unwrap() = None;
+        Ok(())
     }
     fn configure(&self, json: Option<String>, sheet_id: Option<String>) -> Result<String, String> {
         let (Some(j), Some(sid)) = (json, sheet_id) else {
