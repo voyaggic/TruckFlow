@@ -22,11 +22,17 @@ This implements the tracking rules of `09-anpr-page-complete-spec.md` §4:
 pip install -r requirements.txt
 ```
 
-`numpy` + `opencv-python` are required. For real plate reading install an OCR
-engine (recommended for this project: **PaddleOCR** or **EasyOCR**). With no
-OCR engine installed the service runs in deterministic **mock mode** — the
-whole pipeline (tracking, finalization, `/latest`, evidence frames) still
-works, but plates are synthetic.
+`numpy` + `opencv-python` are required, and **EasyOCR** is the installed OCR
+engine for real plate reading (its model weights download automatically on
+first run). With no OCR engine installed the service falls back to
+deterministic **mock mode** — the whole pipeline (tracking, finalization,
+`/latest`, evidence frames) still works, but plates are synthetic.
+
+> Performance note: EasyOCR runs on CPU (~1 s/read). The service throttles
+> OCR to one attempt per track every 5 frames (a track only needs its
+> highest-confidence read), which keeps the live pipeline at several fps while
+> still converging on a best reading. The mock engine is instant — use
+> `--mock` when you only want to exercise tracking.
 
 ## Run
 

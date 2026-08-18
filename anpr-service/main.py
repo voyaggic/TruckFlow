@@ -135,6 +135,31 @@ class OcrBackend:
 
 
 # ---------------------------------------------------------------------------
+# OCR throttling + crop sizing
+# ---------------------------------------------------------------------------
+
+# Frames between OCR attempts on the same track. The tracker runs every frame
+# (fast); OCR runs every N frames per track (slow on CPU). 5 keeps ~5 reads/s
+# per vehicle — plenty to converge on a best reading.
+OCR_INTERVAL = 5
+
+
+def downscale_crop(crop: np.ndarray, max_width: int = 320) -> np.ndarray:
+    """Shrink an OCR crop to a max width, preserving aspect ratio. EasyOCR
+    reads small plates fine; feeding it a 1080p crop wastes seconds per call."""
+    h, w = crop.shape[:2]
+    if w <= max_width or h == 0:
+        return crop
+    scale = max_width / w
+    try:
+        import cv2  # type: ignore
+
+        return cv2.resize(crop, (max_width, max(1, int(h * scale))))
+    except Exception:
+        return crop
+
+
+# ---------------------------------------------------------------------------
 # Plate detection — contour heuristics over the frame (boxes for the tracker)
 # ---------------------------------------------------------------------------
 
@@ -184,6 +209,7 @@ class TrackedReading:
         self.first_seen = time.time()
         self.last_seen = self.first_seen
         self.best_frame: np.ndarray | None = None  # annotated crop at best read
+        self.last_ocr_frame = -100  # throttle: frame number of the last OCR attempt
 
     def consider(self, plate: str, confidence: float, frame: np.ndarray) -> None:
         self.last_seen = time.time()
@@ -202,6 +228,7 @@ class Pipeline:
         self.ocr = ocr
         self.port = port
         self.sort = Sort(max_age=12, min_hits=2)
+        self.frame_num = 0
         self.readings: dict[int, TrackedReading] = {}
         self.sightings: list[dict] = []
         self.last_emitted: dict | None = None  # last /latest payload (dedup by ts)
@@ -229,6 +256,7 @@ class Pipeline:
                 if not ok:
                     break
                 self.frames_processed += 1
+                self.frame_num += 1
                 self.current_frame = frame
                 self.tick(frame)
                 # Throttle to ~10 fps for stability (mock/demo friendly).
@@ -266,15 +294,23 @@ class Pipeline:
         tracked = self.sort.update(dets)
 
         # Collect best reading for every tracked box by cropping + OCR.
+        # OCR is throttled per track: a track only needs its highest-confidence
+        # read, so re-reading every frame just burns CPU (EasyOCR on CPU is
+        # ~1s/call). Every OCR_INTERVAL frames per track is plenty and keeps
+        # the live pipeline fast.
         for row in tracked:
             x1, y1, x2, y2, tid = (int(v) for v in row)
             if x2 <= x1 or y2 <= y1:
                 continue
+            slot = self.readings.setdefault(tid, TrackedReading(tid))
+            if self.frame_num - slot.last_ocr_frame < OCR_INTERVAL:
+                continue
+            slot.last_ocr_frame = self.frame_num
             crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
             if crop.size == 0:
                 continue
+            crop = downscale_crop(crop, max_width=320)
             reads = self.ocr.read(crop)
-            slot = self.readings.setdefault(tid, TrackedReading(tid))
             for plate, conf in reads:
                 slot.consider(plate, conf, crop)
 
