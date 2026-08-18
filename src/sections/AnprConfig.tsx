@@ -408,6 +408,15 @@ function SensitivityPanel({
   const [easy, setEasy] = useState(config.confidence_threshold_easyocr);
   const [pending, setPending] = useState(config.max_pending_duration_hours?.toString() ?? "24");
 
+  // Resync local state when the saved config reloads after a save, so the
+  // panel never shows stale values.
+  useEffect(() => {
+    setPreset(presetFor(config));
+    setPaddle(config.confidence_threshold_paddleocr);
+    setEasy(config.confidence_threshold_easyocr);
+    setPending(config.max_pending_duration_hours?.toString() ?? "24");
+  }, [config]);
+
   const num = (v: string, fallback: number) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
