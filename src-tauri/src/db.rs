@@ -685,6 +685,41 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 21 {
+        // Entry/exit trip model (09-anpr-page-complete-spec.md §9): one trip
+        // record spans a full visit. `entry_time` replaces the old single
+        // `time_in`; `exit_time` is set only when the exit sighting is matched;
+        // `trip_status` (open / complete / missed_exit) is auto-derived;
+        // photos split into entry_photo_refs / exit_photo_refs (never merged).
+        // Old columns stay as a compatibility mirror so untouched code paths
+        // keep working; all reads now use the new columns.
+        conn.execute_batch(
+            "ALTER TABLE trips ADD COLUMN entry_time TEXT;
+             ALTER TABLE trips ADD COLUMN exit_time TEXT;
+             ALTER TABLE trips ADD COLUMN trip_status TEXT NOT NULL DEFAULT 'complete';
+             ALTER TABLE trips ADD COLUMN entry_photo_refs TEXT;
+             ALTER TABLE trips ADD COLUMN exit_photo_refs TEXT;
+             ALTER TABLE trips ADD COLUMN sheet_row INTEGER;
+             ALTER TABLE trips ADD COLUMN sheet_exit_pushed INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| format!("migration 21 failed: {e}"))?;
+        // Historical rows were single-sighting events under the old model: they
+        // are complete trips (verified activity that must keep counting).
+        conn.execute(
+            "UPDATE trips SET entry_time = time_in, entry_photo_refs = photo_refs
+             WHERE entry_time IS NULL",
+            [],
+        )
+        .map_err(|e| format!("migration 21 backfill failed: {e}"))?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_trips_entry_time ON trips(entry_time);
+             CREATE INDEX IF NOT EXISTS idx_trips_trip_status ON trips(trip_status);",
+        )
+        .map_err(|e| format!("migration 21 indexes failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 21;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 

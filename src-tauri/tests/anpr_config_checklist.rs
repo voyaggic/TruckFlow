@@ -384,6 +384,17 @@ fn trips_filtered_by_model_version_never_mix_engines() {
         None,
     )
     .unwrap();
+    truckflow_lib::reference::create_vehicle(
+        ctx.state(),
+        admin.id.clone(),
+        "B456CD".into(),
+        Some(company.id.clone()),
+        Some(30.0),
+        "litres".into(),
+        Some(driver.id.clone()),
+        None,
+    )
+    .unwrap();
 
     set_capture_settings(ctx.state(), admin.id.clone(), Some("fully_automatic".to_string()), None, None, None, None)
         .expect("fully automatic so reads log");
@@ -392,8 +403,10 @@ fn trips_filtered_by_model_version_never_mix_engines() {
     let conn = state.db.lock().unwrap();
     let frames_dir = state.frames_dir.clone();
 
+    // Use different plates — §4.3 entry/exit would match same-plate reads as
+    // an exit within the pending window; we need two separate entries here.
     let read_m1 = read("A123AB", 0.92, &now_iso());
-    let mut read_m2 = read("A123AB", 0.88, &now_iso());
+    let mut read_m2 = read("B456CD", 0.88, &now_iso());
     read_m2.model_version = Some("model-v2".to_string());
     read_m2.ocr_engine = Some("easyocr".to_string());
     read_m2.timestamp = now_iso();

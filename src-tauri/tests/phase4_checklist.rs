@@ -307,8 +307,15 @@ fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
     // Auto-detected plate matched to the DB → auto-pushed, no human step.
     let auto = log_trip(&ctx, &admin, "A123AB");
 
+    // Register a second vehicle for manual entry (avoids entry/exit matching
+    // with the open auto trip for A123AB).
+    reference::create_vehicle(
+        ctx.state(), admin.id.clone(), "A223AB".into(),
+        None, Some(15.0), "litres".into(), None, None,
+    ).unwrap();
+
     // Manual entry logs but is UNclassified → must NOT reach the sheet.
-    let manual = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir())
+    let manual = manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir())
         .unwrap()
         .trip
         .expect("manual exact match logs");

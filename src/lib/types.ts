@@ -167,12 +167,19 @@ export interface TripView {
   driver_name: string | null;
   capacity_at_trip: number | null;
   capacity_unit: string;
+  entry_time: string;
+  exit_time: string | null;
+  trip_status: "open" | "complete" | "missed_exit";
+  /** Backward-compat alias: equals entry_time. */
   time_in: string;
   receipt_no: string | null;
   officer_id: string | null;
   officer_name: string | null;
   capture_method: "auto" | "manual_entry";
   confidence_score: number | null;
+  entry_photo_count: number;
+  exit_photo_count: number;
+  /** Backward-compat: equals entry_photo_count. */
   photo_count: number;
   status: string;
   reason: string | null;

@@ -675,7 +675,7 @@ function ResolveScreen({
 
         <div className="row muted small" style={{ gap: 16 }}>
           <span>
-            Captured <b>{fmtDateTime(trip.time_in)}</b> (stored as time_in)
+            Entry <b>{fmtDateTime(trip.entry_time)}</b>
           </span>
           <span>
             Resolving now <b>{fmtDateTime(new Date().toISOString())}</b>
@@ -683,18 +683,50 @@ function ResolveScreen({
         </div>
 
         {frames.length > 0 ? (
-          <div className="frame-strip">
-            {frames.map((f) => (
-              <div key={f.index} className="frame-card">
-                {f.data_base64 ? (
-                  <img src={`data:image/png;base64,${f.data_base64}`} alt={`frame ${f.index}`} />
-                ) : (
-                  <div className="frame-missing">frame {f.index}</div>
-                )}
-                <div className="muted small">{fmtTime(f.captured_at)}</div>
-              </div>
-            ))}
-          </div>
+          <>
+            {(() => {
+              const entryFrames = frames.filter((f) => !f.kind || f.kind === "entry");
+              const exitFrames = frames.filter((f) => f.kind === "exit");
+              return (
+                <>
+                  {entryFrames.length > 0 && (
+                    <div>
+                      <div className="muted small" style={{ marginBottom: 4, fontWeight: 600 }}>▶ Entry photos</div>
+                      <div className="frame-strip">
+                        {entryFrames.map((f) => (
+                          <div key={f.index} className="frame-card">
+                            {f.data_base64 ? (
+                              <img src={`data:image/png;base64,${f.data_base64}`} alt={`entry frame ${f.index}`} />
+                            ) : (
+                              <div className="frame-missing">frame {f.index}</div>
+                            )}
+                            <div className="muted small">{fmtTime(f.captured_at)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {exitFrames.length > 0 && (
+                    <div style={{ marginTop: 10 }}>
+                      <div className="muted small" style={{ marginBottom: 4, fontWeight: 600 }}>▼ Exit photos</div>
+                      <div className="frame-strip">
+                        {exitFrames.map((f) => (
+                          <div key={f.index} className="frame-card">
+                            {f.data_base64 ? (
+                              <img src={`data:image/png;base64,${f.data_base64}`} alt={`exit frame ${f.index}`} />
+                            ) : (
+                              <div className="frame-missing">frame {f.index}</div>
+                            )}
+                            <div className="muted small">{fmtTime(f.captured_at)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+          </>
         ) : (
           <p className="muted small">No camera frames on record (manual entry).</p>
         )}
@@ -971,7 +1003,7 @@ function DischargeStep({
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Was this a discharge trip?</h3>
         <p className="muted small">
-          Plate <b className="plate-font">{trip.plate_number}</b> · captured {fmtDateTime(trip.time_in)}
+          Plate <b className="plate-font">{trip.plate_number}</b> · entry {fmtDateTime(trip.entry_time)}{trip.exit_time ? ` · exit ${fmtDateTime(trip.exit_time)}` : ""} · <span className={`badge ${trip.trip_status === 'complete' ? 'active' : trip.trip_status === 'missed_exit' ? 'disabled' : 'pin'}`}>{trip.trip_status}</span>
         </p>
         <p className="muted small">
           Discharge classification is a judgment call only the officer on site can make. Nothing is committed until you

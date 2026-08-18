@@ -185,12 +185,22 @@ pub struct TripView {
     pub driver_name: Option<String>,
     pub capacity_at_trip: Option<f64>,
     pub capacity_unit: String,
+    /// Entry sighting time (replaces the old single time_in; 09 §4.3).
+    pub entry_time: String,
+    /// Exit sighting time — set only once the exit is matched; null while open.
+    pub exit_time: Option<String>,
+    /// open / complete / missed_exit — auto-derived, never manually set (09 §5).
+    pub trip_status: String,
+    /// Backward-compat alias for the UI: equals entry_time.
     pub time_in: String,
     pub receipt_no: Option<String>,
     pub officer_id: Option<String>,
     pub officer_name: Option<String>,
     pub capture_method: String, // auto | manual_entry
     pub confidence_score: Option<f64>,
+    pub entry_photo_count: usize,
+    pub exit_photo_count: usize,
+    /// Backward-compat alias: equals entry_photo_count.
     pub photo_count: usize,
     pub status: String,
     pub reason: Option<String>,

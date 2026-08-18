@@ -368,9 +368,12 @@ pub fn cross_reference(conn: &Connection, raw_plate: &str) -> Result<MatchOutcom
 
 pub(crate) const TRIP_SELECT: &str = "SELECT t.id,
     COALESCE(v.plate_number, json_extract(t.resolution_notes, '$.plate'), ''),
-    t.company_id, c.name, t.driver_id, d.name, t.capacity_at_trip, t.capacity_unit, t.time_in, t.receipt_no,
-    t.officer_id, u.name, t.capture_method, t.confidence_score, t.photo_refs, t.status, t.resolution_notes,
-    t.vehicle_id, t.is_discharge_trip, t.model_version, t.ocr_engine
+    t.company_id, c.name, t.driver_id, d.name, t.capacity_at_trip, t.capacity_unit,
+    COALESCE(t.entry_time, t.time_in), t.receipt_no,
+    t.officer_id, u.name, t.capture_method, t.confidence_score,
+    COALESCE(t.entry_photo_refs, t.photo_refs), t.status, t.resolution_notes,
+    t.vehicle_id, t.is_discharge_trip, t.model_version, t.ocr_engine,
+    t.exit_time, t.trip_status, t.exit_photo_refs
     FROM trips t
     LEFT JOIN vehicles v ON v.id = t.vehicle_id
     LEFT JOIN companies c ON c.id = t.company_id
@@ -398,6 +401,13 @@ pub(crate) fn read_trip(row: &rusqlite::Row) -> rusqlite::Result<TripView> {
         _ => (None, vec![]),
     };
     let discharge: Option<i64> = row.get(18)?;
+    let entry_time: String = row.get(8)?;
+    let exit_photo_refs: Option<String> = row.get(23)?;
+    let exit_photo_count = exit_photo_refs
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+        .map(|a| a.len())
+        .unwrap_or(0);
     Ok(TripView {
         id: row.get(0)?,
         vehicle_id: row.get(17)?,
@@ -408,12 +418,17 @@ pub(crate) fn read_trip(row: &rusqlite::Row) -> rusqlite::Result<TripView> {
         driver_name: row.get(5)?,
         capacity_at_trip: row.get(6)?,
         capacity_unit: row.get(7)?,
-        time_in: row.get(8)?,
+        entry_time: entry_time.clone(),
+        exit_time: row.get(21)?,
+        trip_status: row.get(22)?,
+        time_in: entry_time,
         receipt_no: row.get(9)?,
         officer_id: row.get(10)?,
         officer_name: row.get(11)?,
         capture_method: row.get(12)?,
         confidence_score: row.get(13)?,
+        entry_photo_count: photo_count,
+        exit_photo_count: exit_photo_count,
         photo_count,
         status: row.get(15)?,
         reason,
@@ -458,7 +473,11 @@ fn insert_trip(
 ) -> Result<TripView, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
-    let photo_refs = crate::evidence::persist_frames(frames_dir, &id, &read.frames)?;
+    // A new logged trip is an ENTRY sighting: entry photo set, exit pending.
+    // Its trip_status starts "open" until the matching exit is seen (§4.3).
+    let entry_photo_refs = crate::evidence::persist_frames(frames_dir, &id, &read.frames, "entry")?;
+    let trip_status = if status == "queued" || status == "pending_approval" { "open" } else { "open" };
+    let time_in = if read.timestamp.is_empty() { now.clone() } else { read.timestamp.clone() };
     // Manual entry carries no ANPR confidence — score stays null (04 §8).
     let confidence = if capture_method == "manual_entry" { None } else { Some(read.confidence) };
     let ocr_engine = effective_ocr_engine(conn, read, capture_method);
@@ -466,8 +485,10 @@ fn insert_trip(
     conn.execute(
         "INSERT INTO trips (id, vehicle_id, driver_id, company_id, capacity_at_trip, capacity_unit, time_in,
                 officer_id, capture_method, confidence_score, photo_refs, status, resolution_notes,
-                model_version, ocr_engine, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+                model_version, ocr_engine, created_at, updated_at,
+                entry_time, trip_status, entry_photo_refs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16,
+                ?17, ?18, ?19)",
         params![
             id,
             vehicle.id,
@@ -475,16 +496,19 @@ fn insert_trip(
             vehicle.company_id,
             vehicle.registered_capacity,
             vehicle.capacity_unit,
-            read.timestamp,
+            time_in,
             officer_id,
             capture_method,
             confidence,
-            photo_refs,
+            entry_photo_refs,
             status,
             resolution_json(&normalize_plate(&read.plate), None, &[]),
             model_version,
             ocr_engine,
             now,
+            time_in,
+            trip_status,
+            entry_photo_refs,
         ],
     )
     .map_err(|e| format!("trip creation failed: {e}"))?;
@@ -506,7 +530,7 @@ fn insert_queued(
 ) -> Result<TripView, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
-    let photo_refs = crate::evidence::persist_frames(frames_dir, &id, &read.frames)?;
+    let entry_photo_refs = crate::evidence::persist_frames(frames_dir, &id, &read.frames, "entry")?;
     let vehicle = outcome.matched_vehicle_id.as_deref().and_then(|vid| {
         load_active_vehicles(conn)
             .ok()
@@ -518,8 +542,10 @@ fn insert_queued(
     conn.execute(
         "INSERT INTO trips (id, vehicle_id, driver_id, company_id, capacity_at_trip, capacity_unit, time_in,
                 officer_id, capture_method, confidence_score, photo_refs, status, resolution_notes,
-                model_version, ocr_engine, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12, ?13, ?14, ?15, ?15)",
+                model_version, ocr_engine, created_at, updated_at,
+                entry_time, trip_status, entry_photo_refs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12, ?13, ?14, ?15, ?15,
+                ?16, 'open', ?17)",
         params![
             id,
             vehicle.as_ref().map(|v| v.id.clone()),
@@ -531,11 +557,13 @@ fn insert_queued(
             officer_id,
             capture_method,
             if capture_method == "auto" { Some(read.confidence) } else { None },
-            photo_refs,
+            entry_photo_refs,
             resolution_json(plate, Some(reason), &outcome.candidates),
             model_version,
             ocr_engine,
             now,
+            time_in,
+            entry_photo_refs,
         ],
     )
     .map_err(|e| format!("trip queue failed: {e}"))?;
@@ -565,7 +593,7 @@ pub fn flag_training_candidates(conn: &Connection, trip_id: &str, reason: &str) 
     }
     let photo_refs: String = conn
         .query_row(
-            "SELECT COALESCE(photo_refs, '[]') FROM trips WHERE id = ?1",
+            "SELECT COALESCE(entry_photo_refs, photo_refs, '[]') FROM trips WHERE id = ?1",
             params![trip_id],
             |r| r.get(0),
         )
@@ -630,8 +658,7 @@ pub fn ingest_read(
             // Schema status enum: logged / queued / resolved / discarded /
             // declined (01-database-schema.md `trips`). Confirm-required
             // captures are `queued` with reason `pending_approval` until
-            // one-tap approval. No time-based duplicate blocking exists
-            // (08-anpr-integration.md §8).
+            // one-tap approval.
             let status = if capture_method == "manual_entry" || consent_mode(conn) == "fully_automatic" {
                 "logged"
             } else {
@@ -646,12 +673,30 @@ pub fn ingest_read(
                     message: "Trip captured — awaiting approval.".to_string(),
                 });
             }
-            let trip = insert_trip(conn, officer_id, read, &vehicle, capture_method, status, frames_dir)?;
-            let message = match status {
-                "logged" => "Trip logged.",
-                _ => "Trip captured — awaiting approval.",
-            };
-            Ok(IngestResult { trip: Some(trip), queued: None, outcome, message: message.to_string() })
+            // §4.3 entry/exit: a confirmed match either starts a new entry,
+            // closes an open trip as its exit, or (when the pending window has
+            // lapsed) marks the old trip missed_exit and starts fresh.
+            let result = match_entry_exit(conn, officer_id, read, &vehicle, capture_method, frames_dir)?;
+            match result {
+                EntryExitOutcome::NewEntry(trip) => Ok(IngestResult {
+                    trip: Some(trip),
+                    queued: None,
+                    outcome,
+                    message: "Entry logged — vehicle is inside.".to_string(),
+                }),
+                EntryExitOutcome::ExitMatched(trip) => Ok(IngestResult {
+                    trip: Some(trip),
+                    queued: None,
+                    outcome,
+                    message: "Exit matched — trip complete.".to_string(),
+                }),
+                EntryExitOutcome::MissedExitThenNewEntry(trip) => Ok(IngestResult {
+                    trip: Some(trip),
+                    queued: None,
+                    outcome,
+                    message: "Previous entry closed as missed exit — new entry logged.".to_string(),
+                }),
+            }
         }
         "multiple" => {
             let trip = insert_queued(conn, officer_id, read, &plate, "multiple_matches", &outcome, capture_method, frames_dir)?;
@@ -672,6 +717,75 @@ pub fn ingest_read(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// §4.3 Entry/exit matching — the core pipeline change per 09-anpr-page-complete-spec.md
+// ---------------------------------------------------------------------------
+
+/// §4.3 entry/exit outcome.
+enum EntryExitOutcome {
+    NewEntry(TripView),
+    ExitMatched(TripView),
+    MissedExitThenNewEntry(TripView),
+}
+
+fn max_pending_hours(conn: &Connection) -> f64 {
+    conn.query_row(
+        "SELECT COALESCE(max_pending_duration_hours, 24.0) FROM anpr_config LIMIT 1",
+        [],
+        |r| r.get::<_, f64>(0),
+    ).unwrap_or(24.0)
+}
+
+/// §4.3: look up an open trip for this vehicle and either close it as an exit,
+/// mark it missed and start fresh, or create a brand-new entry.
+fn match_entry_exit(
+    conn: &Connection,
+    officer_id: Option<String>,
+    read: &AnprRead,
+    vehicle: &VehicleView,
+    capture_method: &str,
+    frames_dir: &std::path::Path,
+) -> Result<EntryExitOutcome, String> {
+    let open: Option<(String, String)> = conn.query_row(
+        "SELECT id, entry_time FROM trips
+         WHERE vehicle_id = ?1 AND trip_status = 'open' AND exit_time IS NULL
+           AND status = 'logged'
+         ORDER BY entry_time DESC LIMIT 1",
+        params![vehicle.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).ok();
+
+    let pending_hours = max_pending_hours(conn);
+
+    if let Some((open_id, entry_time_str)) = open {
+        let open_dt = chrono::DateTime::parse_from_rfc3339(&entry_time_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let now_dt = chrono::Utc::now();
+        let elapsed_hours = open_dt.map(|dt| (now_dt - dt).num_minutes() as f64 / 60.0).unwrap_or(f64::MAX);
+
+        if elapsed_hours < pending_hours {
+            // Within window → EXIT matched on the same open trip.
+            let exit_refs = crate::evidence::persist_frames(frames_dir, &open_id, &read.frames, "exit")?;
+            conn.execute(
+                "UPDATE trips SET exit_time = ?1, trip_status = 'complete',
+                        exit_photo_refs = ?2, pushed_to_sheets = 0, updated_at = ?1
+                 WHERE id = ?3",
+                params![read.timestamp, exit_refs, open_id],
+            ).map_err(|e| format!("exit update failed: {e}"))?;
+            return Ok(EntryExitOutcome::ExitMatched(trip_by_id(conn, &open_id)?));
+        }
+        // Beyond window → mark old missed_exit, then fall through to create fresh entry.
+        conn.execute(
+            "UPDATE trips SET trip_status = 'missed_exit', updated_at = ?1 WHERE id = ?2",
+            params![now_iso(), open_id],
+        ).map_err(|e| format!("missed_exit update failed: {e}"))?;
+    }
+
+    let trip = insert_trip(conn, officer_id, read, vehicle, capture_method, "logged", frames_dir)?;
+    Ok(EntryExitOutcome::NewEntry(trip))
 }
 
 // ---------------------------------------------------------------------------

@@ -596,7 +596,7 @@ fn training_candidates_flag_low_confidence_and_human_corrected() {
     files.dedup();
     assert_eq!(files.len(), 3, "distinct frame files flagged");
     for fr in &files {
-        let prefix = format!("{}/frame_", queued.id);
+        let prefix = format!("{}/", queued.id);
         assert!(
             fr.starts_with(&prefix) && fr.ends_with(".png"),
             "frame_ref must reference the persisted frame file, got {fr}"
@@ -638,8 +638,11 @@ fn training_candidates_flag_low_confidence_and_human_corrected() {
     assert_eq!(multi_rows.len(), 3, "human-corrected resolution flags all frames");
     assert!(multi_rows.iter().all(|(_, reason)| reason == "human_corrected"));
 
-    // Manual entry has no frames → nothing flagged.
-    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir()).unwrap();
+    // Manual entry has no frames → nothing flagged.  Under §4.3 entry/exit,
+    // manual entry of A123AB closes the earlier open trip as its exit, so
+    // logged.id is the old trip (which already has candidates from the low-
+    // confidence flagging). Use A223AB (registered, no open trip).
+    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir()).unwrap();
     let logged = manual.trip.expect("manual exact match logs");
     assert_eq!(candidate_rows(&ctx, &logged.id).len(), 0, "manual entries carry no frames to flag");
 }

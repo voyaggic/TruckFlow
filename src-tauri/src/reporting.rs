@@ -517,6 +517,7 @@ fn central_trip_view(r: &serde_json::Value) -> Result<TripView, String> {
         Some("0") => Some(false),
         _ => None,
     };
+    let entry_time = r["entry_time"].as_str().unwrap_or(r["time_in"].as_str().unwrap_or(""));
     Ok(TripView {
         id: r["id"].as_str().unwrap_or("").to_string(),
         vehicle_id: r["vehicle_id"].as_str().map(String::from),
@@ -527,12 +528,17 @@ fn central_trip_view(r: &serde_json::Value) -> Result<TripView, String> {
         driver_name: r["driver_name"].as_str().map(String::from),
         capacity_at_trip: r["capacity_at_trip"].as_f64(),
         capacity_unit: r["capacity_unit"].as_str().unwrap_or("").to_string(),
-        time_in: r["time_in"].as_str().unwrap_or("").to_string(),
+        entry_time: entry_time.to_string(),
+        exit_time: r["exit_time"].as_str().map(String::from),
+        trip_status: r["trip_status"].as_str().unwrap_or("complete").to_string(),
+        time_in: entry_time.to_string(),
         receipt_no: r["receipt_no"].as_str().map(String::from),
         officer_id: r["officer_id"].as_str().map(String::from),
         officer_name: r["officer_name"].as_str().map(String::from),
         capture_method: r["capture_method"].as_str().unwrap_or("").to_string(),
         confidence_score: r["confidence_score"].as_f64(),
+        entry_photo_count: photo_count,
+        exit_photo_count: 0,
         photo_count,
         status: r["status"].as_str().unwrap_or("").to_string(),
         reason,

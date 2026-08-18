@@ -19,14 +19,17 @@ const PLACEHOLDER_PNGS: &[&str] = &[
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAANSURBVBhXYxBriPoPAAOQAfAuOHsIAAAAAElFTkSuQmCC",
 ];
 
-/// Write every frame of a read to `frames_dir/<trip_id>/` and return the JSON
-/// `photo_refs` payload (array of {index, captured_at, kind, file}). Frames
+/// Write every frame of a read to `frames_dir/<trip_id>/<kind>/` and return the
+/// JSON `photo_refs` payload (array of {index, captured_at, kind, file}). Frames
 /// with a base64 payload are decoded; simulator frames get a placeholder.
-pub fn persist_frames(frames_dir: &Path, trip_id: &str, frames: &[AnprFrame]) -> Result<String, String> {
+/// `kind` is "entry" or "exit" — the two sighting photo sets are stored and
+/// referenced completely separately (09-anpr-page-complete-spec.md §6), never
+/// merged.
+pub fn persist_frames(frames_dir: &Path, trip_id: &str, frames: &[AnprFrame], kind: &str) -> Result<String, String> {
     if frames.is_empty() {
         return Ok("[]".to_string());
     }
-    let trip_dir = frames_dir.join(trip_id);
+    let trip_dir = frames_dir.join(trip_id).join(kind);
     std::fs::create_dir_all(&trip_dir).map_err(|e| format!("frame dir create failed: {e}"))?;
 
     let mut entries: Vec<Value> = Vec::with_capacity(frames.len());
@@ -48,7 +51,7 @@ pub fn persist_frames(frames_dir: &Path, trip_id: &str, frames: &[AnprFrame]) ->
             "index": frame.index,
             "captured_at": frame.captured_at,
             "kind": frame.kind,
-            "file": format!("{trip_id}/{file}"),
+            "file": format!("{trip_id}/{kind}/{file}"),
         }));
     }
     serde_json::to_string(&entries).map_err(|e| format!("photo_refs serialize failed: {e}"))
@@ -81,14 +84,19 @@ fn read_file_base64(path: &PathBuf) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
-/// Resolve a trip's photo_refs to its evidence frames (used by commands).
+/// Resolve a trip's photo refs (entry + exit, kept separate per §6) to its
+/// evidence frames (used by commands). Entry frames come first, then exit
+/// frames — each keeps its own `kind` label so the UI never merges them.
 pub fn trip_evidence(conn: &Connection, frames_dir: &Path, trip_id: &str) -> Result<Vec<FrameEvidence>, String> {
-    let photo_refs: String = conn
+    let (entry_refs, exit_refs): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT COALESCE(photo_refs, '[]') FROM trips WHERE id = ?1",
+            "SELECT COALESCE(entry_photo_refs, photo_refs, '[]'), COALESCE(exit_photo_refs, '[]')
+             FROM trips WHERE id = ?1",
             params![trip_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| "Trip not found.".to_string())?;
-    load_frames(frames_dir, &photo_refs)
+    let mut out = load_frames(frames_dir, entry_refs.as_deref().unwrap_or("[]"))?;
+    out.extend(load_frames(frames_dir, exit_refs.as_deref().unwrap_or("[]"))?);
+    Ok(out)
 }
