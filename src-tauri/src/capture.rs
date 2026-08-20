@@ -627,11 +627,10 @@ pub fn ingest_read(
     if plate.is_empty() {
         return Err("Read contained no plate.".to_string());
     }
-    // Multi-frame capture is a hard requirement for ANPR reads, not an
-    // optimization (04 §2). Manual entry has no camera, so no frames exist —
-    // it bypasses this check (04 §8).
-    if capture_method == "auto" && read.frames.len() < 2 {
-        return Err("ANPR read must carry at least 2 frames.".to_string());
+    // At least 1 frame required for any capture (entry/exit evidence).
+    // ANPR service sends 1 frame per sighting (the best-confidence crop).
+    if capture_method == "auto" && read.frames.is_empty() {
+        return Err("ANPR read must carry at least 1 frame.".to_string());
     }
 
     let threshold = confidence_threshold(conn);
