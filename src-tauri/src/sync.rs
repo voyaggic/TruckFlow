@@ -577,7 +577,6 @@ pub fn run_sheets_sync_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> R
         // Split into new rows (no sheet_row yet) and exit updates (have sheet_row).
         let new_rows = sheet_trip_rows_filtered(conn, false)?;
         let update_rows = sheet_trip_rows_filtered(conn, true)?;
-
         // Always ensure headers are written before any data push.
         sheets.ensure_header_row(&mapping)?;
 
@@ -1553,8 +1552,8 @@ impl RealSheets {
             self.set_error(e.clone());
             e
         })?;
-        let now = chrono::Utc::now().timestamp();
-        *self.token.lock().unwrap() = Some((token, now + 3600 - 60));
+        let server_now = google_server_time(&http_client()?);
+        *self.token.lock().unwrap() = Some((token, server_now + 3600 - 60));
         c.first_sheet = Some(first.clone());
         *self.last_err.lock().unwrap() = None;
         Ok(first)
@@ -1583,7 +1582,11 @@ impl RealSheets {
         }
         match fetch_token(&creds.json) {
             Ok(t) => {
-                *self.token.lock().unwrap() = Some((t.clone(), now + 3600 - 60));
+                // Use Google server time for expiry so the cached token isn't
+                // prematurely rejected when the local clock is skewed.
+                let client = http_client()?;
+                let server_now = google_server_time(&client);
+                *self.token.lock().unwrap() = Some((t.clone(), server_now + 3600 - 60));
                 Ok(t)
             }
             Err(e) => {
@@ -1686,11 +1689,21 @@ impl SheetsProvider for RealSheets {
         let enabled_keys: Vec<&str> = mapping.iter().filter(|e| e.enabled).map(|e| e.field_key.as_str()).collect();
         let values: Vec<Vec<serde_json::Value>> = rows
             .iter()
-            .map(|row| enabled_keys.iter().map(|k| field_key_to_value(row, k)).collect())
+            .map(|row| {
+                enabled_keys.iter().map(|k| {
+                    let v = field_key_to_value(row, k);
+                    // Ensure every cell is a string (Google RAW mode expects strings).
+                    match v {
+                        serde_json::Value::Null => json!(""),
+                        serde_json::Value::String(_) => v,
+                        other => json!(other.to_string()),
+                    }
+                }).collect()
+            })
             .collect();
         let range = format!("{first_sheet}!A1");
         let url = format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=INSERT_ROWS&includeValuesInResponse=true",
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}:append?valueInputOption=RAW&includeValuesInResponse=true",
             creds.sheet_id,
             urlenc(&range)
         );
@@ -1700,10 +1713,14 @@ impl SheetsProvider for RealSheets {
             .bearer_auth(&token)
             .json(&body)
             .send()
-            .map_err(|e| format!("sheet append failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("sheet append rejected: {e}"))?;
-        let j: serde_json::Value = resp.json().map_err(|e| format!("sheet append response unreadable: {e}"))?;
+            .map_err(|e| format!("sheet append failed: {e}"))?;
+        let status = resp.status();
+        let resp_text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("sheet append rejected ({status}): {resp_text}"));
+        }
+        let j: serde_json::Value = serde_json::from_str(&resp_text)
+            .map_err(|e| format!("sheet append response unreadable: {e} — raw: {resp_text}"))?;
         let updated_range = j["updates"]["updatedRange"].as_str().unwrap_or("");
         let start_row = updated_range.split('!').last()
             .and_then(|r| r.split(':').next())
