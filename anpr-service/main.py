@@ -219,6 +219,230 @@ class TrackedReading:
             self.best_frame = frame
 
 
+# ---------------------------------------------------------------------------
+# Custom HTTP MJPEG frame reader — works with IP Webcam and similar servers
+# ---------------------------------------------------------------------------
+
+class MjpegFrameReader:
+    """Reads JPEG frames from an HTTP multipart MJPEG stream using raw sockets.
+    
+    IP Webcam sends:
+      --boundary\r\nContent-Type: image/jpeg\r\nContent-Length: NNN\r\n\r\n<NNN bytes JPEG>\r\n
+    This reader reads the boundary line, parses Content-Length, then reads
+    exactly N bytes of JPEG data. Much more reliable than scanning for
+    boundary markers in binary data.
+    """
+
+    def __init__(self, url: str, timeout: int = 10):
+        self.url = url
+        self.timeout = timeout
+        self._conn = None
+        self._resp = None
+        self._buf = b''  # leftover bytes from previous reads
+
+    def _connect(self):
+        """Open HTTP connection and start reading the MJPEG stream."""
+        import urllib.parse
+        import http.client
+
+        parsed = urllib.parse.urlparse(self.url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        path = parsed.path or '/'
+        if parsed.query:
+            path += '?' + parsed.query
+
+        if parsed.scheme == 'https':
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=ctx)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+
+        conn.request('GET', path, headers={
+            'User-Agent': 'TruckFlow-ANPR/1.0',
+            'Connection': 'keep-alive',
+        })
+        resp = conn.getresponse()
+        if resp.status != 200:
+            conn.close()
+            raise RuntimeError(f'HTTP {resp.status} from {self.url}')
+
+        content_type = resp.getheader('Content-Type', '')
+        if 'multipart' not in content_type and 'jpeg' not in content_type:
+            conn.close()
+            raise RuntimeError(f'Not an MJPEG stream (Content-Type: {content_type})')
+
+        self._conn = conn
+        self._resp = resp
+        self._buf = b''
+        # Extract boundary from Content-Type
+        self._boundary = None
+        if 'boundary=' in content_type:
+            raw = content_type.split('boundary=')[1].strip().strip('"')
+            # IP Webcam sends boundary=--Ba4oTvQMY8ew04N8dcnM (with dashes)
+            self._boundary = raw
+
+    def _recv(self, n: int) -> bytes:
+        """Read exactly n bytes from the response, using internal buffer."""
+        while len(self._buf) < n:
+            chunk = self._resp.read(n - len(self._buf))
+            if not chunk:
+                return self._buf
+            self._buf += chunk
+        result = self._buf[:n]
+        self._buf = self._buf[n:]
+        return result
+
+    def _readline(self) -> bytes:
+        """Read one line (up to \r\n) from the response."""
+        while b'\r\n' not in self._buf:
+            chunk = self._resp.read(512)
+            if not chunk:
+                line = self._buf
+                self._buf = b''
+                return line
+            self._buf += chunk
+        idx = self._buf.index(b'\r\n')
+        line = self._buf[:idx]
+        self._buf = self._buf[idx + 2:]
+        return line
+
+    def read_frame(self) -> tuple[bool, np.ndarray | None]:
+        """Read one JPEG frame from the stream. Returns (success, frame)."""
+        try:
+            if self._resp is None:
+                self._connect()
+
+            jpeg_data = self._read_multipart_frame()
+            if jpeg_data is None or len(jpeg_data) < 100:
+                return False, None
+
+            # Decode JPEG bytes to numpy array
+            try:
+                import cv2  # type: ignore
+                arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is None or frame.size == 0:
+                    return False, None
+                return True, frame
+            except Exception:
+                return False, None
+
+        except Exception:
+            self._close()
+            return False, None
+
+    def _read_multipart_frame(self) -> bytes | None:
+        """Read one JPEG frame from a multipart MJPEG stream.
+
+        IP Webcam stream format (body starts after HTTP response headers):
+          \r\n--boundary\r\n\r\nContent-Type: image/jpeg\r\nContent-Length: NNN\r\n\r\n<NNN bytes JPEG>\r\n
+        Strategy: scan buffer for '--boundary', then parse Content-Length
+        header, then read exactly N bytes of JPEG data.
+        """
+        boundary = self._boundary.encode() if self._boundary else b''
+
+        # 1) Fill buffer until we find the boundary marker
+        timeout = time.time() + 15
+        while time.time() < timeout:
+            if boundary in self._buf:
+                break
+            try:
+                chunk = self._resp.read(8192)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+        if boundary not in self._buf:
+            return None
+
+        # 2) Find boundary position and skip past it
+        idx = self._buf.find(boundary)
+        rest = self._buf[idx + len(boundary):]
+
+        # 3) Find end of part headers (\r\n\r\n)
+        hdr_end = rest.find(b'\r\n\r\n')
+        while hdr_end < 0 and time.time() < timeout:
+            try:
+                chunk = self._resp.read(4096)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            rest += chunk
+            hdr_end = rest.find(b'\r\n\r\n')
+
+        if hdr_end < 0:
+            return None
+
+        # 4) Parse Content-Length from part headers
+        headers_raw = rest[:hdr_end].decode('latin-1', errors='replace')
+        content_length = None
+        for line in headers_raw.split('\r\n'):
+            line = line.strip()
+            if line.lower().startswith('content-length:'):
+                try:
+                    content_length = int(line.split(':', 1)[1].strip())
+                except ValueError:
+                    pass
+
+        # JPEG data starts after the \r\n\r\n separator
+        data_start = hdr_end + 4
+
+        # 5) Read exactly content_length bytes of JPEG data
+        if content_length and content_length > 0:
+            # Ensure we have enough data in the buffer
+            while len(rest) - data_start < content_length and time.time() < timeout:
+                try:
+                    chunk = self._resp.read(content_length - (len(rest) - data_start))
+                except Exception:
+                    return None
+                if not chunk:
+                    return None
+                rest += chunk
+
+            jpeg_data = rest[data_start:data_start + content_length]
+            # Leave everything after the JPEG in the buffer (trailing \r\n + next boundary)
+            consumed = idx + len(boundary) + data_start + content_length
+            self._buf = self._buf[consumed:]
+            return jpeg_data
+
+        # Fallback: no Content-Length — scan for JPEG end marker (FFD9)
+        while time.time() < timeout:
+            end = rest.find(b'\xff\xd9', data_start)
+            if end >= 0:
+                jpeg_data = rest[data_start:end + 2]
+                consumed = idx + len(boundary) + end + 2
+                self._buf = self._buf[consumed:]
+                return jpeg_data
+            try:
+                chunk = self._resp.read(8192)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            rest += chunk
+        return None
+
+    def _close(self):
+        try:
+            if self._conn:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+        self._resp = None
+        self._buf = b''
+
+    def release(self):
+        self._close()
+
+
 class Pipeline:
     """Owns the capture thread, SORT tracker and the finalized sighting list."""
 
@@ -244,30 +468,112 @@ class Pipeline:
     # -- capture ------------------------------------------------------------
 
     def capture_frames(self) -> None:
-        """Pull frames from the configured source and feed the tracker."""
+        """Pull frames from the configured source and feed the tracker.
+        
+        For HTTP/HTTPS sources, uses a custom MJPEG reader that parses
+        multipart streams directly (OpenCV VideoCapture can't handle these
+        on Windows). For other sources (video files, USB, RTSP), uses OpenCV.
+        Retries on stream drops with exponential backoff.
+        """
+        max_backoff = 30  # seconds
+        attempt = 0
+        # Use custom MJPEG reader for HTTP/HTTPS sources
+        use_mjpeg = self.source_type == "http" and (
+            self.source.startswith("http://") or self.source.startswith("https://")
+        )
+        while True:
+            if use_mjpeg:
+                ok, frame = self._run_mjpeg_capture(attempt)
+            else:
+                ok, frame = self._run_opencv_capture()
+            if ok:
+                break  # EOF / normal exit
+            # Failed — retry with backoff
+            self.running = False
+            attempt += 1
+            wait = min(max_backoff, 2 ** attempt)
+            print(f"[ANPR] Reconnecting in {wait}s (attempt {attempt})...")
+            time.sleep(wait)
+            self.sort = Sort(max_age=12, min_hits=2)
+            self.readings.clear()
+
+    def _run_mjpeg_capture(self, attempt: int) -> tuple[bool, bool]:
+        """Run the MJPEG frame reader loop. Returns (eof, error)."""
+        try:
+            reader = MjpegFrameReader(self.url_for_mjpeg())
+            self.running = True
+            consecutive_failures = 0
+            print(f"[ANPR] Camera connected (MJPEG): {self.source}")
+            while True:
+                ok, frame = reader.read_frame()
+                if not ok or frame is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 20:
+                        print("[ANPR] MJPEG stream dropped, reconnecting...")
+                        reader.release()
+                        return False, False
+                    time.sleep(0.05)
+                    continue
+                consecutive_failures = 0
+                self.frames_processed += 1
+                self.frame_num += 1
+                with self.lock:
+                    self.current_frame = frame
+                self.tick(frame)
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"[ANPR] MJPEG capture error: {e}")
+            return False, True
+        finally:
+            try:
+                reader.release()
+            except Exception:
+                pass
+        return True, False
+
+    def _run_opencv_capture(self) -> tuple[bool, bool]:
+        """Run the OpenCV capture loop. Returns (eof, error)."""
         cap = self._open_capture()
         if cap is None:
-            return
+            return False, True
         try:
             self.running = True
-            loop_start = time.time()
+            consecutive_failures = 0
+            print(f"[ANPR] Camera connected: {self.source}")
             while True:
                 ok, frame = cap.read()
                 if not ok:
-                    break
+                    consecutive_failures += 1
+                    if consecutive_failures >= 15:
+                        print("[ANPR] Stream dropped, reconnecting...")
+                        return False, False
+                    time.sleep(0.05)
+                    continue
+                consecutive_failures = 0
                 self.frames_processed += 1
                 self.frame_num += 1
-                self.current_frame = frame
+                with self.lock:
+                    self.current_frame = frame
                 self.tick(frame)
-                # Throttle to ~10 fps for stability (mock/demo friendly).
                 time.sleep(0.05)
-            cap.release()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ANPR] Capture error: {e}")
+            return False, True
         finally:
-            self.running = False
-            # EOF reached: every remaining track leaves frame -> finalize all.
-            self.finalize_all()
+            try:
+                cap.release()
+            except Exception:
+                pass
+        return True, False
+
+    def url_for_mjpeg(self) -> str:
+        """Return the URL for the MJPEG reader, stripping /videofeed if needed
+        and trying HTTPS → HTTP fallback."""
+        url = self.source
+        if url.startswith("https://"):
+            # Try HTTPS first (some IP Webcam servers require it)
+            return url
+        return url
 
     def _open_capture(self):
         try:
@@ -277,12 +583,33 @@ class Pipeline:
                 print("OpenCV (cv2) is required for this source. Install: pip install opencv-python")
                 return None
             return None
+        # For HTTPS sources with self-signed certs, try FFmpeg first
+        if self.source_type == "http" and self.source.startswith("https://"):
+            # Try with FFmpeg backend which handles HTTPS better
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file,tcp,http,https,rtsp|rtp|udp"
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+                return cap
+            # Fallback: try plain HTTP (some cameras serve both)
+            http_url = self.source.replace("https://", "http://")
+            print(f"[ANPR] HTTPS failed, trying HTTP: {http_url}")
+            cap = cv2.VideoCapture(http_url)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            return cap
         if self.source_type == "video_file":
             return cv2.VideoCapture(self.source)
         if self.source_type == "usb":
             return cv2.VideoCapture(int(self.source))
         if self.source_type in ("http", "rtsp", "live_test"):
+            # Set FFmpeg options for network streams
+            if self.source.startswith("rtsp://"):
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
             cap = cv2.VideoCapture(self.source)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000)
             return cap
         return None
 
@@ -383,6 +710,8 @@ class Pipeline:
 
     def status(self) -> dict:
         fps = self.frames_processed / max(1.0, time.time() - self.start_time)
+        with self.lock:
+            has_frame = self.current_frame is not None
         return {
             "running": self.running,
             "source_type": self.source_type,
@@ -394,6 +723,7 @@ class Pipeline:
             "last_plate_time": self.latest["timestamp"] if self.latest else None,
             "uptime_seconds": int(time.time() - self.start_time),
             "ocr_engine": self.ocr.name,
+            "camera_connected": has_frame,
         }
 
     def latest_payload(self) -> dict | None:
@@ -411,14 +741,16 @@ class Pipeline:
         except Exception:
             return frame
         out = frame.copy()
-        for tid, slot in self.readings.items():
+        # Snapshot tracker state under lock to avoid race with capture thread
+        with self.lock:
+            trackers_snapshot = [(row.id, tuple(int(v) for v in row.bbox)) for row in self.sort.trackers]
+            readings_snapshot = dict(self.readings)
+        for tid, slot in readings_snapshot.items():
             color = (80, 220, 120) if slot.plate else (220, 180, 60)
-            # Re-derive box from the tracker for drawing.
-            for row in self.sort.trackers:
-                if row.id == tid:
-                    x1, y1, x2, y2 = (int(v) for v in row.bbox)
+            for t_id, (x1, y1, x2, y2) in trackers_snapshot:
+                if t_id == tid:
                     cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-                    label = f"#{tid} {slot.plate or '…'}"
+                    label = f"#{tid} {slot.plate or '...'}"
                     cv2.putText(out, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     break
         return out
@@ -468,12 +800,19 @@ def serve(pipeline: Pipeline, port: int) -> None:
             elif path == "/health":
                 self._json({"ok": True})
             elif path == "/preview_frame":
-                frame = pipeline.current_frame
+                with pipeline.lock:
+                    frame = pipeline.current_frame
                 if frame is None:
                     self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
                     self.end_headers()
+                    self.wfile.write(b'{"error": "no frame yet"}')
                     return
                 data = _jpeg(pipeline.annotate(frame))
+                if not data:
+                    self.send_response(500)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(data)))
@@ -487,17 +826,23 @@ def serve(pipeline: Pipeline, port: int) -> None:
         def _stream_mjpeg(self):
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.end_headers()
             try:
                 while True:
-                    frame = pipeline.current_frame
+                    with pipeline.lock:
+                        frame = pipeline.current_frame
                     if frame is not None:
                         data = _jpeg(pipeline.annotate(frame))
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-                        self.wfile.write(data)
-                        self.wfile.write(b"\r\n")
+                        if data:
+                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                            self.wfile.write(data)
+                            self.wfile.write(b"\r\n")
+                            self.wfile.flush()
                     time.sleep(0.1)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -506,15 +851,6 @@ def serve(pipeline: Pipeline, port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TruckFlow ANPR service (SORT-tracked)")
-    p.add_argument("--source", default="http://127.0.0.1:8080/videofeed", help="rtsp://…, http://…, video file path, or usb:N")
-    p.add_argument("--type", default=None, choices=["rtsp", "http", "video_file", "usb", "live_test"], help="override source type inference")
-    p.add_argument("--port", type=int, default=9800)
-    p.add_argument("--mock", action="store_true", help="force the deterministic mock OCR (no model downloads)")
-    return p.parse_args(argv)
-
 
 def infer_type(source: str) -> str:
     if source.startswith("rtsp://"):
@@ -526,12 +862,66 @@ def infer_type(source: str) -> str:
     return "video_file"
 
 
+# ---------------------------------------------------------------------------
+# Config file — the Tauri app writes this when camera sources change.
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_config() -> dict:
+    """Load config from config.json if it exists."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    """Save config to config.json."""
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def get_source_from_config() -> tuple[str, str, bool]:
+    """Read the camera source from config.json.
+    Returns (source_url, source_type, mock_mode)."""
+    cfg = load_config()
+    source = cfg.get("source", "http://127.0.0.1:8080/videofeed")
+    source_type = cfg.get("source_type") or infer_type(source)
+    mock = cfg.get("mock", False)
+    return source, source_type, mock
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="TruckFlow ANPR service (SORT-tracked)")
+    p.add_argument("--source", default=None, help="rtsp://…, http://…, video file path, or usb:N (overrides config.json)")
+    p.add_argument("--type", default=None, choices=["rtsp", "http", "video_file", "usb", "live_test"], help="override source type inference")
+    p.add_argument("--port", type=int, default=9800)
+    p.add_argument("--mock", action="store_true", help="force the deterministic mock OCR (no model downloads)")
+    return p.parse_args(argv)
+
+
 def main() -> None:
     args = parse_args()
-    source_type = args.type or infer_type(args.source)
-    ocr = OcrBackend(force_mock=args.mock)
+    # Priority: CLI --source > config.json > default
+    if args.source:
+        source = args.source
+        source_type = args.type or infer_type(source)
+        mock = args.mock
+    else:
+        source, source_type, mock = get_source_from_config()
+        if args.type:
+            source_type = args.type
+        if args.mock:
+            mock = True
+    print(f"Camera source: {source} ({source_type})")
+    ocr = OcrBackend(force_mock=mock)
     print(f"OCR backend: {ocr.name}" + ("  (real engines not installed — mock readings)" if ocr.name == "mock" else ""))
-    pipeline = Pipeline(args.source, source_type, ocr, args.port)
+    pipeline = Pipeline(source, source_type, ocr, args.port)
 
     capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
     capture_thread.start()

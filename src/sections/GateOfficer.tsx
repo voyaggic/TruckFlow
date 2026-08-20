@@ -430,7 +430,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               Export CSV
             </button>
             <button
-              className="ghost small danger"
+              className="small danger"
               disabled={filtered.length === 0}
               onClick={async () => {
                 if (!window.confirm(`Archive all ${filtered.length} recent entries? They can be restored later by an admin.`)) return;
@@ -501,7 +501,8 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                   <td className="muted small">{t.officer_name ?? "—"}</td>
                   <td>
                     <button
-                      className="ghost small"
+                      className="small danger"
+                      style={{ fontSize: 11, padding: "2px 8px" }}
                       title="Archive this entry"
                       onClick={async () => {
                         try {
@@ -512,7 +513,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                         }
                       }}
                     >
-                      Archive
+                      ✕
                     </button>
                   </td>
                 </tr>

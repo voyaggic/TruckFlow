@@ -1702,3 +1702,100 @@ pub fn trip_frames(state: State<AppState>, trip_id: String) -> Result<Vec<crate:
 pub fn emit_capture_update(app: &AppHandle) {
     let _ = app.emit("capture-updated", ());
 }
+
+// ---------------------------------------------------------------------------
+// ANPR service management — start / stop / write config
+// ---------------------------------------------------------------------------
+
+use std::fs;
+use std::process::{Command as StdCommand, Stdio};
+
+/// Path to the ANPR service config.json (written by the app, read by the service)
+fn anpr_config_path() -> String {
+    let base = std::env::current_dir().unwrap_or_default();
+    base.join("anpr-service").join("config.json").to_string_lossy().to_string()
+}
+
+/// Write the ANPR service config.json so it picks up the active camera source.
+#[tauri::command]
+pub fn write_anpr_config(
+    state: State<AppState>,
+    actor_id: String,
+    source_url: String,
+    source_type: Option<String>,
+    mock: Option<bool>,
+) -> Result<String, String> {
+    let cfg = serde_json::json!({
+        "source": source_url,
+        "source_type": source_type,
+        "mock": mock.unwrap_or(false),
+    });
+    let path = anpr_config_path();
+    fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    append_audit(&conn, &actor_id, "wrote_anpr_config", None, Some(serde_json::json!({"source": source_url})))?;
+    Ok(path)
+}
+
+/// Start the ANPR service process. Returns the PID.
+#[tauri::command]
+pub fn start_anpr_service(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<u32, String> {
+    // Kill any existing process first
+    let _ = stop_anpr_service_inner(&state);
+
+    let anpr_dir = std::env::current_dir().map_err(|e| e.to_string())?.join("anpr-service");
+    if !anpr_dir.exists() {
+        return Err(format!("ANPR service directory not found: {}", anpr_dir.display()));
+    }
+
+    // Build the command — reads source from config.json
+    let mut cmd = StdCommand::new("python");
+    cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
+    cmd.current_dir(&anpr_dir);
+
+    // Capture stdout/stderr to a log file
+    let log_path = anpr_dir.join("anpr.log");
+    let log_file = fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    let log_file2 = log_file.try_clone().map_err(|e| e.to_string())?;
+    cmd.stdout(Stdio::from(log_file));
+    cmd.stderr(Stdio::from(log_file2));
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to start ANPR service: {e}"))?;
+    let pid = child.id();
+
+    // Store the child handle
+    {
+        let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
+        procs.push(child);
+    }
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    append_audit(&conn, &actor_id, "started_anpr_service", None, Some(serde_json::json!({"pid": pid})))?;
+    Ok(pid)
+}
+
+/// Stop all ANPR service processes.
+#[tauri::command]
+pub fn stop_anpr_service(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<String, String> {
+    let count = stop_anpr_service_inner(&state)?;
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    append_audit(&conn, &actor_id, "stopped_anpr_service", None, None)?;
+    Ok(format!("Stopped {count} ANPR process(es)."))
+}
+
+fn stop_anpr_service_inner(state: &State<AppState>) -> Result<usize, String> {
+    let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
+    let mut count = 0;
+    for mut child in procs.drain(..) {
+        let _ = child.kill();
+        let _ = child.wait();
+        count += 1;
+    }
+    Ok(count)
+}

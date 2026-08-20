@@ -26,6 +26,8 @@ pub struct AppState {
     pub pg: Arc<dyn PostgresAdapter>,
     /// Google Sheets export adapter (mock in dev).
     pub sheets: Arc<dyn SheetsProvider>,
+    /// ANPR service child processes (managed by start/stop commands).
+    pub anpr_processes: Mutex<Vec<std::process::Child>>,
 }
 
 pub fn now_iso() -> String {
@@ -53,6 +55,7 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
         frames_dir,
         pg,
         sheets,
+        anpr_processes: Mutex::new(Vec::new()),
     })
 }
 

@@ -459,6 +459,14 @@ export const api = {
 
   tripFrames: (tripId: string) => invoke<FrameEvidence[]>("trip_frames", { tripId }),
 
+  // --- ANPR Service Management ---
+  writeAnprConfig: (actorId: string, sourceUrl: string, sourceType?: string, mock?: boolean) =>
+    invoke<string>("write_anpr_config", { actorId, sourceUrl, sourceType, mock }),
+  startAnprService: (actorId: string) =>
+    invoke<number>("start_anpr_service", { actorId }),
+  stopAnprService: (actorId: string) =>
+    invoke<string>("stop_anpr_service", { actorId }),
+
   // --- ANPR Engine Configuration (08 §5 / §6, gated on manage_anpr_config) ---
 
   getAnprConfig: () => invoke<AnprConfigView>("get_anpr_config"),

@@ -155,7 +155,7 @@ function LivePreviewTab({
 
   return (
     <div className="stack">
-      <ServiceStatusBar />
+      <ServiceStatusBar cameras={cameras} actor={actor} />
       {cameras.length === 0 ? (
         <div className="placeholder">
           No camera sources yet. Add one in <b>Settings</b>, then come back here to watch the live feed.
@@ -250,31 +250,69 @@ function LivePreviewTab({
 }
 
 function CameraThumb({ camera, previewUrl, large }: { camera: CameraSourceView; previewUrl?: string; large?: boolean }) {
-  const isHttp = camera.connection_string.startsWith("http://") || camera.connection_string.startsWith("https://");
   const h = large ? "65vh" : "100%";
-  if (isHttp) {
-    // MJPEG / HTTP stream — <img> renders multipart MJPEG; <video> cannot.
-    return <img src={camera.connection_string} alt={`${camera.label} live feed`} style={{ width: "100%", height: h, objectFit: "contain" }} />;
-  }
-  if (previewUrl || camera.source_type === "video_file" || camera.source_type === "nvr_export") {
+  // Always proxy through ANPR service — it handles the camera connection,
+  // so the UI just needs to show the locally-served preview frame.
+  const proxySrc = `${ANPR_SERVICE_URL}/preview_frame?t=${Date.now()}`;
+  // For video files, use the converted file src
+  if (camera.source_type === "video_file" || camera.source_type === "nvr_export") {
     return <video src={previewUrl ?? convertFileSrc(camera.connection_string)} controls={!!large} muted autoPlay={!!large} loop={!!large} style={{ width: "100%", height: h, objectFit: "contain" }} />;
   }
+  // For live sources (HTTP, RTSP, USB), try the ANPR service proxy first
   return (
-    <span className="muted small" style={{ padding: 8, textAlign: "center" }}>
-      {camera.source_type === "rtsp"
-        ? "RTSP — test the connection in Settings"
-        : camera.source_type === "usb"
-          ? "USB camera — preview appears when the ANPR service is running"
-          : "No live preview for this type"}
-    </span>
+    <img
+      src={proxySrc}
+      alt={`${camera.label} live feed`}
+      style={{ width: "100%", height: h, objectFit: "contain" }}
+      onError={(e) => {
+        // If ANPR service proxy isn't running, show a placeholder
+        const target = e.currentTarget as HTMLImageElement;
+        target.style.display = "none";
+        // Fallback: try direct camera URL for HTTP sources
+        const parent = target.parentElement;
+        if (parent && (camera.connection_string.startsWith("http://") || camera.connection_string.startsWith("https://"))) {
+          const fallback = document.createElement("img");
+          fallback.src = camera.connection_string;
+          fallback.alt = `${camera.label} direct feed`;
+          fallback.style.cssText = `width:100%;height:${h};object-fit:contain`;
+          parent.appendChild(fallback);
+        }
+      }}
+    />
+  );
+}
+
+/** Auto-refreshing live preview from the ANPR service. Updates every 500ms. */
+function LivePreview() {
+  const [src, setSrc] = useState(`${ANPR_SERVICE_URL}/preview_frame?t=${Date.now()}`);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSrc(`${ANPR_SERVICE_URL}/preview_frame?t=${Date.now()}`);
+    }, 500);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <img
+      src={src}
+      alt="Live camera feed"
+      style={{ width: "100%", maxHeight: 300, objectFit: "contain" }}
+      onError={() => {
+        // If preview_frame fails, try the /preview endpoint
+        setSrc(`${ANPR_SERVICE_URL}/preview?t=${Date.now()}`);
+      }}
+    />
   );
 }
 
 const ANPR_SERVICE_URL = "http://127.0.0.1:9800";
 
-function ServiceStatusBar() {
+function ServiceStatusBar({ cameras, actor }: { cameras: CameraSourceView[]; actor: SessionUser }) {
   const [status, setStatus] = useState<AnprServiceStatus | null>(null);
   const [lastPlate, setLastPlate] = useState<{ plate: string; confidence: number; timestamp: string } | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -302,6 +340,56 @@ function ServiceStatusBar() {
   }, [refresh]);
 
   const isRunning = status?.running ?? false;
+
+  /** Find the first active camera source */
+  const activeCamera = cameras.find(c => c.status === "active");
+
+  /** Start the ANPR service using the active camera source */
+  const handleStart = useCallback(async () => {
+    if (!activeCamera) {
+      setMessage("No active camera source. Add one in Camera Settings and set it active.");
+      return;
+    }
+    setStarting(true);
+    setMessage(null);
+    try {
+      // 1. Write config.json with the active camera source
+      await api.writeAnprConfig(actor.id, activeCamera.connection_string, activeCamera.source_type, false);
+      // 2. Start the ANPR service
+      const pid = await api.startAnprService(actor.id);
+      setMessage(`ANPR service started (PID ${pid}). Connecting to ${activeCamera.connection_string}...`);
+      // 3. Poll until it's up
+      let tries = 0;
+      const check = async () => {
+        try {
+          const resp = await fetch(`${ANPR_SERVICE_URL}/health`);
+          if (resp.ok) {
+            setMessage(`ANPR service running — connected to ${activeCamera.connection_string}`);
+            refresh();
+            return;
+          }
+        } catch {}
+        if (++tries < 15) setTimeout(check, 1000);
+        else setMessage("ANPR service started but not responding yet — check logs.");
+      };
+      setTimeout(check, 2000);
+    } catch (e: any) {
+      setMessage(`Failed: ${e}`);
+    } finally {
+      setStarting(false);
+    }
+  }, [activeCamera, actor, refresh]);
+
+  /** Stop the ANPR service */
+  const handleStop = useCallback(async () => {
+    try {
+      await api.stopAnprService(actor.id);
+      setMessage("ANPR service stopped.");
+      refresh();
+    } catch (e: any) {
+      setMessage(`Failed: ${e}`);
+    }
+  }, [actor, refresh]);
   const uptime = status?.uptime_seconds ?? 0;
   const uptimeStr = uptime > 3600
     ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
@@ -311,10 +399,19 @@ function ServiceStatusBar() {
 
   return (
     <div className="card">
-      <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+      <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <span className={`badge ${isRunning ? "active" : "disabled"}`}>
           {isRunning ? "ANPR Running" : "ANPR Stopped"}
         </span>
+        {!isRunning ? (
+          <button className="small" onClick={handleStart} disabled={starting} style={{ marginLeft: 4 }}>
+            {starting ? "Starting..." : "Start ANPR"}
+          </button>
+        ) : (
+          <button className="small danger" onClick={handleStop} style={{ marginLeft: 4 }}>
+            Stop ANPR
+          </button>
+        )}
         {status && (
           <>
             <span className="muted small">Source: {status.source_type} {status.source_url ? `(${status.source_url})` : ""}</span>
@@ -325,6 +422,11 @@ function ServiceStatusBar() {
           </>
         )}
       </div>
+      {message && (
+        <div className="muted small" style={{ marginTop: 6, padding: "4px 8px", background: "var(--surface-2, #1a1a2e)", borderRadius: 4 }}>
+          {message}
+        </div>
+      )}
 
       {/* Live service preview */}
       <div
@@ -342,11 +444,7 @@ function ServiceStatusBar() {
         }}
       >
         {isRunning ? (
-          <img
-            src={`${ANPR_SERVICE_URL}/preview?t=${Date.now()}`}
-            alt="Live camera feed"
-            style={{ width: "100%", maxHeight: 300, objectFit: "contain" }}
-          />
+          <LivePreview />
         ) : (
           <div style={{ padding: 30, textAlign: "center" }}>
             <p className="muted" style={{ fontSize: 14, margin: 0 }}>ANPR service is not running</p>
