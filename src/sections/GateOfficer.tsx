@@ -823,6 +823,15 @@ function ResolveScreen({
 
             <div className="entry-grid" style={{ marginTop: 12 }}>
               <div>
+                <div className="muted small">{label("vehicle", "plate_number")} (edit if needed)</div>
+                <input
+                  className="plate-input"
+                  value={newPlate || trip.plate_number}
+                  onChange={(e) => setNewPlate(e.target.value.toUpperCase())}
+                  placeholder="e.g. KBA344J"
+                />
+              </div>
+              <div>
                 <div className="muted small">{label("vehicle", "company")}</div>
                 <select value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
                   <option value="">— none —</option>

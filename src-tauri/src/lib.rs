@@ -24,6 +24,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let state = db::init_state(app.handle())?;
+            // Auto-start ANPR service with the first active camera source
+            if let Err(e) = auto_start_anpr(&state) {
+                eprintln!("[ANPR] Auto-start skipped: {e}");
+            }
             spawn_anpr_poller(app.handle(), &state);
             spawn_sync_poller(app.handle(), &state);
             app.manage(state);
@@ -176,6 +180,65 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// Auto-start the ANPR service on app launch. Finds the first active camera,
+/// writes config.json, spawns the Python process, and sets anpr_source=http.
+fn auto_start_anpr(state: &AppState) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // Find the first active camera source
+    let camera = conn
+        .query_row(
+            "SELECT source_type, connection_string FROM camera_sources WHERE status = 'active' LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .map_err(|_| "No active camera source found. Add one in Camera Settings.")?;
+    drop(conn);
+
+    let (source_type, connection_string) = camera;
+    println!("[ANPR] Auto-starting with {source_type}: {connection_string}");
+
+    // Write config.json for the ANPR service
+    let config_path = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join("anpr-service")
+        .join("config.json");
+    let cfg = serde_json::json!({
+        "source": connection_string,
+        "source_type": source_type,
+    });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
+        .map_err(|e| format!("Failed to write config.json: {e}"))?;
+
+    // Spawn the ANPR service process
+    let anpr_dir = std::env::current_dir().map_err(|e| e.to_string())?.join("anpr-service");
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
+    cmd.current_dir(&anpr_dir);
+    let log_path = anpr_dir.join("anpr.log");
+    let log_file = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    let log_file2 = log_file.try_clone().map_err(|e| e.to_string())?;
+    cmd.stdout(std::process::Stdio::from(log_file));
+    cmd.stderr(std::process::Stdio::from(log_file2));
+    let child = cmd.spawn().map_err(|e| format!("Failed to start ANPR: {e}"))?;
+    let pid = child.id();
+    println!("[ANPR] Service started (PID {pid})");
+
+    // Store the child handle
+    {
+        let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
+        procs.push(child);
+    }
+
+    // Set anpr_source to http so the poller picks it up
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('anpr_source', 'http')\n         ON CONFLICT(key) DO UPDATE SET value = 'http'",
+        [],
+    ).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Background poller for the ANPR source (02-architecture.md §4). Runs
 /// independently of the UI; an unreachable/unconfigured source degrades
 /// gracefully and never blocks the rest of the app.
@@ -189,33 +252,33 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
             let Some(st) = handle.try_state::<AppState>() else {
                 continue;
             };
-            let source_name = {
-                let Ok(conn) = st.db.lock() else { continue };
-                if !capture::anpr_enabled(&conn) {
-                    continue;
-                }
-                capture::anpr_source(&conn)
-            };
+            let Ok(conn) = st.db.lock() else { continue };
+            if !capture::anpr_enabled(&conn) {
+                drop(conn);
+                continue;
+            }
+            drop(conn);
 
-            // Surface ANPR service outages to System Monitor immediately
-            // (08 §3): an unreachable HTTP source becomes a health event and is
-            // cleared as soon as the service answers again.
-            if source_name == "http" {
+            // The ANPR service (port 9800) handles ALL source types internally
+            // (HTTP, RTSP, USB, video file). The app always polls from it —
+            // the source type doesn't matter at the poller level.
+            if http.reachable() {
                 let Ok(conn) = st.db.lock() else { continue };
-                if http.reachable() {
-                    let _ = monitor::record_health_event(&conn, "anpr_service", "ok", None);
-                } else {
-                    let _ = monitor::record_health_event(
-                        &conn,
-                        "anpr_service",
-                        "offline",
-                        Some("ANPR service unreachable at 127.0.0.1:9800"),
-                    );
-                }
+                let _ = monitor::record_health_event(&conn, "anpr_service", "ok", None);
+                drop(conn);
+            } else {
+                let Ok(conn) = st.db.lock() else { continue };
+                let _ = monitor::record_health_event(
+                    &conn,
+                    "anpr_service",
+                    "offline",
+                    Some("ANPR service unreachable at 127.0.0.1:9800"),
+                );
+                drop(conn);
+                continue; // service down — skip this cycle
             }
 
-            let read = if source_name == "http" { http.poll() } else { st.simulator.poll() };
-            let Some(read) = read else { continue };
+            let Some(read) = http.poll() else { continue };
 
             if let Ok(mut last) = st.anpr_last.lock() {
                 *last = Some((read.timestamp.clone(), read.plate.clone()));
@@ -226,9 +289,7 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                 Err(_) => continue,
             };
             let _ = capture::ingest_read(&conn, officer, &read, "auto", &st.frames_dir);
-            // A successful read is itself evidence the pipeline is healthy, and
-            // every read feeds the confidence-over-time series (05 §6h).
-            let _ = capture::record_read_event(&conn, &read, &source_name, "captured");
+            let _ = capture::record_read_event(&conn, &read, "auto", "captured");
             let _ = monitor::record_health_event(&conn, "anpr_service", "ok", None);
             drop(conn);
             let _ = handle.emit("capture-updated", ());
