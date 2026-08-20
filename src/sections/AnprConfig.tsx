@@ -137,10 +137,10 @@ function LivePreviewTab({
   onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
 }) {
   const [expanded, setExpanded] = useState<CameraSourceView | null>(null);
+  const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
   const [previews, setPreviews] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    // Load previews for video-file sources (needs convertFileSrc).
     const next: Record<string, string> = {};
     for (const c of cameras) {
       if (c.source_type === "video_file" || c.source_type === "nvr_export") {
@@ -150,33 +150,77 @@ function LivePreviewTab({
     setPreviews(next);
   }, [cameras]);
 
+  const isPortrait = orientation === "portrait";
+
   const online = (c: CameraSourceView) =>
     c.status === "active" && (c.source_type === "http" || c.source_type === "rtsp" || c.source_type === "live_test");
 
   return (
-    <div className="stack">
+    <div className="stack" style={{ height: "100%" }}>
       <ServiceStatusBar cameras={cameras} actor={actor} />
+
+      {/* Orientation toggle */}
+      <div className="row" style={{ gap: 8, alignItems: "center" }}>
+        <span className="muted small">Preview:</span>
+        <button
+          className={`ghost small ${orientation === "landscape" ? "active" : ""}`}
+          onClick={() => setOrientation("landscape")}
+        >
+          Landscape
+        </button>
+        <button
+          className={`ghost small ${orientation === "portrait" ? "active" : ""}`}
+          onClick={() => setOrientation("portrait")}
+        >
+          Portrait
+        </button>
+      </div>
+
       {cameras.length === 0 ? (
         <div className="placeholder">
           No camera sources yet. Add one in <b>Settings</b>, then come back here to watch the live feed.
         </div>
       ) : (
-        <div className="health-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: isPortrait
+              ? `repeat(${Math.min(cameras.length, 3)}, 1fr)`
+              : `repeat(${Math.min(cameras.length, 2)}, 1fr)`,
+            gap: 12,
+            flex: 1,
+            minHeight: 0,
+          }}
+        >
           {cameras.map((c) => (
-            <div key={c.id} className={`health-card ${c.status === "active" ? "ok" : "offline"}`} style={{ cursor: "pointer" }} onClick={() => setExpanded(c)}>
-              <div className="row between" style={{ alignItems: "center" }}>
-                <b>{c.label}</b>
-                <span className={`badge ${c.status === "active" ? "active" : "disabled"}`}>{c.status}</span>
+            <div
+              key={c.id}
+              className={`health-card ${c.status === "active" ? "ok" : "offline"}`}
+              style={{
+                cursor: "pointer",
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+              }}
+              onClick={() => setExpanded(c)}
+            >
+              <div className="row between" style={{ alignItems: "center", padding: "8px 10px 0" }}>
+                <b style={{ fontSize: 13 }}>{c.label}</b>
+                <span className={`badge ${c.status === "active" ? "active" : "disabled"}`} style={{ fontSize: 11 }}>
+                  {c.status}
+                </span>
               </div>
-              <div className="muted small" style={{ marginTop: 2 }}>
+              <div className="muted small" style={{ padding: "2px 10px" }}>
                 {c.source_type} · {c.connection_string}
               </div>
 
+              {/* Camera preview — fills available space */}
               <div
                 style={{
-                  margin: "10px 0",
-                  height: 120,
-                  borderRadius: 8,
+                  flex: 1,
+                  minHeight: 0,
+                  margin: "6px 6px",
+                  borderRadius: 6,
                   overflow: "hidden",
                   background: "#000",
                   display: "flex",
@@ -187,13 +231,7 @@ function LivePreviewTab({
                 <CameraThumb camera={c} previewUrl={previews[c.id]} />
               </div>
 
-              {c.last_connection_check_result && (
-                <div className="small muted" style={{ marginBottom: 6 }}>
-                  Last check: {c.last_connection_check_result}
-                </div>
-              )}
-
-              <div className="row" style={{ gap: 6 }}>
+              <div className="row" style={{ gap: 4, padding: "0 8px 8px" }}>
                 {online(c) ? (
                   <button
                     className="ghost small"
@@ -202,7 +240,7 @@ function LivePreviewTab({
                       onRun(() => api.setCameraSourceStatus(actor.id, c.id, "inactive"), "Feed paused.");
                     }}
                   >
-                    Pause feed
+                    Pause
                   </button>
                 ) : (
                   <button
@@ -212,7 +250,7 @@ function LivePreviewTab({
                       onRun(() => api.setCameraSourceStatus(actor.id, c.id, "active"), "Feed resumed.");
                     }}
                   >
-                    Resume feed
+                    Resume
                   </button>
                 )}
                 <button className="ghost small" onClick={(e) => { e.stopPropagation(); setExpanded(c); }}>
@@ -224,17 +262,41 @@ function LivePreviewTab({
         </div>
       )}
 
+      {/* Expanded fullscreen view */}
       {expanded && (
         <div className="overlay" onClick={() => setExpanded(null)}>
-          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              maxWidth: isPortrait ? "50vw" : "90vw",
+              height: isPortrait ? "85vh" : "75vh",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
             <div className="row between">
               <h3 style={{ marginTop: 0 }}>{expanded.label}</h3>
-              <button className="ghost" onClick={() => setExpanded(null)}>Close</button>
+              <div className="row" style={{ gap: 6 }}>
+                <button className="ghost small" onClick={() => setOrientation(isPortrait ? "landscape" : "portrait")}>
+                  {isPortrait ? "Landscape" : "Portrait"}
+                </button>
+                <button className="ghost" onClick={() => setExpanded(null)}>Close</button>
+              </div>
             </div>
             <div className="muted small" style={{ marginBottom: 8 }}>
               {expanded.source_type} — {expanded.connection_string}
             </div>
-            <div style={{ width: "100%", borderRadius: 8, overflow: "hidden", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{
+              flex: 1,
+              minHeight: 0,
+              borderRadius: 8,
+              overflow: "hidden",
+              background: "#000",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
               <CameraThumb camera={expanded} previewUrl={previews[expanded.id]} large />
             </div>
             {expanded.last_connection_check_result && (

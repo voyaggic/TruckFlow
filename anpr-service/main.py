@@ -57,42 +57,44 @@ PLATE_FORMAT = "K{:03d}{}{:02d}"  # Kenyan-style: K123AB45
 
 
 class OcrBackend:
-    """Abstraction over plate OCR. Tries easyocr -> paddleocr -> mock."""
+    """Abstraction over plate OCR. Tries paddleocr -> easyocr -> fallback."""
 
-    def __init__(self, force_mock: bool = False):
-        self.name = "mock"
+    def __init__(self):
+        self.name = "none"
         self.reader = None
         self.paddle = None
         self.model_version = None
-        if force_mock:
-            return
-        try:
-            import easyocr  # type: ignore
-
-            self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-            self.name = "easyocr"
-            self.model_version = "easyocr-en"
-            return
-        except Exception:
-            pass
+        # Try PaddleOCR first (faster, better for plates)
         try:
             from paddleocr import PaddleOCR  # type: ignore
 
             self.paddle = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
             self.name = "paddleocr"
             self.model_version = "paddleocr-en"
+            print("[OCR] Using PaddleOCR")
             return
-        except Exception:
-            pass
-        self.name = "mock"
+        except Exception as e:
+            print(f"[OCR] PaddleOCR not available: {e}")
+        # Fallback to EasyOCR
+        try:
+            import easyocr  # type: ignore
+
+            self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+            self.name = "easyocr"
+            self.model_version = "easyocr-en"
+            print("[OCR] Using EasyOCR")
+            return
+        except Exception as e:
+            print(f"[OCR] EasyOCR not available: {e}")
+        print("[OCR] WARNING: No OCR engine available!")
 
     def read(self, frame: np.ndarray) -> list[tuple[str, float]]:
         """Return [(plate_text, confidence)] for the plates visible in frame."""
-        if self.name == "mock":
-            return self._mock_read(frame)
+        if self.paddle is not None:
+            return self._paddle_read(frame)
         if self.reader is not None:
             return self._easyocr_read(frame)
-        return self._paddle_read(frame)
+        return []
 
     def _easyocr_read(self, frame: np.ndarray) -> list[tuple[str, float]]:
         results = []
@@ -119,19 +121,7 @@ class OcrBackend:
             pass
         return results
 
-    # A deterministic synthetic plate so the whole pipeline (tracking,
-    # finalization, /latest, evidence frames) is runnable with zero OCR
-    # dependencies. The plate is derived from the frame hash, so the same
-    # region in the same video yields a stable reading — enough to demo
-    # tracking and dedup end to end.
-    def _mock_read(self, frame: np.ndarray) -> list[tuple[str, float]]:
-        gray = frame.mean(axis=2) if frame.ndim == 3 else frame
-        small = gray[::8, ::8]
-        h = int(hash(small.tobytes()) % 0xFFFFFFF)
-        plate = PLATE_FORMAT.format(h % 1000, chr(65 + (h // 1000) % 26), h % 100)
-        # One "vehicle" per frame region with varied confidence.
-        conf = 0.55 + (h % 30) / 100.0
-        return [(plate, conf)]
+
 
 
 # ---------------------------------------------------------------------------
@@ -746,13 +736,26 @@ class Pipeline:
             trackers_snapshot = [(row.id, tuple(int(v) for v in row.bbox)) for row in self.sort.trackers]
             readings_snapshot = dict(self.readings)
         for tid, slot in readings_snapshot.items():
-            color = (80, 220, 120) if slot.plate else (220, 180, 60)
+            # Green box if plate detected, yellow if tracking only
+            color = (0, 255, 0) if slot.plate else (0, 200, 255)
+            thickness = 3 if slot.plate else 2
             for t_id, (x1, y1, x2, y2) in trackers_snapshot:
                 if t_id == tid:
-                    cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-                    label = f"#{tid} {slot.plate or '...'}"
-                    cv2.putText(out, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+                    # Label with plate and confidence
+                    if slot.plate:
+                        label = f"{slot.plate} ({slot.confidence:.0%})"
+                    else:
+                        label = f"Tracking #{tid}..."
+                    # Draw label background for readability
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(out, (x1, y1 - th - 10), (x1 + tw + 4, y1), color, -1)
+                    cv2.putText(out, label, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
                     break
+        # FPS counter
+        fps = self.frames_processed / max(1.0, time.time() - self.start_time)
+        cv2.putText(out, f"FPS: {fps:.1f}  Frames: {self.frames_processed}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         return out
 
 
@@ -817,7 +820,10 @@ def serve(pipeline: Pipeline, port: int) -> None:
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
             elif path == "/preview":
                 self._stream_mjpeg()
             else:
@@ -886,14 +892,13 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def get_source_from_config() -> tuple[str, str, bool]:
+def get_source_from_config() -> tuple[str, str]:
     """Read the camera source from config.json.
-    Returns (source_url, source_type, mock_mode)."""
+    Returns (source_url, source_type)."""
     cfg = load_config()
     source = cfg.get("source", "http://127.0.0.1:8080/videofeed")
     source_type = cfg.get("source_type") or infer_type(source)
-    mock = cfg.get("mock", False)
-    return source, source_type, mock
+    return source, source_type
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -901,7 +906,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--source", default=None, help="rtsp://…, http://…, video file path, or usb:N (overrides config.json)")
     p.add_argument("--type", default=None, choices=["rtsp", "http", "video_file", "usb", "live_test"], help="override source type inference")
     p.add_argument("--port", type=int, default=9800)
-    p.add_argument("--mock", action="store_true", help="force the deterministic mock OCR (no model downloads)")
     return p.parse_args(argv)
 
 
@@ -911,16 +915,12 @@ def main() -> None:
     if args.source:
         source = args.source
         source_type = args.type or infer_type(source)
-        mock = args.mock
     else:
-        source, source_type, mock = get_source_from_config()
+        source, source_type = get_source_from_config()
         if args.type:
             source_type = args.type
-        if args.mock:
-            mock = True
     print(f"Camera source: {source} ({source_type})")
-    ocr = OcrBackend(force_mock=mock)
-    print(f"OCR backend: {ocr.name}" + ("  (real engines not installed — mock readings)" if ocr.name == "mock" else ""))
+    ocr = OcrBackend()
     pipeline = Pipeline(source, source_type, ocr, args.port)
 
     capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
