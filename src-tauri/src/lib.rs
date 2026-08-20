@@ -118,6 +118,8 @@ pub fn run() {
             capture::purge_declined,
             capture::classify_discharge,
             capture::trip_frames,
+            capture::list_detection_images,
+            capture::load_detection_image,
             capture::write_anpr_config,
             capture::start_anpr_service,
             capture::stop_anpr_service,

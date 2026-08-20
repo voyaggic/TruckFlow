@@ -459,6 +459,12 @@ export const api = {
 
   tripFrames: (tripId: string) => invoke<FrameEvidence[]>("trip_frames", { tripId }),
 
+  // --- Detection Image Browser ---
+  listDetectionImages: (limit?: number) =>
+    invoke<{ trip_id: string; kind: string; filename: string; size_bytes: number; modified: string }[]>("list_detection_images", { limit }),
+  loadDetectionImage: (tripId: string, kind: string, filename: string) =>
+    invoke<string>("load_detection_image", { tripId, kind, filename }),
+
   // --- ANPR Service Management ---
   writeAnprConfig: (actorId: string, sourceUrl: string, sourceType?: string, mock?: boolean) =>
     invoke<string>("write_anpr_config", { actorId, sourceUrl, sourceType, mock }),

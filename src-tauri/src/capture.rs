@@ -1798,3 +1798,75 @@ fn stop_anpr_service_inner(state: &State<AppState>) -> Result<usize, String> {
     }
     Ok(count)
 }
+
+/// List recent detection images from the frames directory.
+/// Returns a list of {trip_id, kind, file, base64} for browsing.
+#[tauri::command]
+pub fn list_detection_images(
+    state: State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<DetectionImage>, String> {
+    let max = limit.unwrap_or(50);
+    let mut images = Vec::new();
+    if !state.frames_dir.exists() {
+        return Ok(images);
+    }
+    // Walk the frames directory: frames_dir/<trip_id>/<entry|exit>/<file.jpg>
+    let entries = std::fs::read_dir(&state.frames_dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let trip_id = entry.file_name().to_string_lossy().to_string();
+        if !entry.path().is_dir() { continue; }
+        let Ok(kind_iter) = std::fs::read_dir(entry.path()) else { continue };
+        for kind_dir in kind_iter.flatten() {
+            let kind = kind_dir.file_name().to_string_lossy().to_string();
+            if !kind_dir.path().is_dir() { continue; }
+            let Ok(file_iter) = std::fs::read_dir(kind_dir.path()) else { continue };
+            for file in file_iter.flatten() {
+                let fname = file.file_name().to_string_lossy().to_string();
+                let meta = std::fs::metadata(file.path()).ok();
+                images.push(DetectionImage {
+                    trip_id: trip_id.clone(),
+                    kind: kind.clone(),
+                    filename: fname,
+                    size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    modified: meta.and_then(|m| m.modified().ok())
+                        .map(|t| {
+                            let d: chrono::DateTime<chrono::Utc> = t.into();
+                            d.to_rfc3339()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+    }
+    // Sort by modified desc and limit
+    images.sort_by(|a, b| b.modified.cmp(&a.modified));
+    images.truncate(max);
+    Ok(images)
+}
+
+#[derive(serde::Serialize)]
+pub struct DetectionImage {
+    pub trip_id: String,
+    pub kind: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub modified: String,
+}
+
+/// Load a single detection image as base64 for preview.
+#[tauri::command]
+pub fn load_detection_image(
+    state: State<AppState>,
+    trip_id: String,
+    kind: String,
+    filename: String,
+) -> Result<String, String> {
+    let path = state.frames_dir.join(&trip_id).join(&kind).join(&filename);
+    if !path.exists() {
+        return Err("Image not found".to_string());
+    }
+    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+}
