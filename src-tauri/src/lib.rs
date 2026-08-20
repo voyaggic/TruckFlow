@@ -180,6 +180,26 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// Find the anpr-service directory by trying multiple known locations.
+fn find_anpr_dir() -> std::path::PathBuf {
+    // Try current dir (dev mode from project root)
+    if let Ok(dir) = std::env::current_dir() {
+        let p = dir.join("anpr-service");
+        if p.exists() { return p; }
+    }
+    // Try hardcoded dev path
+    let dev = std::path::PathBuf::from(r"D:\Exhauster project\TruckFlow\anpr-service");
+    if dev.exists() { return dev; }
+    // Try relative to exe
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join("anpr-service");
+            if p.exists() { return p; }
+        }
+    }
+    dev // fallback even if not found — will error later
+}
+
 /// Auto-start the ANPR service on app launch. Finds the first active camera,
 /// writes config.json, spawns the Python process, and sets anpr_source=http.
 fn auto_start_anpr(state: &AppState) -> Result<(), String> {
@@ -198,10 +218,8 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     println!("[ANPR] Auto-starting with {source_type}: {connection_string}");
 
     // Write config.json for the ANPR service
-    let config_path = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join("anpr-service")
-        .join("config.json");
+    let anpr_dir = find_anpr_dir();
+    let config_path = anpr_dir.join("config.json");
     let cfg = serde_json::json!({
         "source": connection_string,
         "source_type": source_type,
@@ -210,7 +228,6 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
         .map_err(|e| format!("Failed to write config.json: {e}"))?;
 
     // Spawn the ANPR service process
-    let anpr_dir = std::env::current_dir().map_err(|e| e.to_string())?.join("anpr-service");
     let mut cmd = std::process::Command::new("python");
     cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
     cmd.current_dir(&anpr_dir);
