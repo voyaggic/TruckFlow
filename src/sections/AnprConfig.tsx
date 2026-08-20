@@ -1023,7 +1023,7 @@ function EngineTab({
       <div className="row">
         <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
           <input style={{ width: "auto" }} type="checkbox" checked={isCapturePoint} onChange={(e) => setIsCapturePoint(e.target.checked)} />
-          <span>This machine is a capture point</span>
+          <span>Auto-start ANPR on app launch (capture point)</span>
         </label>
         <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
           <input style={{ width: "auto" }} type="checkbox" checked={confirmRequired} onChange={(e) => setConfirmRequired(e.target.checked)} />

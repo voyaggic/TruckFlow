@@ -221,7 +221,7 @@ pub fn login_password(state: State<AppState>, username: String, password: String
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let row = conn
         .query_row(
-            "SELECT id, name, auth_type, credential_hash, status, revoked_by, must_change_password FROM users WHERE name = ?1",
+            "SELECT id, name, auth_type, credential_hash, status, revoked_by, must_change_password, failed_login_attempts, locked_until FROM users WHERE name = ?1",
             params![username.trim()],
             |r| {
                 Ok((
@@ -232,10 +232,24 @@ pub fn login_password(state: State<AppState>, username: String, password: String
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .map_err(|_| "Incorrect username or password.".to_string())?;
+
+    // --- Brute-force lockout check (audit §2.2) ---
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if let Some(ref locked_until) = row.8 {
+        if locked_until > &now {
+            append_audit(&conn, &row.0, "login_blocked_lockout", None, Some(serde_json::json!({ "name": row.1 })))?;
+            return Err(format!("Account temporarily locked due to too many failed attempts. Try again after {}.", &locked_until[..16].replace('T', " ")));
+        }
+        // Lock period expired — reset the counter
+        conn.execute("UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?1", params![row.0])
+            .map_err(|e| e.to_string())?;
+    }
 
     if row.4 != "active" {
         if row.4 == "deleted" {
@@ -255,8 +269,31 @@ pub fn login_password(state: State<AppState>, username: String, password: String
         return Err(msg);
     }
     if !verify_credential(&row.3, &password) {
+        // Increment failed attempts; lock after 5 failures for 15 minutes
+        let attempts = row.7 + 1;
+        if attempts >= 5 {
+            let lockout_until = (chrono::Utc::now() + chrono::Duration::minutes(15))
+                .format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            conn.execute(
+                "UPDATE users SET failed_login_attempts = ?1, locked_until = ?2 WHERE id = ?3",
+                params![attempts, lockout_until, row.0],
+            ).map_err(|e| e.to_string())?;
+            append_audit(&conn, &row.0, "login_locked", None, Some(serde_json::json!({ "name": row.1, "attempts": attempts })))?;
+            return Err("Account temporarily locked due to too many failed attempts. Try again in 15 minutes.".to_string());
+        } else {
+            conn.execute(
+                "UPDATE users SET failed_login_attempts = ?1 WHERE id = ?2",
+                params![attempts, row.0],
+            ).map_err(|e| e.to_string())?;
+            append_audit(&conn, &row.0, "login_failed", None, Some(serde_json::json!({ "name": row.1, "attempts": attempts })))?;
+        }
         return Err("Incorrect username or password.".to_string());
     }
+    // Successful login — reset failed attempts
+    conn.execute(
+        "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?1",
+        params![row.0],
+    ).map_err(|e| e.to_string())?;
     let id = row.0.clone();
     *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
         user_id: id.clone(),

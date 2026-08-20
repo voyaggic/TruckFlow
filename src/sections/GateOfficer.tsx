@@ -40,8 +40,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
   const [sync, setSync] = useState<SyncStatusView | null>(null);
   const [query, setQuery] = useState("");
   const [manualPlate, setManualPlate] = useState("");
-  const [simPlate, setSimPlate] = useState("");
-  const [simConf, setSimConf] = useState("0.95");
+
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [resolving, setResolving] = useState<TripView | null>(null);
@@ -147,19 +146,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     }
   };
 
-  const simulate = async () => {
-    setError(null);
-    const plate = simPlate.trim();
-    if (!plate) return;
-    try {
-      const res = await api.simulateRead(plate, parseFloat(simConf) || 0.95);
-      setFlash(res.message);
-      setTimeout(() => setFlash(null), 2500);
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+
 
   const toggleConsent = async () => {
     if (!settings) return;
@@ -333,7 +320,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
           </div>
         ) : (
           <div className="placeholder" style={{ marginTop: 12 }}>
-            No entries yet today. Capture one with the simulator or log via Manual Entry.
+            No entries yet today. Capture via the ANPR camera or log via Manual Entry.
           </div>
         )}
       </div>
@@ -357,32 +344,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
             Runs the same cross-reference logic as the camera. Works with ANPR fully offline.
           </p>
         </div>
-        <div className="card">
-          <h3 style={{ margin: "0 0 10px", fontSize: 15 }}>Simulator (dev)</h3>
-          <div className="row">
-            <input
-              className="plate-input"
-              value={simPlate}
-              onChange={(e) => setSimPlate(e.target.value.toUpperCase())}
-              onKeyDown={(e) => e.key === "Enter" && simulate()}
-              placeholder={label("vehicle", "plate_number")}
-            />
-            <input
-              style={{ width: 70 }}
-              value={simConf}
-              onChange={(e) => setSimConf(e.target.value)}
-              placeholder="0.95"
-            />
-            <button className="ghost" onClick={simulate} disabled={!simPlate.trim()}>
-              Simulate read
-            </button>
-          </div>
-          {anpr && (
-            <p className="muted small" style={{ marginBottom: 0 }}>
-              Queue: {anpr.pending_reads} pending · last: {anpr.last_plate ? `${anpr.last_plate} @ ${fmtTime(anpr.last_read_at ?? "")}` : "none"}
-            </p>
-          )}
-        </div>
+
       </div>
 
       <div className="card">

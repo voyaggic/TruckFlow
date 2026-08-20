@@ -206,6 +206,17 @@ fn find_anpr_dir() -> std::path::PathBuf {
 /// writes config.json, spawns the Python process, and sets anpr_source=http.
 fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // Check if this machine is configured as a capture point
+    let is_capture: i64 = conn
+        .query_row(
+            "SELECT COALESCE(is_capture_point, 0) FROM anpr_config LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if is_capture == 0 {
+        return Err("This machine is not a capture point. Enable it in ANPR Settings.".to_string());
+    }
     // Find the first active camera source
     let camera = conn
         .query_row(

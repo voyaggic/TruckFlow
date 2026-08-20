@@ -737,6 +737,36 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 22 {
+        // Brute-force login protection (audit §2.2): track failed attempts
+        // per user and lock accounts after 5 consecutive failures for 15 minutes.
+        let col_defs: Vec<(&str, &str, Option<&str>)> = vec![
+            ("failed_login_attempts", "INTEGER", Some("NOT NULL DEFAULT 0")),
+            ("locked_until", "TEXT", None),
+        ];
+        for (col_name, col_type, col_default) in &col_defs {
+            let exists = conn
+                .prepare("PRAGMA table_info(users)")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map([], |r| r.get::<_, String>(1))
+                        .ok()
+                        .map(|rows| rows.filter_map(|r| r.ok()).any(|c| c == *col_name))
+                })
+                .unwrap_or(false);
+            if !exists {
+                let default_clause = col_default.map(|d| format!(" {d}")).unwrap_or_default();
+                conn.execute_batch(&format!(
+                    "ALTER TABLE users ADD COLUMN {} {}{};",
+                    col_name, col_type, default_clause
+                ))
+                .map_err(|e| format!("migration 22 add {} failed: {}", col_name, e))?;
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 22;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
