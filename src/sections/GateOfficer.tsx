@@ -31,7 +31,7 @@ function reasonLabel(reason: string, entityLabel: string): string {
   }
 }
 
-export default function GateOfficer({ user, canResolve }: { user: SessionUser; canResolve: boolean }) {
+export default function GateOfficer({ user, canResolve, canRegisterVehicle, canEditTrip }: { user: SessionUser; canResolve: boolean; canRegisterVehicle: boolean; canEditTrip: boolean }) {
   const { label, entityLabel } = useReferenceFields();
   const [today, setToday] = useState<TripView[]>([]);
   const [queued, setQueued] = useState<TripView[]>([]);
@@ -286,16 +286,38 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                 <div className="muted small">Officer</div>
                 <div>{current.officer_name ?? "—"}</div>
               </div>
-            </div>
-            {current.status === "queued" && current.reason === "pending_approval" && canResolve && (
+            </div>            {current.status === "queued" && current.reason === "pending_approval" && (
               <div className="row" style={{ marginTop: 14 }}>
-                <button className="primary" onClick={() => approve(current)}>
-                  Approve
-                </button>
-                <button onClick={() => openResolve(current)}>Edit before confirming</button>
-                <button className="danger" onClick={() => setDeclineTarget(current)}>
-                  Decline read
-                </button>
+                {canResolve ? (
+                  <button className="primary" onClick={() => approve(current)}>
+                    Approve
+                  </button>
+                ) : (
+                  <button className="primary" disabled title="Only gate officers can approve">
+                    Approve ⛔
+                  </button>
+                )}
+                {canEditTrip ? (
+                  <button onClick={() => openResolve(current)}>Edit before confirming</button>
+                ) : (
+                  <button disabled title="Only gate officers can edit trips">
+                    Edit ⛔
+                  </button>
+                )}
+                {canResolve ? (
+                  <button className="danger" onClick={() => setDeclineTarget(current)}>
+                    Decline read
+                  </button>
+                ) : (
+                  <button className="danger" disabled title="Only gate officers can decline">
+                    Decline ⛔
+                  </button>
+                )}
+                {!canResolve && canRegisterVehicle && (
+                  <button onClick={() => { setResolving(current); }}>
+                    Register new vehicle
+                  </button>
+                )}
               </div>
             )}
             {current.status === "logged" &&
@@ -529,6 +551,8 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
           trip={resolving}
           officerId={user.id}
           onClose={() => setResolving(null)}
+          canRegisterVehicle={canRegisterVehicle}
+          canEditTrip={canEditTrip}
           onDecline={(t) => {
             setResolving(null);
             setDeclineTarget(t);
@@ -580,12 +604,16 @@ function ResolveScreen({
   onClose,
   onDecline,
   onDone,
+  canRegisterVehicle,
+  canEditTrip,
 }: {
   trip: TripView;
   officerId: string;
   onClose: () => void;
   onDecline: (trip: TripView) => void;
   onDone: (message: string, trip: TripView | null) => Promise<void>;
+  canRegisterVehicle: boolean;
+  canEditTrip: boolean;
 }) {
   const { label, entityLabel, fieldsFor } = useReferenceFields();
   const vehicleDefs = fieldsFor("vehicle");
@@ -864,18 +892,42 @@ function ResolveScreen({
             </div>
 
             <div className="row" style={{ marginTop: 14, gap: 8 }}>
-              <button className="primary" onClick={confirmExisting} disabled={busy || !selectedVehicleId}>
-                Confirm & log trip
-              </button>
-              <button className="ghost" onClick={() => setRegisterNew(true)} disabled={busy}>
-                New {entityLabel("vehicle").toLowerCase()} / none of these
-              </button>
-              <button className="danger" onClick={() => setConfirmingDiscard(true)} disabled={busy}>
-                Discard
-              </button>
-              <button className="danger" onClick={() => onDecline(trip)} disabled={busy}>
-                Decline read
-              </button>
+              {canEditTrip ? (
+                <button className="primary" onClick={confirmExisting} disabled={busy || !selectedVehicleId}>
+                  Confirm & log trip
+                </button>
+              ) : (
+                <button className="primary" disabled title="Only gate officers can confirm trips">
+                  Confirm ⛔
+                </button>
+              )}
+              {canRegisterVehicle ? (
+                <button className="ghost" onClick={() => setRegisterNew(true)} disabled={busy}>
+                  New {entityLabel("vehicle").toLowerCase()} / none of these
+                </button>
+              ) : (
+                <button className="ghost" disabled title="Only admins can register new vehicles">
+                  New vehicle ⛔
+                </button>
+              )}
+              {canEditTrip ? (
+                <button className="danger" onClick={() => setConfirmingDiscard(true)} disabled={busy}>
+                  Discard
+                </button>
+              ) : (
+                <button className="danger" disabled title="Only gate officers can discard">
+                  Discard ⛔
+                </button>
+              )}
+              {canEditTrip ? (
+                <button className="danger" onClick={() => onDecline(trip)} disabled={busy}>
+                  Decline read
+                </button>
+              ) : (
+                <button className="danger" disabled title="Only gate officers can decline">
+                  Decline ⛔
+                </button>
+              )}
               <button className="ghost" onClick={onClose} disabled={busy}>
                 Skip / resolve later
               </button>
@@ -960,9 +1012,15 @@ function ResolveScreen({
               <div className="warn-banner">
                 {dupWarning}
                 <div className="row" style={{ marginTop: 8, gap: 8 }}>
-                  <button className="primary" onClick={() => registerAndLog(true)} disabled={busy}>
-                    Attach to existing vehicle instead
-                  </button>
+                  {canEditTrip ? (
+                    <button className="primary" onClick={() => registerAndLog(true)} disabled={busy}>
+                      Attach to existing vehicle instead
+                    </button>
+                  ) : (
+                    <button className="primary" disabled title="Only gate officers can confirm trips">
+                      Attach ⛔
+                    </button>
+                  )}
                   <button className="ghost" onClick={() => setDupWarning(null)} disabled={busy}>
                     Edit plate
                   </button>
@@ -971,9 +1029,15 @@ function ResolveScreen({
             )}
 
             <div className="row" style={{ marginTop: 14, gap: 8 }}>
-              <button className="primary" onClick={() => registerAndLog(false)} disabled={busy || !newPlate.trim()}>
-                Register & log trip
-              </button>
+              {canRegisterVehicle ? (
+                <button className="primary" onClick={() => registerAndLog(false)} disabled={busy || !newPlate.trim()}>
+                  Register & log trip
+                </button>
+              ) : (
+                <button className="primary" disabled title="Only admins can register new vehicles">
+                  Register ⛔
+                </button>
+              )}
               <button className="ghost" onClick={() => setRegisterNew(false)} disabled={busy}>
                 ← Back to matches
               </button>

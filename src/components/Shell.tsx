@@ -19,6 +19,9 @@ const PERM = {
   manageIntegrations: "manage_integrations",
   manageAnprConfig: "manage_anpr_config",
   viewAudit: "view_audit_log",
+  registerNewVehicle: "register_new_vehicle",
+  exportReporting: "export_reporting",
+  editTrip: "edit_trip",
 };
 
 export function hasPerm(user: SessionUser, key: string): boolean {
@@ -63,7 +66,7 @@ export default function Shell({
 
   const tabs: Tab[] = [];
   if (hasPerm(user, PERM.gateEntries)) {
-    tabs.push({ id: "gate", label: "Gate", render: () => <GateOfficer user={user} canResolve={hasPerm(user, PERM.queue)} /> });
+    tabs.push({ id: "gate", label: "Gate", render: () => <GateOfficer user={user} canResolve={hasPerm(user, PERM.queue)} canRegisterVehicle={hasPerm(user, PERM.registerNewVehicle)} canEditTrip={hasPerm(user, PERM.editTrip)} /> });
   }
   if (hasPerm(user, PERM.reporting)) {
     tabs.push({ id: "reporting", label: "Reporting", render: () => <Reporting user={user} /> });

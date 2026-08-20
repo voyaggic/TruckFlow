@@ -811,16 +811,20 @@ pub const PERMISSION_CATALOG: &[(&str, &str, &str, &str)] = &[
     ("perm-manage-anpr-config", "manage_anpr_config", "password", "Configure the ANPR engine, models, camera sources and thresholds"),
     ("perm-view-audit-log", "view_audit_log", "password", "View the audit log"),
     ("perm-edit-existing-vehicles", "edit_existing_vehicles", "pin", "Edit existing vehicles in the reference database"),
+    ("perm-register-new-vehicle", "register_new_vehicle", "pin", "Register new vehicles from the Gate page"),
+    ("perm-export-reporting", "export_reporting", "pin", "Export reporting data (CSV/PDF)"),
+    ("perm-edit-trip", "edit_trip", "pin", "Edit trip details before confirming"),
     ("perm-acknowledge-health-alerts", "acknowledge_health_alerts", "pin", "Acknowledge system health alerts"),
     ("perm-view-health-history", "view_health_history", "pin", "View system health incident history"),
 ];
 
 pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
-    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles"]),
+    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles", "edit_trip"]),
     (
         "preset-admin",
         "Admin",
         &[
+            "register_new_vehicle",
             "manage_users",
             "manage_reference_database",
             "view_audit_log",
@@ -828,11 +832,10 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
             "manage_anpr_config",
             "view_reporting_dashboard",
             "view_system_health",
-            "resolve_queue",
             "view_gate_entries",
         ],
     ),
-    ("preset-reporting", "Reporting", &["view_reporting_dashboard"]),
+    ("preset-reporting", "Reporting", &["view_reporting_dashboard", "export_reporting"]),
     (
         "preset-system-monitor",
         "System Monitor",
