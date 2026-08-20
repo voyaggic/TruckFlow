@@ -980,7 +980,7 @@ pub fn list_today_trips(state: State<AppState>) -> Result<Vec<TripView>, String>
     let from = format!("{day}T00:00:00Z");
     let mut stmt = conn
         .prepare(&format!(
-            "{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status != 'declined' ORDER BY t.time_in DESC LIMIT 200"
+            "{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status != 'declined' AND t.archived = 0 ORDER BY t.time_in DESC LIMIT 200"
         ))
         .map_err(|e| format!("trip list failed: {e}"))?;
     let rows = stmt
@@ -995,6 +995,7 @@ pub fn list_today_trips(state: State<AppState>) -> Result<Vec<TripView>, String>
 pub fn export_today_csv(
     state: State<AppState>,
     actor_id: String,
+    target_path: String,
     trip_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -1055,13 +1056,29 @@ pub fn export_today_csv(
         ));
     }
 
-    let dir = state.frames_dir.parent().unwrap_or(std::path::Path::new(".")).join("exports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("export dir failed: {e}"))?;
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let path = dir.join(format!("gate-export-{ts}.csv"));
+    let path = std::path::PathBuf::from(&target_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("export dir failed: {e}"))?;
+    }
     std::fs::write(&path, csv).map_err(|e| format!("export write failed: {e}"))?;
     crate::db::append_audit(&conn, &actor_id, "exported_gate_entries", None, Some(serde_json::json!({ "count": rows.len(), "path": path.to_string_lossy() })))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Archive a single trip (soft-delete).
+#[tauri::command]
+pub fn archive_trip(
+    state: State<AppState>,
+    actor_id: String,
+    trip_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE trips SET archived = 1, updated_at = ?1 WHERE id = ?2",
+        params![crate::db::now_iso(), trip_id],
+    ).map_err(|e| format!("archive trip failed: {e}"))?;
+    crate::db::append_audit(&conn, &actor_id, "archived_trip", Some(&trip_id), None)?;
+    Ok(())
 }
 
 /// Clear today's trips for the gate officer (soft-delete to archive).

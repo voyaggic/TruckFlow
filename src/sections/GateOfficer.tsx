@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../lib/api";
 import { useReferenceFields } from "../lib/referenceFields";
 import { DynamicFieldInput, MEASUREMENT_UNIT_GROUPS } from "./AdminPanel";
@@ -412,8 +413,13 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
               disabled={filtered.length === 0}
               onClick={async () => {
                 try {
+                  const filePath = await save({
+                    defaultPath: `gate-export-${new Date().toISOString().slice(0, 10)}.csv`,
+                    filters: [{ name: "CSV", extensions: ["csv"] }],
+                  });
+                  if (!filePath) return;
                   const ids = filtered.map((t) => t.id);
-                  const path = await api.exportTodayCsv(user.id, ids);
+                  const path = await api.exportTodayCsv(user.id, filePath, ids);
                   setFlash(`Exported ${filtered.length} entries → ${path}`);
                   setTimeout(() => setFlash(null), 4000);
                 } catch (e) {
@@ -461,6 +467,7 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                 <th>Status</th>
                 <th>Type</th>
                 <th>Officer</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -492,6 +499,22 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                     )}
                   </td>
                   <td className="muted small">{t.officer_name ?? "—"}</td>
+                  <td>
+                    <button
+                      className="ghost small"
+                      title="Archive this entry"
+                      onClick={async () => {
+                        try {
+                          await api.archiveTrip(user.id, t.id);
+                          await refresh();
+                        } catch (e) {
+                          setError(String(e));
+                        }
+                      }}
+                    >
+                      Archive
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>

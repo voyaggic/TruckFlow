@@ -99,6 +99,7 @@ pub fn run() {
             capture::list_today_trips,
             capture::search_trips,
             capture::export_today_csv,
+            capture::archive_trip,
             capture::clear_today_trips,
             capture::list_queued,
             capture::get_capture_settings,

@@ -365,8 +365,11 @@ export const api = {
 
   searchTrips: (query: string) => invoke<TripView[]>("search_trips", { query }),
 
-  exportTodayCsv: (actorId: string, tripIds?: string[]) =>
-    invoke<string>("export_today_csv", { actorId, tripIds: tripIds ?? null }),
+  exportTodayCsv: (actorId: string, targetPath: string, tripIds?: string[]) =>
+    invoke<string>("export_today_csv", { actorId, targetPath, tripIds: tripIds ?? null }),
+
+  archiveTrip: (actorId: string, tripId: string) =>
+    invoke<void>("archive_trip", { actorId, tripId }),
 
   clearTodayTrips: (actorId: string) =>
     invoke<number>("clear_today_trips", { actorId }),
