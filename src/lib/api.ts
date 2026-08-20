@@ -365,6 +365,12 @@ export const api = {
 
   searchTrips: (query: string) => invoke<TripView[]>("search_trips", { query }),
 
+  exportTodayCsv: (actorId: string, tripIds?: string[]) =>
+    invoke<string>("export_today_csv", { actorId, tripIds: tripIds ?? null }),
+
+  clearTodayTrips: (actorId: string) =>
+    invoke<number>("clear_today_trips", { actorId }),
+
   listQueued: () => invoke<TripView[]>("list_queued"),
 
   getCaptureSettings: () => invoke<CaptureSettings>("get_capture_settings"),

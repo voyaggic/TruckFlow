@@ -395,31 +395,72 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
       </div>
 
       <div className="card">
-        <div className="row between">
-          <h3 style={{ margin: 0, fontSize: 15 }}>Recent Entries</h3>
-          <input
-            style={{ width: 260 }}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search plate, company, time…"
-          />
+        <div className="row between" style={{ marginBottom: 8 }}>
+          <h3 style={{ margin: 0, fontSize: 15 }}>
+            Recent Entries
+            <span className="muted small" style={{ marginLeft: 8 }}>({filtered.length})</span>
+          </h3>
+          <div className="row" style={{ gap: 6 }}>
+            <input
+              style={{ width: 220 }}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search plate, company, time…"
+            />
+            <button
+              className="ghost small"
+              disabled={filtered.length === 0}
+              onClick={async () => {
+                try {
+                  const ids = filtered.map((t) => t.id);
+                  const path = await api.exportTodayCsv(user.id, ids);
+                  setFlash(`Exported ${filtered.length} entries → ${path}`);
+                  setTimeout(() => setFlash(null), 4000);
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+            >
+              Export CSV
+            </button>
+            <button
+              className="ghost small danger"
+              disabled={filtered.length === 0}
+              onClick={async () => {
+                if (!window.confirm(`Archive all ${filtered.length} recent entries? They can be restored later by an admin.`)) return;
+                try {
+                  const n = await api.clearTodayTrips(user.id);
+                  setFlash(`${n} entries archived`);
+                  setTimeout(() => setFlash(null), 2500);
+                  await refresh();
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+            >
+              Clear All
+            </button>
+          </div>
         </div>
         {filtered.length === 0 ? (
           <p className="muted small" style={{ margin: "10px 0 0" }}>
             No matching entries today.
           </p>
         ) : (
-          <table className="table" style={{ marginTop: 10 }}>
+          <div style={{ overflowX: "auto" }}>
+          <table className="table" style={{ marginTop: 0 }}>
             <thead>
               <tr>
                 <th>{label("vehicle", "plate_number")}</th>
                 <th>{label("vehicle", "company")}</th>
                 <th>{label("vehicle", "driver")}</th>
                 <th>{label("vehicle", "registered_capacity")}</th>
-                <th>Time</th>
+                <th>Entry</th>
+                <th>Exit</th>
                 <th>Source</th>
                 <th>Status</th>
                 <th>Type</th>
+                <th>Officer</th>
               </tr>
             </thead>
             <tbody>
@@ -428,8 +469,9 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                   <td className="plate-font">{t.plate_number}</td>
                   <td>{t.company_name ?? "—"}</td>
                   <td>{t.driver_name ?? "—"}</td>
-                  <td>{t.capacity_at_trip != null ? `${t.capacity_at_trip} t` : "—"}</td>
-                  <td>{fmtTime(t.time_in)}</td>
+                  <td>{t.capacity_at_trip != null ? `${t.capacity_at_trip} ${t.capacity_unit || "t"}` : "—"}</td>
+                  <td>{fmtTime(t.entry_time || t.time_in)}</td>
+                  <td>{t.exit_time ? fmtTime(t.exit_time) : <span className="muted small">open</span>}</td>
                   <td>
                     <span className={`badge ${t.capture_method === "auto" ? "pin" : "active"}`}>
                       {t.capture_method === "auto" ? "Auto" : "Manual"}
@@ -449,10 +491,12 @@ export default function GateOfficer({ user, canResolve }: { user: SessionUser; c
                       <span className="badge">Non-discharge</span>
                     )}
                   </td>
+                  <td className="muted small">{t.officer_name ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

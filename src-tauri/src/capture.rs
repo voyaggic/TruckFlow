@@ -990,6 +990,99 @@ pub fn list_today_trips(state: State<AppState>) -> Result<Vec<TripView>, String>
         .map_err(|e| format!("trip read failed: {e}"))
 }
 
+/// Export today's trips (or filtered subset) to a CSV file and return the path.
+#[tauri::command]
+pub fn export_today_csv(
+    state: State<AppState>,
+    actor_id: String,
+    trip_ids: Option<Vec<String>>,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let day = chrono::Utc::now().format("%Y-%m-%d");
+    let from = format!("{day}T00:00:00Z");
+    let sql = if trip_ids.as_ref().map_or(false, |v| !v.is_empty()) {
+        let placeholders: Vec<String> = (0..trip_ids.as_ref().unwrap().len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        format!(
+            "{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.id IN ({}) ORDER BY t.time_in DESC",
+            placeholders.join(", ")
+        )
+    } else {
+        format!("{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status != 'declined' ORDER BY t.time_in DESC")
+    };
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from.clone())];
+    if let Some(ref ids) = trip_ids {
+        for id in ids {
+            params.push(Box::new(id.clone()));
+        }
+    }
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("export query failed: {e}"))?;
+    let rows: Vec<TripView> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), read_trip)
+        .map_err(|e| format!("export query failed: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("export read failed: {e}"))?;
+
+    // Build CSV
+    let mut csv = String::from("Plate,Company,Driver,Capacity,Unit,Entry Time,Exit Time,Status,Type,Source,Officer\n");
+    let cell = |v: &str| -> String {
+        if v.contains([',', '"', '\n']) {
+            format!("\"{}\"", v.replace('"', "\"\""))
+        } else {
+            v.to_string()
+        }
+    };
+    for r in &rows {
+        let discharge = match r.is_discharge_trip {
+            Some(true) => "Discharge",
+            Some(false) => "Non-discharge",
+            None => "Unclassified",
+        };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            cell(&r.plate_number),
+            cell(r.company_name.as_deref().unwrap_or("—")),
+            cell(r.driver_name.as_deref().unwrap_or("—")),
+            r.capacity_at_trip.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+            cell(&r.capacity_unit),
+            cell(&r.entry_time),
+            cell(r.exit_time.as_deref().unwrap_or("")),
+            cell(&r.status),
+            cell(discharge),
+            cell(&r.capture_method),
+            cell(r.officer_name.as_deref().unwrap_or("—")),
+        ));
+    }
+
+    let dir = state.frames_dir.parent().unwrap_or(std::path::Path::new(".")).join("exports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("export dir failed: {e}"))?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let path = dir.join(format!("gate-export-{ts}.csv"));
+    std::fs::write(&path, csv).map_err(|e| format!("export write failed: {e}"))?;
+    crate::db::append_audit(&conn, &actor_id, "exported_gate_entries", None, Some(serde_json::json!({ "count": rows.len(), "path": path.to_string_lossy() })))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Clear today's trips for the gate officer (soft-delete to archive).
+#[tauri::command]
+pub fn clear_today_trips(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let day = chrono::Utc::now().format("%Y-%m-%d");
+    let from = format!("{day}T00:00:00Z");
+    let n = conn
+        .execute(
+            "UPDATE trips SET archived = 1, updated_at = ?1 WHERE time_in >= ?2 AND status != 'declined' AND archived = 0",
+            params![crate::db::now_iso(), from],
+        )
+        .map_err(|e| format!("clear trips failed: {e}"))?;
+    crate::db::append_audit(&conn, &actor_id, "cleared_gate_entries", None, Some(serde_json::json!({ "count": n })))?;
+    Ok(n as i64)
+}
+
 #[tauri::command]
 pub fn search_trips(state: State<AppState>, query: String) -> Result<Vec<TripView>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
