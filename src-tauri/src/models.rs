@@ -342,6 +342,17 @@ pub struct TablePending {
     pub pending: i64,
 }
 
+/// One column in the configurable Google Sheets export mapping.
+/// `field_key` identifies which trip data to send; `header` is the
+/// user-chosen column name in the sheet; `enabled` controls visibility.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SheetColumnEntry {
+    pub field_key: String,
+    pub header: String,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PgSyncStateView {

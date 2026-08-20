@@ -1289,6 +1289,24 @@ fn sa_email(service_account_json: &str) -> Result<String, String> {
         .ok_or("service account JSON is missing client_email".to_string())
 }
 
+/// Get the current server time from Google to avoid JWT failures when the
+/// local clock is skewed (which Google strictly rejects).
+fn google_server_time(client: &reqwest::blocking::Client) -> i64 {
+    // Hit any lightweight Google endpoint and parse the `Date` header.
+    // We intentionally ignore errors — the caller falls back to local time.
+    if let Ok(resp) = client.get("https://www.googleapis.com/").send() {
+        if let Some(date_str) = resp.headers().get("date") {
+            if let Ok(date_val) = date_str.to_str() {
+                // HTTP Date format: "Thu, 20 Aug 2026 02:16:28 GMT"
+                if let Ok(tm) = chrono::DateTime::parse_from_str(date_val, "%a, %d %b %Y %H:%M:%S %z") {
+                    return tm.timestamp();
+                }
+            }
+        }
+    }
+    chrono::Utc::now().timestamp()
+}
+
 /// Exchange the service account's signed JWT for an access token (RFC 7523).
 fn fetch_token(service_account_json: &str) -> Result<String, String> {
     let parsed: serde_json::Value =
@@ -1305,7 +1323,9 @@ fn fetch_token(service_account_json: &str) -> Result<String, String> {
         .as_str()
         .unwrap_or("https://oauth2.googleapis.com/token")
         .to_string();
-    let now = chrono::Utc::now().timestamp();
+    let client = http_client()?;
+    // Use Google's server time to avoid clock skew issues.
+    let now = google_server_time(&client);
     let claims = json!({
         "iss": email,
         "scope": "https://www.googleapis.com/auth/spreadsheets",
@@ -1314,11 +1334,14 @@ fn fetch_token(service_account_json: &str) -> Result<String, String> {
         "exp": now + 3600,
     });
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(key.as_bytes())
+    // Trim whitespace/newlines that may sneak in when the JSON is pasted.
+    let key_clean = key.trim().replace('\r', "");
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(key_clean.as_bytes())
         .map_err(|e| format!("invalid private key: {e}"))?;
     let jwt = jsonwebtoken::encode(&header, &claims, &encoding_key)
         .map_err(|e| format!("cannot sign JWT: {e}"))?;
-    let client = http_client()?;
+    eprintln!("[sheets-auth] JWT signed OK, email={email}, aud={token_uri}");
+    // Reuse the client created above for google_server_time.
     // The JWT is base64url (no characters needing form encoding).
     let body = format!("grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={jwt}");
     let resp = client
@@ -1326,10 +1349,20 @@ fn fetch_token(service_account_json: &str) -> Result<String, String> {
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .map_err(|e| format!("token request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("token request rejected: {e}"))?;
-    let resp_json: serde_json::Value = resp.json().map_err(|e| format!("token response unreadable: {e}"))?;
+        .map_err(|e| format!("token request failed: {e}"))?;
+    let status = resp.status();
+    let resp_text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        // Parse Google's error message for a helpful hint
+        if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
+            let msg = err_json.get("error_description").or(err_json.get("error"))
+                .and_then(|v| v.as_str()).unwrap_or(&resp_text);
+            return Err(format!("Google token error ({status}): {msg}"));
+        }
+        return Err(format!("Google token error ({status}): {resp_text}"));
+    }
+    let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+        .map_err(|e| format!("token response unreadable: {e} — raw: {resp_text}"))?;
     resp_json["access_token"]
         .as_str()
         .map(|s| s.to_string())
