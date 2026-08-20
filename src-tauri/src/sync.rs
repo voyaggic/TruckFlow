@@ -423,11 +423,57 @@ pub fn default_sheet_mapping() -> Vec<crate::models::SheetColumnEntry> {
         .collect()
 }
 
-/// Read the current sheet column mapping (from settings, or defaults).
+/// Read the current sheet column mapping (from settings, or defaults)
+/// and merge any custom parent fields from field_definitions so they
+/// appear as available sheet columns.
 pub fn read_sheet_mapping(conn: &Connection) -> Vec<crate::models::SheetColumnEntry> {
-    get_setting(conn, "sheet_column_mapping")
+    use crate::models::SheetColumnEntry;
+    let mut mapping: Vec<SheetColumnEntry> = get_setting(conn, "sheet_column_mapping")
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(default_sheet_mapping)
+        .unwrap_or_else(default_sheet_mapping);
+    // Collect existing field_keys so we don't duplicate built-in entries.
+    let existing: std::collections::HashSet<String> = mapping.iter().map(|e| e.field_key.clone()).collect();
+    // Add custom parent fields from field_definitions that aren't already present.
+    let custom_fields = list_custom_sheet_fields(conn);
+    for (key, label) in custom_fields {
+        if !existing.contains(&key) {
+            mapping.push(SheetColumnEntry {
+                field_key: key,
+                header: label,
+                enabled: false, // disabled by default — user must opt in
+            });
+        }
+    }
+    mapping
+}
+
+/// Query field_definitions for custom parent fields that can be exported
+/// as sheet columns. These are fields whose entity_type has a parent in
+/// the trip query (e.g. vehicle custom fields stored in extra_fields).
+fn list_custom_sheet_fields(conn: &Connection) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for entity_type in &["vehicle", "company", "driver"] {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT field_key, field_label FROM field_definitions
+             WHERE entity_type = ?1 AND is_standard = 0 AND is_hidden = 0
+             ORDER BY sort_order, field_label",
+        ) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(params![entity_type], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
+        let collected: Vec<(String, String)> = rows.flatten().collect();
+        for (key, label) in collected {
+            result.push((
+                format!("{entity_type}_extra_{}", key),
+                format!("{label} ({entity_type})"),
+            ));
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -524,7 +570,10 @@ fn sheet_trip_rows_filtered(conn: &Connection, has_sheet_row: bool) -> Result<Ve
                 t.capture_method, t.is_discharge_trip, t.created_at,
                 COALESCE(c.name, '') AS company, COALESCE(d.name, '') AS driver,
                 u.name AS officer_name, t.model_version, t.ocr_engine, t.status,
-                t.sheet_row
+                t.sheet_row,
+                v.extra_fields AS vehicles_extra,
+                c.extra_fields AS companies_extra,
+                d.extra_fields AS drivers_extra
          FROM trips t
          LEFT JOIN vehicles v ON v.id = t.vehicle_id
          LEFT JOIN companies c ON c.id = t.company_id
@@ -560,11 +609,22 @@ fn sheet_trip_rows_filtered(conn: &Connection, has_sheet_row: bool) -> Result<Ve
                 "ocr_engine": r.get::<_, Option<String>>(16)?,
                 "status": r.get::<_, String>(17)?,
                 "sheet_row": r.get::<_, Option<i64>>(18)?,
+                "vehicles_extra": parse_extra_field_json(r.get::<_, Option<String>>(19)?),
+                "companies_extra": parse_extra_field_json(r.get::<_, Option<String>>(20)?),
+                "drivers_extra": parse_extra_field_json(r.get::<_, Option<String>>(21)?),
             }))
         })
         .map_err(|e| format!("sheet rows failed: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("sheet rows failed: {e}"))
+}
+
+/// Parse a JSON string from the extra_fields column into a serde_json::Value.
+fn parse_extra_field_json(raw: Option<String>) -> serde_json::Value {
+    match raw.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        Some(v) => v,
+        None => json!({}),
+    }
 }
 
 /// Push all logged-but-unsynced trips to the sheet and flip `pushed_to_sheets`
@@ -1390,27 +1450,17 @@ fn sheet_meta(token: &str, sheet_id: &str) -> Result<String, String> {
         .ok_or("the spreadsheet has no first tab".to_string())
 }
 
-/// Write the header row once, when the sheet's A1 cell is empty.
+/// Always overwrite the header row in the sheet to match the current mapping.
+/// This runs on every sync cycle so that reordered/renamed/disabled columns
+/// and newly added custom fields are reflected immediately.
 fn ensure_headers(token: &str, sheet_id: &str, tab: &str, mapping: &[crate::models::SheetColumnEntry]) -> Result<(), String> {
     let client = http_client()?;
     let range = format!("{tab}!A1");
-    let get_url = format!(
-        "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{}?majorDimension=ROWS",
-        urlenc(&range)
-    );
-    let resp = client
-        .get(&get_url)
-        .bearer_auth(token)
-        .send()
-        .map_err(|e| format!("cannot read sheet header: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("sheet header read rejected: {e}"))?;
-    let j: serde_json::Value = resp.json().map_err(|e| format!("sheet header unreadable: {e}"))?;
-    let a1_empty = j["values"][0][0].as_str().map(|s| s.is_empty()).unwrap_or(true);
-    if !a1_empty {
+    let headers: Vec<serde_json::Value> = mapping.iter().filter(|e| e.enabled).map(|e| json!(e.header)).collect();
+    if headers.is_empty() {
         return Ok(());
     }
-    let headers: Vec<serde_json::Value> = mapping.iter().filter(|e| e.enabled).map(|e| json!(e.header)).collect();
+    // Always write headers — this keeps the sheet in sync with the mapping.
     let body = json!({ "range": range, "majorDimension": "ROWS", "values": vec![headers] });
     let put_url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{}?valueInputOption=RAW",
@@ -1470,6 +1520,34 @@ fn field_key_to_value(row: &serde_json::Value, field_key: &str) -> serde_json::V
         "model_version" => opt_str(row.get("model_version")),
         "ocr_engine" => opt_str(row.get("ocr_engine")),
         "status" => opt_str(row.get("status")),
+        // Custom parent fields: vehicle_extra_<key>, company_extra_<key>, driver_extra_<key>
+        k if k.starts_with("vehicle_extra_") || k.starts_with("company_extra_") || k.starts_with("driver_extra_") => {
+            extract_extra_field(row, k)
+        }
+        _ => json!(""),
+    }
+}
+
+/// Extract a custom field value from the extra_fields JSON blob stored on
+/// a row. The field_key format is `<entity>_extra_<field_key>`.
+fn extract_extra_field(row: &serde_json::Value, field_key: &str) -> serde_json::Value {
+    let (entity, raw_key) = if let Some(rest) = field_key.strip_prefix("vehicle_extra_") {
+        ("vehicles_extra", rest)
+    } else if let Some(rest) = field_key.strip_prefix("company_extra_") {
+        ("companies_extra", rest)
+    } else if let Some(rest) = field_key.strip_prefix("driver_extra_") {
+        ("drivers_extra", rest)
+    } else {
+        return json!("");
+    };
+    match row.get(entity) {
+        Some(serde_json::Value::Object(map)) => match map.get(raw_key) {
+            Some(serde_json::Value::String(s)) => json!(s),
+            Some(serde_json::Value::Number(n)) => json!(n.to_string()),
+            Some(serde_json::Value::Bool(b)) => json!(if *b { "Yes" } else { "No" }),
+            Some(other) => json!(other.to_string()),
+            None => json!(""),
+        },
         _ => json!(""),
     }
 }
