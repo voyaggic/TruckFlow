@@ -307,6 +307,10 @@ export interface TrainingCandidateView {
   reason: "low_confidence" | "human_corrected";
   used_in_model_version_id: string | null;
   created_at: string;
+  confidence: number | null;
+  ocr_engine: string | null;
+  captured_at: string | null;
+  capture_method: string | null;
 }
 
 // ---------------------------------------------------------------------------

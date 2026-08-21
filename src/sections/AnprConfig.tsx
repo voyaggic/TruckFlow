@@ -1772,15 +1772,18 @@ function CandidatePanel({
         <div className="stack" style={{ gap: 8 }}>
           {candidates.map((c) => (
             <div key={c.id} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 10, background: "var(--surface)" }}>
-              <div className="row between" style={{ gap: 10 }}>
+              <div
+                className="row between"
+                style={{ gap: 10, cursor: "pointer" }}
+                onClick={() => setExpandedFrame(expandedFrame === c.id ? null : c.id)}
+              >
                 <div className="row" style={{ gap: 10, alignItems: "center", flex: 1 }}>
                   {/* Frame thumbnail */}
                   {c.frame_ref && (
                     <img
                       src={convertFileSrc(c.frame_ref)}
                       alt="Frame"
-                      style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 4, cursor: "pointer", border: "1px solid var(--border)" }}
-                      onClick={() => setExpandedFrame(expandedFrame === c.id ? null : c.id)}
+                      style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 4, border: "1px solid var(--border)" }}
                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                     />
                   )}
@@ -1788,26 +1791,74 @@ function CandidatePanel({
                     <div className="row" style={{ gap: 6, alignItems: "center" }}>
                       <span className="plate-font">{c.plate_number ?? "—"}</span>
                       <span className="badge">{c.reason}</span>
+                      {c.confidence != null && (
+                        <span className="badge" style={{ background: c.confidence >= 0.7 ? "var(--success)" : c.confidence >= 0.5 ? "var(--warning, #f59e0b)" : "var(--danger)", color: "#fff" }}>
+                          {(c.confidence * 100).toFixed(1)}%
+                        </span>
+                      )}
                     </div>
                     <div className="muted small" style={{ marginTop: 2 }}>
                       {c.source_trip_id ? `Trip ${c.source_trip_id.slice(0, 8)}` : "Manual upload"} · {new Date(c.created_at).toLocaleString()}
                     </div>
                   </div>
                 </div>
-                <div className="row" style={{ gap: 4 }}>
-                  <button className="ghost small" onClick={() => handleApprove(c.id)}>Approve</button>
-                  <button className="ghost small" style={{ color: "var(--danger)" }} onClick={() => handleReject(c.id)}>Reject</button>
+                <div className="row" style={{ gap: 4, alignItems: "center" }}>
+                  <span className="muted small">{expandedFrame === c.id ? "▲" : "▼"}</span>
+                  <button className="ghost small" onClick={(e) => { e.stopPropagation(); handleApprove(c.id); }}>Approve</button>
+                  <button className="ghost small" style={{ color: "var(--danger)" }} onClick={(e) => { e.stopPropagation(); handleReject(c.id); }}>Reject</button>
                 </div>
               </div>
-              {/* Expanded frame view */}
-              {expandedFrame === c.id && c.frame_ref && (
-                <div style={{ marginTop: 8, textAlign: "center" }}>
-                  <img
-                    src={convertFileSrc(c.frame_ref)}
-                    alt="Expanded frame"
-                    style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 4, border: "1px solid var(--border)" }}
-                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                  />
+              {/* Expanded details — full info + captured frame */}
+              {expandedFrame === c.id && (
+                <div style={{ marginTop: 10, padding: 10, background: "var(--surface-2)", borderRadius: 6, border: "1px solid var(--border)" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
+                    <div>
+                      <div className="muted small">Plate</div>
+                      <div style={{ fontWeight: 600, fontFamily: "monospace" }}>{c.plate_number ?? "—"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Confidence</div>
+                      <div style={{ fontWeight: 600 }}>{c.confidence != null ? `${(c.confidence * 100).toFixed(1)}%` : "—"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">OCR Engine</div>
+                      <div style={{ fontWeight: 600 }}>{c.ocr_engine ?? "—"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Capture method</div>
+                      <div style={{ fontWeight: 600 }}>{c.capture_method ?? "—"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Captured at</div>
+                      <div style={{ fontWeight: 600 }}>{c.captured_at ? new Date(c.captured_at).toLocaleString() : "—"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Reason</div>
+                      <div style={{ fontWeight: 600 }}>{c.reason === "low_confidence" ? "Low confidence read" : "Human corrected"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Source trip</div>
+                      <div style={{ fontWeight: 600, fontFamily: "monospace", fontSize: 12 }}>{c.source_trip_id ?? "Manual upload"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Added</div>
+                      <div style={{ fontWeight: 600 }}>{new Date(c.created_at).toLocaleString()}</div>
+                    </div>
+                  </div>
+                  {/* Captured frame — mandatory display */}
+                  {c.frame_ref ? (
+                    <div style={{ textAlign: "center" }}>
+                      <div className="muted small" style={{ marginBottom: 4 }}>Captured frame:</div>
+                      <img
+                        src={convertFileSrc(c.frame_ref)}
+                        alt="Captured frame"
+                        style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 4, border: "1px solid var(--border)" }}
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="muted small" style={{ textAlign: "center", padding: 12 }}>No frame image available</div>
+                  )}
                 </div>
               )}
             </div>

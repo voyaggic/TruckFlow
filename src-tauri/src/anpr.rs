@@ -701,7 +701,8 @@ pub fn list_training_candidates(state: State<AppState>) -> Result<Vec<TrainingCa
     let mut stmt = conn
         .prepare(
             "SELECT tc.id, tc.source_trip_id, v.plate_number,
-                    tc.frame_ref, tc.reason, tc.used_in_model_version_id, tc.created_at
+                    tc.frame_ref, tc.reason, tc.used_in_model_version_id, tc.created_at,
+                    t.confidence_score, t.ocr_engine, t.entry_time, t.capture_method
              FROM training_candidates tc
              LEFT JOIN trips t ON t.id = tc.source_trip_id
              LEFT JOIN vehicles v ON v.id = t.vehicle_id
@@ -718,6 +719,10 @@ pub fn list_training_candidates(state: State<AppState>) -> Result<Vec<TrainingCa
                 reason: r.get(4)?,
                 used_in_model_version_id: r.get(5)?,
                 created_at: r.get(6)?,
+                confidence: r.get(7)?,
+                ocr_engine: r.get(8)?,
+                captured_at: r.get(9)?,
+                capture_method: r.get(10)?,
             })
         })
         .map_err(|e| format!("training candidate list failed: {e}"))?;
@@ -757,6 +762,10 @@ pub fn add_training_candidate(
         reason: "manual_upload".into(),
         used_in_model_version_id: None,
         created_at: now,
+        confidence: None,
+        ocr_engine: None,
+        captured_at: None,
+        capture_method: Some("manual".into()),
     })
 }
 

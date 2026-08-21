@@ -345,6 +345,14 @@ pub struct TrainingCandidateView {
     pub reason: String,
     pub used_in_model_version_id: Option<String>,
     pub created_at: String,
+    /// Confidence score from the source trip (0.0–1.0)
+    pub confidence: Option<f64>,
+    /// OCR engine that produced this read
+    pub ocr_engine: Option<String>,
+    /// Entry timestamp of the source trip
+    pub captured_at: Option<String>,
+    /// Capture method (auto/manual)
+    pub capture_method: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

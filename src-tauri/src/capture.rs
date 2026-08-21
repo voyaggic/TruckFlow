@@ -1726,66 +1726,50 @@ use std::process::{Command as StdCommand, Stdio};
 /// Find a working Python executable by trying common names.
 /// Returns the first one that resolves to an actual file.
 fn find_python() -> String {
-    let candidates = if cfg!(target_os = "windows") {
-        vec!["python.exe", "python3.exe", "py.exe"]
-    } else {
-        vec!["python3", "python"]
-    };
-    for name in &candidates {
-        // Use `where` on Windows to find the full path
-        #[cfg(target_os = "windows")]
-        {
-            if let Ok(output) = StdCommand::new("where").arg(name).output() {
-                if output.status.success() {
-                    let out = String::from_utf8_lossy(&output.stdout);
-                    if let Some(first_line) = out.lines().next() {
-                        let path = first_line.trim().to_string();
-                        if std::path::Path::new(&path).exists() {
-                            eprintln!("[ANPR] Found Python at: {path}");
-                            return path;
-                        }
-                    }
-                }
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Ok(output) = StdCommand::new("which").arg(name).output() {
-                if output.status.success() {
-                    let out = String::from_utf8_lossy(&output.stdout);
-                    if let Some(first_line) = out.lines().next() {
-                        let path = first_line.trim().to_string();
-                        if std::path::Path::new(&path).exists() {
-                            return path;
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback: try running the command directly (works if it's in PATH)
-        if let Ok(output) = StdCommand::new(name).arg("--version").output() {
-            if output.status.success() {
-                return name.to_string();
-            }
-        }
-    }
-    // Last resort — try common install paths on Windows
+    // Probe known Python paths directly — no dependency on `where`/`which`
+    // or the system PATH, which may differ in the Tauri app context.
     #[cfg(target_os = "windows")]
     {
-        let common_paths = [
-            r"C:\Python312\python.exe",
-            r"C:\Python311\python.exe",
-            r"C:\Python310\python.exe",
-            r"C:\Users\*\AppData\Local\Programs\Python\Python3*\python.exe",
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let probe: Vec<String> = vec![
+            // Standard Python.org installer (per-user)
+            format!(r"{local}\Programs\Python\Python313\python.exe"),
+            format!(r"{local}\Programs\Python\Python312\python.exe"),
+            format!(r"{local}\Programs\Python\Python311\python.exe"),
+            format!(r"{local}\Programs\Python\Python310\python.exe"),
+            // System-wide installs
+            r"C:\Python313\python.exe".into(),
+            r"C:\Python312\python.exe".into(),
+            r"C:\Python311\python.exe".into(),
+            r"C:\Python310\python.exe".into(),
+            // Python in PATH
+            "python.exe".into(),
+            "python3.exe".into(),
+            "py.exe".into(),
         ];
-        for pattern in &common_paths {
-            if let Ok(output) = StdCommand::new(pattern).arg("--version").output() {
-                if output.status.success() {
-                    return pattern.to_string();
+        for path in &probe {
+            if let Ok(out) = StdCommand::new(path).arg("--version").output() {
+                if out.status.success() {
+                    let ver = String::from_utf8_lossy(&out.stdout);
+                    eprintln!("[ANPR] Found Python: {path} ({ver})");
+                    return path.clone();
                 }
             }
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let probe = ["python3", "python"];
+        for name in &probe {
+            if let Ok(out) = StdCommand::new(name).arg("--version").output() {
+                if out.status.success() {
+                    eprintln!("[ANPR] Found Python: {name}");
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    eprintln!("[ANPR] WARNING: No Python found!");
     "python".to_string()
 }
 
@@ -1907,7 +1891,12 @@ pub fn start_anpr_service(
     cmd.stdout(Stdio::from(log_file));
     cmd.stderr(Stdio::from(log_file2));
 
-    let child = cmd.spawn().map_err(|e| format!("Failed to start ANPR service: {e}"))?;
+    eprintln!("[ANPR] Spawning: {python_cmd} -u main.py --port 9800 (dir: {})", anpr_dir.display());
+    let child = cmd.spawn().map_err(|e| {
+        let msg = format!("Failed to start ANPR service: {e} (python: {python_cmd}, dir: {})", anpr_dir.display());
+        eprintln!("[ANPR] {msg}");
+        msg
+    })?;
     let pid = child.id();
 
     // Store the child handle
