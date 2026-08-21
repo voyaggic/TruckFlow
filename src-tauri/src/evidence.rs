@@ -13,6 +13,21 @@ use serde_json::Value;
 
 use crate::models::{AnprFrame, FrameEvidence};
 
+/// Returns the default frames directory (app_data_dir/frames).
+/// Used by migration code that doesn't have access to AppState.
+pub fn default_frames_dir() -> PathBuf {
+    // Mirrors the logic in db::init_state: app_data_dir().join("frames")
+    // On Windows: C:\Users\<user>\AppData\Roaming\com.truckflow.app\frames
+    // On Linux: ~/.local/share/com.truckflow.app/frames
+    if let Some(home) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        home.join("com.truckflow.app").join("frames")
+    } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        home.join(".local").join("share").join("com.truckflow.app").join("frames")
+    } else {
+        PathBuf::from("frames")
+    }
+}
+
 const PLACEHOLDER_PNGS: &[&str] = &[
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAANSURBVBhXY+CNXv8fAAOnAhfSo4paAAAAAElFTkSuQmCC",
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAANSURBVBhXY+ArmfAfAAO4AhKkJl85AAAAAElFTkSuQmCC",
@@ -51,7 +66,7 @@ pub fn persist_frames(frames_dir: &Path, trip_id: &str, frames: &[AnprFrame], ki
             "index": frame.index,
             "captured_at": frame.captured_at,
             "kind": frame.kind,
-            "file": format!("{trip_id}/{kind}/{file}"),
+            "file": trip_dir.join(&file).to_string_lossy().to_string(),
         }));
     }
     serde_json::to_string(&entries).map_err(|e| format!("photo_refs serialize failed: {e}"))

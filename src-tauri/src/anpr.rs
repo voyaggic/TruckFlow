@@ -1241,3 +1241,60 @@ pub fn anpr_diagnostics(state: State<AppState>) -> Result<AnprDiagnosticsView, S
         error_log,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Per-user, per-machine auto-start preference
+// ---------------------------------------------------------------------------
+
+/// Get the current user's auto-start preference for this machine.
+#[tauri::command]
+pub fn get_user_auto_start(state: State<AppState>, actor_id: String) -> Result<bool, String> {
+    let info = get_machine_info()?;
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let enabled: bool = conn
+        .query_row(
+            "SELECT COALESCE(enabled, 0) FROM user_anpr_auto_start WHERE user_id = ?1 AND machine_id = ?2",
+            params![actor_id, info.machine_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    Ok(enabled)
+}
+
+/// Set (or clear) the current user's auto-start preference for this machine.
+#[tauri::command]
+pub fn set_user_auto_start(
+    state: State<AppState>,
+    actor_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let info = get_machine_info()?;
+    let now = crate::db::now_iso();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO user_anpr_auto_start (user_id, machine_id, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(user_id, machine_id) DO UPDATE SET enabled = ?3, updated_at = ?4",
+        params![actor_id, info.machine_id, enabled as i32, now],
+    )
+    .map_err(|e| format!("failed to save auto-start preference: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        if enabled { "enabled_anpr_auto_start" } else { "disabled_anpr_auto_start" },
+        None,
+        Some(json!({ "machine_id": info.machine_id, "enabled": enabled })),
+    )?;
+    Ok(())
+}
+
+/// Check if ANY user has auto-start enabled for this machine.
+/// Returns the first matching user_id (used by auto_start_anpr).
+pub fn any_auto_start_for_machine(conn: &Connection, machine_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT user_id FROM user_anpr_auto_start WHERE machine_id = ?1 AND enabled = 1 LIMIT 1",
+        params![machine_id],
+        |r| r.get(0),
+    )
+    .ok()
+}

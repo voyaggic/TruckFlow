@@ -811,6 +811,58 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    // ── Migration 25: user_anpr_auto_start table ───────────────────────────
+    if current < 25 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS user_anpr_auto_start (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                machine_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, machine_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_uas_machine ON user_anpr_auto_start(machine_id);",
+        )
+        .map_err(|e| format!("migration 25 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 25;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // ── Migration 26: Backfill training_candidates.frame_ref to absolute ────
+    if current < 26 {
+        // Get the frames directory from the app data dir
+        let frames_dir = crate::evidence::default_frames_dir();
+        let frames_str = frames_dir.to_string_lossy();
+        let all: Vec<(String, String)> = conn
+            .prepare("SELECT id, frame_ref FROM training_candidates")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        let mut backfilled = 0i64;
+        for (id, frame_ref) in &all {
+            // If the path is not absolute, prepend frames_dir
+            if !std::path::Path::new(frame_ref).is_absolute() {
+                let abs = format!("{}/{}", frames_str.trim_end_matches('/'), frame_ref.trim_start_matches('/'));
+                conn.execute(
+                    "UPDATE training_candidates SET frame_ref = ?1 WHERE id = ?2",
+                    params![abs, id],
+                )
+                .ok();
+                backfilled += 1;
+            }
+        }
+        if backfilled > 0 {
+            println!("[DB] Migration 26: backfilled {backfilled} training candidate frame_ref paths to absolute");
+        }
+        conn.execute_batch("PRAGMA user_version = 26;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 

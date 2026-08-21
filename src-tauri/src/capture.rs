@@ -1725,7 +1725,7 @@ use std::process::{Command as StdCommand, Stdio};
 
 /// Find a working Python executable by trying common names.
 /// Returns the first one that resolves to an actual file.
-fn find_python() -> String {
+pub fn find_python() -> String {
     // Probe known Python paths directly — no dependency on `where`/`which`
     // or the system PATH, which may differ in the Tauri app context.
     #[cfg(target_os = "windows")]
@@ -1773,11 +1773,6 @@ fn find_python() -> String {
     "python".to_string()
 }
 
-/// Path to the ANPR service config.json (written by the app, read by the service)
-fn anpr_config_path() -> String {
-    let base = std::env::current_dir().unwrap_or_default();
-    base.join("anpr-service").join("config.json").to_string_lossy().to_string()
-}
 
 /// Write the ANPR service config.json so it picks up the active camera source.
 #[tauri::command]
@@ -1824,11 +1819,24 @@ pub fn write_anpr_config(
         "cloud_api_url": cloud_api_url,
         "cloud_api_key": cloud_api_key,
     });
-    let path = anpr_config_path();
-    fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
+    // Use find_anpr_dir() (which walks up ancestor directories) instead of the
+    // old anpr_config_path() helper that only checked current_dir — the old
+    // helper broke when cargo tauri dev set cwd to src-tauri instead of the
+    // project root, producing "os error 3 (path not found)".
+    let anpr_dir = crate::find_anpr_dir();
+    if !anpr_dir.exists() {
+        return Err(format!(
+            "ANPR service directory not found: {}. Make sure anpr-service/ exists in the project root.",
+            anpr_dir.display()
+        ));
+    }
+    let config_path = anpr_dir.join("config.json");
+    let path_str = config_path.to_string_lossy().to_string();
+    fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
+        .map_err(|e| format!("Failed to write config.json to {}: {e}", config_path.display()))?;
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     append_audit(&conn, &actor_id, "wrote_anpr_config", None, Some(serde_json::json!({"source": source_url})))?;
-    Ok(path)
+    Ok(path_str)
 }
 
 /// Start the ANPR service process. Returns the PID.

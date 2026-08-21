@@ -1082,6 +1082,7 @@ function EngineTab({
   const [saveImages, setSaveImages] = useState(config.save_recognition_images);
   const [retrain, setRetrain] = useState(config.retrain_candidate_threshold?.toString() ?? "");
   const [isCapturePoint, setIsCapturePoint] = useState(config.is_capture_point);
+  const [userAutoStart, setUserAutoStart] = useState(false);
   const [preferCloud, setPreferCloud] = useState(config.prefer_cloud);
   const [confirmingSwap, setConfirmingSwap] = useState(false);
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null);
@@ -1103,11 +1104,12 @@ function EngineTab({
     setPreferCloud(config.prefer_cloud);
   }, [config]);
 
-  // Load machine info on mount
+  // Load machine info and user auto-start preference on mount
   useEffect(() => {
     api.getMachineInfo().then(setMachineInfo).catch(() => undefined);
     api.checkMachineMatch().then(setMachineMatch).catch(() => undefined);
-  }, []);
+    api.getUserAutoStart(actor.id).then(setUserAutoStart).catch(() => undefined);
+  }, [actor.id]);
 
   const num = (v: string, fallback: number) => {
     const n = Number(v);
@@ -1316,13 +1318,24 @@ function EngineTab({
       <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, background: "var(--surface-2)" }}>
         <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>Machine & Auto-Start</div>
         <p className="muted small" style={{ marginTop: -4, marginBottom: 10 }}>
-          Auto-start only triggers on the designated machine. If you share the same account across multiple PCs,
-          each machine can be individually designated.
+          Enable auto-start for your account on this specific computer. Each user on each machine
+          controls their own preference independently.
         </p>
         <div className="row" style={{ gap: 8, alignItems: "center", marginBottom: 10 }}>
           <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
-            <input style={{ width: "auto" }} type="checkbox" checked={isCapturePoint} onChange={(e) => setIsCapturePoint(e.target.checked)} />
-            <span>Auto-start ANPR on app launch (capture point)</span>
+            <input
+              style={{ width: "auto" }}
+              type="checkbox"
+              checked={userAutoStart}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setUserAutoStart(next);
+                api.setUserAutoStart(actor.id, next)
+                  .then(() => undefined)
+                  .catch((err) => { setUserAutoStart(!next); alert(`Failed: ${err}`); });
+              }}
+            />
+            <span>Auto-start ANPR on this machine for my account</span>
           </label>
         </div>
         {machineInfo && (

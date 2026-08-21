@@ -162,6 +162,8 @@ pub fn run() {
             anpr::set_anpr_machine,
             anpr::get_anpr_machine,
             anpr::check_machine_match,
+            anpr::get_user_auto_start,
+            anpr::set_user_auto_start,
             sync::sync_status,
             sync::sync_now_pg,
             sync::connect_google_sheets,
@@ -204,71 +206,74 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// Find the anpr-service directory by trying multiple known locations.
+/// Find the anpr-service directory.
+///
+/// Walks up the directory tree from two starting points:
+///   1. The process working directory  (covers `cargo tauri dev` where cwd = src-tauri,
+///      which walks up one level to the project root that contains anpr-service/).
+///   2. The directory that contains the running executable  (covers installed production
+///      builds where anpr-service/ sits next to the .exe, and debug builds run from
+///      target/debug/ which walk up through target/ → src-tauri/ → project root).
+///
+/// This approach is entirely path-agnostic: it never hard-codes any machine-specific
+/// or environment-specific paths, so it works the same in dev, CI, and production.
 pub fn find_anpr_dir() -> std::path::PathBuf {
-    // Try current dir (dev mode from project root)
-    if let Ok(dir) = std::env::current_dir() {
-        let p = dir.join("anpr-service");
-        if p.exists() { return p; }
+    fn walk_up(start: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut dir = start.to_path_buf();
+        loop {
+            let candidate = dir.join("anpr-service");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        None
     }
-    // Try relative to exe
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent.join("anpr-service");
-            if p.exists() { return p; }
+
+    // 1. Walk up from the current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(p) = walk_up(&cwd) {
+            return p;
         }
     }
-    // Try next to the source directory during development
-    if let Ok(dir) = std::env::current_dir() {
-        let p = dir.join("src-tauri").join("anpr-service");
-        if p.exists() { return p; }
+
+    // 2. Walk up from the directory that contains the running executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            if let Some(p) = walk_up(exe_dir) {
+                return p;
+            }
+        }
     }
-    std::path::PathBuf::from("anpr-service") // fallback — will error later
+
+    // Neither walk found anything — return a relative path so the caller gets
+    // a clear "directory not found" error message rather than a silent panic.
+    std::path::PathBuf::from("anpr-service")
 }
 
 /// Auto-start the ANPR service on app launch. Finds the first active camera,
 /// writes config.json, spawns the Python process, and sets anpr_source=http.
-/// Only auto-starts if the current machine matches the designated machine
-/// (or no machine is designated).
+/// Only auto-starts if ANY user has enabled auto-start for this machine.
+/// Machine fingerprint identifies the computer; per-user preferences determine
+/// who gets auto-start on their own machines.
 fn auto_start_anpr(state: &AppState) -> Result<(), String> {
+    let machine_info = anpr::get_machine_info().unwrap_or_else(|_| anpr::MachineInfo {
+        hostname: "unknown".to_string(),
+        mac_address: "unknown".to_string(),
+        machine_id: "unknown".to_string(),
+    });
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    // Check if this machine is configured as a capture point
-    let is_capture: i64 = conn
-        .query_row(
-            "SELECT COALESCE(is_capture_point, 0) FROM anpr_config LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if is_capture == 0 {
-        return Err("This machine is not a capture point. Enable it in ANPR Settings.".to_string());
+    // Check per-user auto-start preference for this machine
+    let auto_start_user: Option<String> = anpr::any_auto_start_for_machine(&conn, &machine_info.machine_id);
+    if auto_start_user.is_none() {
+        return Err(format!(
+            "No user has enabled auto-start on this machine ({}). Enable it in ANPR Settings.",
+            machine_info.hostname
+        ));
     }
-
-    // Check machine fingerprint: only auto-start if current machine matches
-    // the designated machine (or no machine is designated)
-    let designated: Option<String> = conn
-        .query_row(
-            "SELECT designated_machine_id FROM anpr_config WHERE id = ?1",
-            params![crate::db::ANPR_CONFIG_ID],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    drop(conn);
-
-    if let Some(designated_id) = designated {
-        let current_info = anpr::get_machine_info().unwrap_or_else(|_| anpr::MachineInfo {
-            hostname: "unknown".to_string(),
-            mac_address: "unknown".to_string(),
-            machine_id: "unknown".to_string(),
-        });
-        if current_info.machine_id != designated_id {
-            return Err(format!(
-                "This machine ({}) does not match the designated ANPR machine. Auto-start skipped.",
-                current_info.hostname
-            ));
-        }
-    }
+    println!("[ANPR] Auto-start triggered by user {} on machine {}", auto_start_user.unwrap_or_default(), machine_info.hostname);
 
     // Read cloud/settings from database
     let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -328,16 +333,16 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
         .map_err(|e| format!("Failed to write config.json: {e}"))?;
 
-    // Spawn the ANPR service process
-    let mut cmd = std::process::Command::new("python");
-    cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
+    // Spawn the ANPR service process (same fix as start_anpr_service)
+    let python_cmd = capture::find_python();
+    let main_py = anpr_dir.join("main.py");
+    println!("[ANPR] python={python_cmd} main={}", main_py.display());
+    let mut cmd = std::process::Command::new(&python_cmd);
+    cmd.arg("-u").arg(&main_py).arg("--port").arg("9800");
     cmd.current_dir(&anpr_dir);
-    let log_path = anpr_dir.join("anpr.log");
-    let log_file = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    let log_file2 = log_file.try_clone().map_err(|e| e.to_string())?;
-    cmd.stdout(std::process::Stdio::from(log_file));
-    cmd.stderr(std::process::Stdio::from(log_file2));
-    let child = cmd.spawn().map_err(|e| format!("Failed to start ANPR: {e}"))?;
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let child = cmd.spawn().map_err(|e| format!("Failed to start ANPR: {e} (python: {python_cmd}, dir: {})", anpr_dir.display()))?;
     let pid = child.id();
     println!("[ANPR] Service started (PID {pid})");
 

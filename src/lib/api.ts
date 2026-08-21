@@ -591,6 +591,10 @@ export const api = {
 
   checkMachineMatch: () => invoke<boolean>("check_machine_match"),
 
+  getUserAutoStart: (actorId: string) => invoke<boolean>("get_user_auto_start", { actorId }),
+
+  setUserAutoStart: (actorId: string, enabled: boolean) => invoke("set_user_auto_start", { actorId, enabled }),
+
   // --- Sync & integrations (Phase 4, gated on manage_integrations) ---
 
   syncStatus: () => invoke<SyncStatusView>("sync_status"),
