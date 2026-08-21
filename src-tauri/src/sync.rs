@@ -343,6 +343,116 @@ fn pending_for_table(conn: &Connection, table: &str) -> Result<i64, String> {
         .map_err(|e| format!("{table} count failed: {e}"))
 }
 
+/// Pull reference data (companies, vehicles, drivers) from central DB.
+/// Uses last-edit-wins-by-timestamp: if the central row is newer than the
+/// local row, the central version wins. Local edits that haven't been pushed
+/// yet are preserved (they'll push on next sync).
+const REFERENCE_TABLES: &[&str] = &["companies", "drivers", "vehicles"];
+
+pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<PullResult, String> {
+    if !pg.connected() {
+        return Ok(PullResult { pulled: 0, tables: vec![] });
+    }
+    let last_pull = get_setting(conn, "pg_last_pulled_at").unwrap_or_default();
+    let mut total_pulled = 0i64;
+    let mut tables = Vec::new();
+
+    for &table in REFERENCE_TABLES {
+        // Query central for rows newer than our last pull
+        let sql = format!(
+            "SELECT * FROM {} WHERE updated_at > $1 ORDER BY updated_at ASC",
+            pg_quote_ident(table)
+        );
+        let central_rows = pg.query_rows(&sql, &[last_pull.clone()])
+            .map_err(|e| format!("{table} pull failed: {e}"))?;
+
+        let mut pulled = 0i64;
+        for row in &central_rows {
+            let Some(obj) = row.as_object() else { continue };
+            let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() { continue }
+            let central_updated = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Check if local row exists and is newer (local edit wins)
+            let local_updated: Option<String> = conn
+                .query_row(
+                    &format!("SELECT updated_at FROM {} WHERE id = ?1", pg_quote_ident(table)),
+                    params![id],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            if let Some(ref local_ts) = local_updated {
+                if local_ts.as_str() >= central_updated {
+                    continue; // local is same age or newer — skip
+                }
+            }
+
+            // Upsert from central (central is newer)
+            upsert_row_from_central(conn, table, obj)?;
+            pulled += 1;
+        }
+        tables.push(TablePending {
+            table: table.to_string(),
+            display: table.to_string(),
+            pending: 0,
+        });
+        total_pulled += pulled;
+    }
+
+    set_setting(conn, "pg_last_pulled_at", &now_iso())?;
+    Ok(PullResult { pulled: total_pulled, tables })
+}
+
+fn upsert_row_from_central(conn: &Connection, table: &str, row: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let keys: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
+    if keys.is_empty() { return Ok(()) }
+
+    // Build column list and placeholders
+    let columns: Vec<String> = keys.iter().map(|k| pg_quote_ident(k)).collect();
+    let placeholders: Vec<String> = (1..=keys.len()).map(|i| format!("?{i}")).collect();
+    let update_clause: Vec<String> = keys.iter()
+        .filter(|k| **k != "id")
+        .map(|k| format!("{col} = excluded.{col}", col = pg_quote_ident(k)))
+        .collect();
+
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})
+         ON CONFLICT (id) DO UPDATE SET {}",
+        pg_quote_ident(table),
+        columns.join(", "),
+        placeholders.join(", "),
+        update_clause.join(", ")
+    );
+
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = keys.iter()
+        .map(|k| {
+            let val = row.get(*k).cloned().unwrap_or(serde_json::Value::Null);
+            match val {
+                serde_json::Value::String(s) => Box::new(s) as Box<dyn rusqlite::types::ToSql>,
+                serde_json::Value::Number(n) => {
+                    // Store all numbers as text to avoid i64/f64 type mismatch
+                    Box::new(n.to_string()) as Box<dyn rusqlite::types::ToSql>
+                }
+                serde_json::Value::Bool(b) => Box::new(b as i32),
+                serde_json::Value::Null => Box::new(rusqlite::types::Value::Null),
+                _ => Box::new(val.to_string()),
+            }
+        })
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    conn.execute(&sql, param_refs.as_slice())
+        .map_err(|e| format!("{table} upsert failed for id={}: {e}", row.get("id").unwrap_or(&serde_json::Value::Null)))?;
+    Ok(())
+}
+
+#[derive(Default)]
+pub struct PullResult {
+    pub pulled: i64,
+    pub tables: Vec<TablePending>,
+}
+
 pub fn pg_sync_state_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<PgSyncStateView, String> {
     let mut tables = Vec::new();
     for (name, display) in PG_SYNC_TABLES {
@@ -1019,10 +1129,18 @@ fn to_pg_param(v: &serde_json::Value, ty: &str) -> Box<dyn ToSql + Sync> {
 /// Connect to `cs`; if the database does not exist yet, create it first via
 /// the maintenance `postgres` database and reconnect. This makes setup as
 /// simple as "paste the connection string".
+fn make_tls_connector() -> postgres_native_tls::MakeTlsConnector {
+    let connector = native_tls::TlsConnector::builder()
+        .build()
+        .unwrap_or_else(|_| native_tls::TlsConnector::new().unwrap());
+    postgres_native_tls::MakeTlsConnector::new(connector)
+}
+
 fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
     let mut config: postgres::Config = cs.parse().map_err(|e| format!("invalid connection string: {e}"))?;
     config.connect_timeout(std::time::Duration::from_secs(6));
-    match config.connect(postgres::NoTls) {
+    let tls = make_tls_connector();
+    match config.connect(tls.clone()) {
         Ok(c) => Ok(c),
         Err(e) => {
             let is_missing_db = e.as_db_error().map(|d| d.message().contains("does not exist")).unwrap_or(false);
@@ -1035,7 +1153,7 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
                 .to_string();
             config.dbname("postgres");
             let mut admin = config
-                .connect(postgres::NoTls)
+                .connect(tls.clone())
                 .map_err(|ae| format!("cannot connect to the 'postgres' maintenance database: {ae}"))?;
             admin
                 .batch_execute(&format!("CREATE DATABASE {}", pg_quote_ident(&dbname)))
@@ -1043,7 +1161,7 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
             drop(admin);
             config.dbname(&dbname);
             config
-                .connect(postgres::NoTls)
+                .connect(tls)
                 .map_err(|e2| format!("cannot connect after creating database: {e2}"))
         }
     }
@@ -2218,8 +2336,14 @@ fn sheets_due(conn: &Connection, sheets: &dyn SheetsProvider) -> bool {
 /// the 10s loop never spams System Monitor.
 pub fn run_background_sync(conn: &Connection, pg: &dyn PostgresAdapter, sheets: &dyn SheetsProvider) {
     if pg.configured() {
+        // Push local changes to central
         if let Err(e) = run_pg_sync_impl(conn, pg) {
             let _ = crate::monitor::record_health_event(conn, "sync", "degraded", Some(&format!("PostgreSQL sync failed: {e}")));
+        }
+        // Pull reference data from central (companies, vehicles, drivers)
+        // Uses last-edit-wins-by-timestamp for conflict resolution
+        if let Err(e) = pull_reference_data(conn, pg) {
+            let _ = crate::monitor::record_health_event(conn, "sync", "degraded", Some(&format!("PostgreSQL pull failed: {e}")));
         }
     }
     if sheets.configured() && sheets_due(conn, sheets) {
