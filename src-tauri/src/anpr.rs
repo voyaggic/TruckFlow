@@ -997,8 +997,8 @@ fn generate_machine_id() -> MachineInfo {
     // Get MAC addresses via ipconfig (Windows) or ifconfig (Linux/Mac)
     let mac_address = get_primary_mac_address();
 
-    // Combine hostname + MAC for a unique machine ID
-    let machine_id = format!("{}:{}", hostname, mac_address);
+    // Combine hostname + MAC for a unique machine ID (lowercase for consistency)
+    let machine_id = format!("{}:{}", hostname.to_lowercase(), mac_address.to_lowercase());
 
     MachineInfo {
         hostname,

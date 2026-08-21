@@ -930,6 +930,22 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    // ── Migration 29: normalize machine_ids to lowercase ────────────────────
+    if current < 29 {
+        // Lowercase all machine_ids in user_anpr_auto_start
+        conn.execute(
+            "UPDATE user_anpr_auto_start SET machine_id = lower(machine_id)",
+            [],
+        ).ok();
+        // Lowercase designated_machine_id in anpr_config
+        conn.execute(
+            "UPDATE anpr_config SET designated_machine_id = lower(designated_machine_id) WHERE designated_machine_id IS NOT NULL",
+            [],
+        ).ok();
+        conn.execute_batch("PRAGMA user_version = 29;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
