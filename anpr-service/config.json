@@ -1,4 +1,7 @@
 {
-  "source": "http://192.168.100.27:8080/videofeed",
-  "source_type": "http"
+  "source": "C:\\Users\\voyya\\Downloads\\license-plate-detection-test-1080-ytshorts.savetube.me.mp4",
+  "source_type": "video_file",
+  "prefer_cloud": false,
+  "cloud_api_url": "",
+  "cloud_api_key": ""
 }
