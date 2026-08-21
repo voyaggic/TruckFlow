@@ -275,6 +275,9 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     }
     println!("[ANPR] Auto-start triggered by user {} on machine {}", auto_start_user.unwrap_or_default(), machine_info.hostname);
 
+    // Drop first lock before re-locking — std::sync::Mutex is NOT reentrant
+    drop(conn);
+
     // Read cloud/settings from database
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let prefer_cloud: bool = conn

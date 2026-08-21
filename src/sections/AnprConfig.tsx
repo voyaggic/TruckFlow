@@ -139,7 +139,15 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
       {activeTab === "models" && <ModelPanel versions={versions} actor={user} onRun={run} />}
 
       {activeTab === "training" && (
-        <CandidatePanel candidates={candidates} config={config} actor={user} onRun={run} />
+        <CandidatePanel candidates={candidates} config={config} actor={user} onRun={(fn, okMsg) => {
+          setError(null);
+          setNotice(null);
+          fn().then(() => {
+            setNotice(okMsg);
+            // Only refresh training candidates, not config+cameras
+            api.listTrainingCandidates().then(setCandidates).catch(() => undefined);
+          }).catch((e) => setError(String(e)));
+        }} />
       )}
 
       {activeTab === "diagnostics" && <DiagnosticsTab diagnostics={diagnostics} actor={user} />}
@@ -200,12 +208,10 @@ function LivePreviewTab({
     return () => clearInterval(t);
   }, [anprUrl, cameras]);
 
-  // Stop ANPR service when no cameras remain
-  useEffect(() => {
-    if (cameras.length === 0) {
-      api.stopAnprService(actor.id).catch(() => undefined);
-    }
-  }, [cameras.length, actor, api]);
+  // NOTE: We intentionally do NOT auto-stop the ANPR service when cameras
+  // is empty — cameras starts as [] on mount before the parent fetches them,
+  // and this effect would kill a running service every time the tab mounts.
+  // Users stop the service manually via the Engine tab.
 
   const isPortrait = orientation === "portrait";
 
