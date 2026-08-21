@@ -8,3 +8,7 @@ updates/
 *.sqlite3
 tmp_tsc.txt
 cargo_*.txt
+
+anpr-service/anpr.log
+anpr-service/config.json
+*.db
