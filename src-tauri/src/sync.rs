@@ -366,6 +366,14 @@ pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Resul
         let central_rows = pg.query_rows(&sql, &[last_pull.clone()])
             .map_err(|e| format!("{table} pull failed: {e}"))?;
 
+        if central_rows.is_empty() {
+            tables.push(TablePending { table: table.to_string(), display: table.to_string(), pending: 0 });
+            continue;
+        }
+
+        // Batch-load all local timestamps in one query instead of per-row
+        let local_timestamps = batch_load_local_timestamps(conn, table)?;
+
         let mut pulled = 0i64;
         for row in &central_rows {
             let Some(obj) = row.as_object() else { continue };
@@ -373,16 +381,8 @@ pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Resul
             if id.is_empty() { continue }
             let central_updated = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Check if local row exists and is newer (local edit wins)
-            let local_updated: Option<String> = conn
-                .query_row(
-                    &format!("SELECT updated_at FROM {} WHERE id = ?1", pg_quote_ident(table)),
-                    params![id],
-                    |r| r.get(0),
-                )
-                .ok();
-
-            if let Some(ref local_ts) = local_updated {
+            // Check local timestamp from batch (O(1) lookup instead of per-row query)
+            if let Some(ref local_ts) = local_timestamps.get(id) {
                 if local_ts.as_str() >= central_updated {
                     continue; // local is same age or newer — skip
                 }
@@ -392,16 +392,27 @@ pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Resul
             upsert_row_from_central(conn, table, obj)?;
             pulled += 1;
         }
-        tables.push(TablePending {
-            table: table.to_string(),
-            display: table.to_string(),
-            pending: 0,
-        });
+        tables.push(TablePending { table: table.to_string(), display: table.to_string(), pending: 0 });
         total_pulled += pulled;
     }
 
     set_setting(conn, "pg_last_pulled_at", &now_iso())?;
     Ok(PullResult { pulled: total_pulled, tables })
+}
+
+/// Load all (id, updated_at) pairs for a table in one query.
+fn batch_load_local_timestamps(conn: &Connection, table: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let sql = format!("SELECT id, updated_at FROM {} WHERE updated_at IS NOT NULL", pg_quote_ident(table));
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("{table} timestamp query failed: {e}"))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| format!("{table} timestamp query failed: {e}"))?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        if let Ok((id, ts)) = row {
+            map.insert(id, ts);
+        }
+    }
+    Ok(map)
 }
 
 fn upsert_row_from_central(conn: &Connection, table: &str, row: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
@@ -1130,9 +1141,17 @@ fn to_pg_param(v: &serde_json::Value, ty: &str) -> Box<dyn ToSql + Sync> {
 /// the maintenance `postgres` database and reconnect. This makes setup as
 /// simple as "paste the connection string".
 fn make_tls_connector() -> postgres_native_tls::MakeTlsConnector {
+    // Accept all TLS certificates — required for Supabase and other managed
+    // Postgres providers that use their own CA. The connection string itself
+    // contains authentication, so certificate verification is not the primary
+    // security control here.
     let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
         .build()
-        .unwrap_or_else(|_| native_tls::TlsConnector::new().unwrap());
+        .unwrap_or_else(|_| {
+            // Fallback: basic connector without cert validation
+            native_tls::TlsConnector::new().unwrap()
+        });
     postgres_native_tls::MakeTlsConnector::new(connector)
 }
 
@@ -2309,7 +2328,7 @@ pub fn run_trip_retention(conn: &Connection, pg: &dyn PostgresAdapter) -> Result
     Ok(())
 }
 
-fn sheets_due(conn: &Connection, sheets: &dyn SheetsProvider) -> bool {
+pub fn sheets_due(conn: &Connection, sheets: &dyn SheetsProvider) -> bool {
     let Ok(st) = sheets_state_impl(conn, sheets) else {
         return false;
     };

@@ -438,16 +438,31 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
 fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
     let handle = app.clone();
     let running = state.running.clone();
+    let pg = state.pg.clone();
+    let sheets = state.sheets.clone();
     std::thread::spawn(move || {
         while running.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(10));
             let Some(st) = handle.try_state::<AppState>() else {
                 continue;
             };
-            let Ok(conn) = st.db.lock() else {
-                continue;
-            };
-            sync::run_background_sync(&conn, &*st.pg, &*st.sheets);
+            // Phase 1: Push local → central (drop conn before phase 2)
+            {
+                let Ok(conn) = st.db.lock() else { continue };
+                let _ = sync::run_pg_sync_impl(&conn, &*pg);
+            } // conn dropped here
+            // Phase 2: Pull central → local
+            {
+                let Ok(conn) = st.db.lock() else { continue };
+                let _ = sync::pull_reference_data(&conn, &*pg);
+            } // conn dropped here
+            // Phase 3: Google Sheets sync
+            {
+                let Ok(conn) = st.db.lock() else { continue };
+                if sync::sheets_due(&conn, &*sheets) {
+                    let _ = sync::run_sheets_sync_impl(&conn, &*sheets);
+                }
+            } // conn dropped here
         }
     });
 }
