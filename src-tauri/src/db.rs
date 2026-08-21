@@ -34,6 +34,12 @@ pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// ISO timestamp offset by `secs` seconds from now (used for token expiry).
+pub fn now_iso_offset(secs: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(secs))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
     let dir = app
         .path()
@@ -863,6 +869,67 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    // ── Migration 27: sessions table for persistent login ───────────────────
+    if current < 27 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);",
+        )
+        .map_err(|e| format!("migration 27 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 27;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // ── Migration 28: grant resolve_queue to existing admin users ───────────
+    if current < 28 {
+        // Find the resolve_queue permission ID
+        let perm_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM permissions WHERE key = 'resolve_queue' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(pid) = perm_id {
+            // Grant to all users who have manage_users (i.e. admins)
+            let admin_ids: Vec<String> = conn
+                .prepare(
+                    "SELECT DISTINCT up.user_id FROM user_permissions up
+                     JOIN permissions p ON p.id = up.permission_id
+                     WHERE p.key = 'manage_users'",
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| r.get(0))
+                        .ok()
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+            let mut granted = 0i64;
+            for uid in &admin_ids {
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions (user_id, permission_id, granted_by, granted_at)
+                     VALUES (?1, ?2, 'migration-28', ?3)",
+                    params![uid, pid, crate::db::now_iso()],
+                )
+                .ok();
+                granted += 1;
+            }
+            if granted > 0 {
+                println!("[DB] Migration 28: granted resolve_queue to {granted} admin user(s)");
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 28;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -951,6 +1018,7 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
         "Admin",
         &[
             "register_new_vehicle",
+            "resolve_queue",
             "manage_users",
             "manage_reference_database",
             "view_audit_log",

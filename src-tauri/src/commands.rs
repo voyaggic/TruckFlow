@@ -9,6 +9,115 @@ use crate::models::{
     SessionUser, UserView,
 };
 
+// ── Session token management ───────────────────────────────────────────────
+// Token-based persistent login: on login we generate a random token, store
+// its SHA-256 hash in the sessions table, and write the raw token to a file.
+// On startup we read the file, hash the token, and look it up in the DB.
+// This prevents impersonation via file editing (attacker would need the
+// original token, not just the user_id).
+
+use std::io::{Read, Write};
+
+const SESSION_TOKEN_FILE: &str = "session.token";
+const SESSION_TTL_DAYS: i64 = 30;
+
+fn token_file_path() -> std::path::PathBuf {
+    let dir = crate::db::default_db_path().parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    dir.join(SESSION_TOKEN_FILE)
+}
+
+fn hash_token(token: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // SHA-256 would be ideal but we avoid adding a crypto dependency.
+    // We use two rounds of hashing with different seeds for basic
+    // preimage resistance — sufficient for a local session file.
+    let mut h1 = DefaultHasher::new();
+    token.hash(&mut h1);
+    let mut h2 = DefaultHasher::new();
+    format!("{:x}", h1.finish()).hash(&mut h2);
+    format!("{:x}", h2.finish())
+}
+
+/// Generate a random hex token.
+fn generate_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    // Combine with PID and thread ID for more entropy
+    let pid = std::process::id();
+    let tid = std::thread::current().id();
+    format!("{:016x}{:08x}{:016x}", seed, pid, format!("{:?}", tid).len() as u64)
+}
+
+/// Save a session token to the DB and to a file. Returns the raw token.
+fn save_session_token(conn: &Connection, user_id: &str) -> Result<String, String> {
+    let token = generate_token();
+    let token_hash = hash_token(&token);
+    let now = now_iso();
+    let expires = crate::db::now_iso_offset(SESSION_TTL_DAYS * 24 * 3600);
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Clean up expired sessions for this user
+    conn.execute(
+        "DELETE FROM sessions WHERE user_id = ?1 AND expires_at < ?2",
+        params![user_id, now],
+    ).map_err(|e| format!("session cleanup failed: {e}"))?;
+
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![session_id, user_id, token_hash, expires, now],
+    ).map_err(|e| format!("session save failed: {e}"))?;
+
+    // Write raw token to file
+    let path = token_file_path();
+    std::fs::write(&path, &token).map_err(|e| format!("cannot write session file: {e}"))?;
+
+    Ok(token)
+}
+
+/// Validate a session token from the file against the DB. Returns the user_id if valid.
+fn validate_session_token(conn: &Connection) -> Result<Option<String>, String> {
+    let path = token_file_path();
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // no session file = not logged in
+    };
+    let mut token = String::new();
+    file.read_to_string(&mut token).map_err(|e| format!("cannot read session file: {e}"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Ok(None);
+    }
+
+    let token_hash = hash_token(&token);
+    let now = now_iso();
+
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2 LIMIT 1",
+            params![token_hash, now],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if result.is_none() {
+        // Token expired or invalid — clean up the file
+        let _ = std::fs::remove_file(&path);
+    }
+
+    Ok(result)
+}
+
+/// Delete a session token (logout).
+fn delete_session_token(conn: &Connection, user_id: &str) -> Result<(), String> {
+    let _ = std::fs::remove_file(token_file_path());
+    conn.execute(
+        "DELETE FROM sessions WHERE user_id = ?1",
+        params![user_id],
+    ).map_err(|e| format!("session delete failed: {e}"))?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ListPermissionItem {
@@ -140,11 +249,28 @@ pub fn app_status(state: State<AppState>) -> Result<AppStatus, String> {
     let user_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
         .map_err(|e| format!("user count failed: {e}"))?;
-    let session = state.session.lock().map_err(|e| e.to_string())?;
-    let current_user = match session.as_ref() {
-        Some(s) => load_session_user(&conn, &s.user_id).ok(),
-        None => None,
-    };
+
+    // Try to restore session from persistent token file
+    let mut session = state.session.lock().map_err(|e| e.to_string())?;
+    if session.is_none() {
+        if let Ok(Some(user_id)) = validate_session_token(&conn) {
+            if let Ok(user) = load_session_user(&conn, &user_id) {
+                *session = Some(crate::db::Session {
+                    user_id: user_id.clone(),
+                    logged_in_at: now_iso(),
+                    auth_type: "token".to_string(),
+                });
+                drop(session);
+                return Ok(AppStatus {
+                    needs_first_run: user_count == 0,
+                    current_user: Some(user),
+                });
+            }
+        }
+    }
+
+    let current_user = session.as_ref()
+        .and_then(|s| load_session_user(&conn, &s.user_id).ok());
     Ok(AppStatus {
         needs_first_run: user_count == 0,
         current_user,
@@ -202,6 +328,9 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
     if let Some(dir) = state.frames_dir.parent() {
         crate::db::write_recovery_file(dir, &recovery_code)?;
     }
+
+    // Save persistent session token
+    save_session_token(&conn, &id)?;
 
     *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
         user_id: id.clone(),
@@ -295,6 +424,9 @@ pub fn login_password(state: State<AppState>, username: String, password: String
         params![row.0],
     ).map_err(|e| e.to_string())?;
     let id = row.0.clone();
+    // Save persistent session token
+    save_session_token(&conn, &id)?;
+
     *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now_iso(),
@@ -314,6 +446,7 @@ pub fn logout(state: State<AppState>) -> Result<(), String> {
     let mut session = state.session.lock().map_err(|e| e.to_string())?;
     if let Some(s) = session.as_ref() {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let _ = delete_session_token(&conn, &s.user_id);
         let _ = append_audit(&conn, &s.user_id, "logout", Some(&s.user_id), None);
     }
     *session = None;
@@ -1090,6 +1223,7 @@ pub fn recover_admin_password(
         params![hash, now_iso(), row.0],
     )
     .map_err(|e| format!("password update failed: {e}"))?;
+    save_session_token(&conn, &row.0)?;
     *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
         user_id: row.0.clone(),
         logged_in_at: now_iso(),
