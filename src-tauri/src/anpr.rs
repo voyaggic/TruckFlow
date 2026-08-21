@@ -820,6 +820,21 @@ pub fn approve_all_training_candidates(
     Ok(count as i64)
 }
 
+/// Reject (remove) ALL training candidates at once.
+#[tauri::command]
+pub fn reject_all_training_candidates(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let count = conn
+        .execute("DELETE FROM training_candidates", [])
+        .map_err(|e| format!("Failed to reject all candidates: {e}"))?;
+    append_audit(&conn, &actor_id, "rejected_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
+    Ok(count as i64)
+}
+
 // ---------------------------------------------------------------------------
 // anpr_credentials — API / license keys, masked + rotatable (§8 Credentials
 // sub-tab). Values are stored in the DB row (single-user desktop app) but

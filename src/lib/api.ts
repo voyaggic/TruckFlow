@@ -568,6 +568,9 @@ export const api = {
   approveAllTrainingCandidates: (actorId: string) =>
     invoke<number>("approve_all_training_candidates", { actorId }),
 
+  rejectAllTrainingCandidates: (actorId: string) =>
+    invoke<number>("reject_all_training_candidates", { actorId }),
+
   // --- ANPR credentials + diagnostics (09-anpr-page-complete-spec §1, §8) ---
 
   listAnprCredentials: () => invoke<AnprCredentialView[]>("list_anpr_credentials"),

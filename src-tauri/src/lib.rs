@@ -154,6 +154,7 @@ pub fn run() {
             anpr::approve_training_candidate,
             anpr::reject_training_candidate,
             anpr::approve_all_training_candidates,
+            anpr::reject_all_training_candidates,
             anpr::list_anpr_credentials,
             anpr::set_anpr_credential,
             anpr::delete_anpr_credential,

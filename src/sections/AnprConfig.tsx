@@ -1726,6 +1726,10 @@ function CandidatePanel({
     onRun(() => api.approveAllTrainingCandidates(actor.id).then(() => undefined), "All candidates approved.");
   };
 
+  const handleRejectAll = () => {
+    onRun(() => api.rejectAllTrainingCandidates(actor.id).then(() => undefined), "All candidates cleared.");
+  };
+
   return (
     <div className="card stack">
       <div className="section-title" style={{ fontSize: 15 }}>Training candidates ({candidates.length})</div>
@@ -1777,7 +1781,7 @@ function CandidatePanel({
             style={{ color: "var(--danger)" }}
             onClick={() => {
               if (!window.confirm(`Remove all ${candidates.length} candidates? This cannot be undone.`)) return;
-              handleApproveAll();
+              handleRejectAll();
             }}
           >
             Clear all
