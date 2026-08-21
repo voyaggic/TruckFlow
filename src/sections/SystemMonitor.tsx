@@ -239,6 +239,21 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
                       {deleting ? "Deleting…" : `Delete (${selected.length})`}
                     </button>
                   )}
+                  {canDelete && dash.recent_history.length > 0 && (
+                    <button className="danger small" disabled={deleting} onClick={() => {
+                      const allIds = dash.recent_history.map((e) => e.id);
+                      setSelected(allIds);
+                      // Trigger delete immediately
+                      setDeleting(true);
+                      api.deleteHealthEvents(user.id, allIds).then(() => {
+                        refresh();
+                        setDeleting(false);
+                        setSelected([]);
+                      }).catch(() => setDeleting(false));
+                    }}>
+                      {deleting ? "Clearing…" : "Clear All"}
+                    </button>
+                  )}
                 </div>
               )}
             </div>

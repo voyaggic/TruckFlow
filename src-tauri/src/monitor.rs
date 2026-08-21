@@ -225,7 +225,7 @@ pub fn anpr_confidence_trend(
 
     let mut sql = String::from(
         "SELECT date(timestamp) AS day, AVG(confidence) AS avg_conf, COUNT(*) AS reads
-         FROM anpr_read_events WHERE 1 = 1",
+         FROM anpr_read_events WHERE timestamp IS NOT NULL AND timestamp != ''",
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(f) = from {
@@ -243,7 +243,7 @@ pub fn anpr_confidence_trend(
         sql.push_str(" AND timestamp <= ?");
         args.push(rusqlite::types::Value::Text(upper));
     }
-    sql.push_str(" GROUP BY day ORDER BY day ASC");
+    sql.push_str(" GROUP BY day HAVING day IS NOT NULL ORDER BY day ASC");
 
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("trend query failed: {e}"))?;
     let mut out = Vec::new();

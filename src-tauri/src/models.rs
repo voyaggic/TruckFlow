@@ -254,10 +254,15 @@ pub struct AnprConfigView {
     pub save_recognition_images: bool,
     pub retrain_candidate_threshold: Option<i64>,
     pub is_capture_point: bool,
+    /// When true, the cloud OCR API is preferred for character reading;
+    /// if unreachable, the configured local engine is used automatically.
+    pub prefer_cloud: bool,
     /// Entry/exit matcher window (09-anpr-page-complete-spec.md §4.3): an open
     /// trip older than this many hours is closed as `missed_exit` and the next
     /// sighting starts a fresh entry. Null = default 24h applied at read time.
     pub max_pending_duration_hours: Option<f64>,
+    /// Machine hostname:MAC fingerprint for auto-start (§9.1). Null = not yet designated.
+    pub designated_machine_id: Option<String>,
 }
 
 /// A stored ANPR credential (API/license key). Values are stored encrypted-at-
@@ -292,8 +297,16 @@ pub struct AnprDiagnosticsView {
     pub dependencies: Vec<DependencyHealthView>,
     pub storage_bytes: i64,
     pub storage_detail: String,
+    pub storage_breakdown: Vec<StorageBreakdownItem>,
     pub service_running: bool,
     pub error_log: Vec<HealthEventView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StorageBreakdownItem {
+    pub label: String,
+    pub bytes: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

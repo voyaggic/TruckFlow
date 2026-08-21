@@ -13,6 +13,7 @@ pub mod sync;
 
 use std::sync::atomic::Ordering;
 
+use rusqlite::params;
 use tauri::{Emitter, Manager};
 
 use crate::capture::AnprSource;
@@ -24,9 +25,20 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let state = db::init_state(app.handle())?;
-            // Auto-start ANPR service with the first active camera source
-            if let Err(e) = auto_start_anpr(&state) {
-                eprintln!("[ANPR] Auto-start skipped: {e}");
+            // Auto-start ANPR service in background (non-blocking)
+            {
+                let state_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // Small delay to let the app finish rendering first
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let Some(st) = state_handle.try_state::<AppState>() else {
+                        return;
+                    };
+                    match auto_start_anpr(&st) {
+                        Ok(()) => println!("[ANPR] Auto-started successfully"),
+                        Err(e) => println!("[ANPR] Auto-start skipped: {e}"),
+                    }
+                });
             }
             spawn_anpr_poller(app.handle(), &state);
             spawn_sync_poller(app.handle(), &state);
@@ -119,12 +131,14 @@ pub fn run() {
             capture::classify_discharge,
             capture::trip_frames,
             capture::list_detection_images,
+            capture::delete_detection_frames,
             capture::load_detection_image,
             capture::write_anpr_config,
             capture::start_anpr_service,
             capture::stop_anpr_service,
             anpr::get_anpr_config,
             anpr::update_anpr_config,
+            anpr::get_anpr_service_url,
             anpr::list_camera_sources,
             anpr::add_camera_source,
             anpr::update_camera_source,
@@ -136,10 +150,18 @@ pub fn run() {
             anpr::deploy_model_version,
             anpr::rollback_model_version,
             anpr::list_training_candidates,
+            anpr::add_training_candidate,
+            anpr::approve_training_candidate,
+            anpr::reject_training_candidate,
+            anpr::approve_all_training_candidates,
             anpr::list_anpr_credentials,
             anpr::set_anpr_credential,
             anpr::delete_anpr_credential,
             anpr::anpr_diagnostics,
+            anpr::get_machine_info,
+            anpr::set_anpr_machine,
+            anpr::get_anpr_machine,
+            anpr::check_machine_match,
             sync::sync_status,
             sync::sync_now_pg,
             sync::connect_google_sheets,
@@ -183,15 +205,12 @@ pub fn run() {
 }
 
 /// Find the anpr-service directory by trying multiple known locations.
-fn find_anpr_dir() -> std::path::PathBuf {
+pub fn find_anpr_dir() -> std::path::PathBuf {
     // Try current dir (dev mode from project root)
     if let Ok(dir) = std::env::current_dir() {
         let p = dir.join("anpr-service");
         if p.exists() { return p; }
     }
-    // Try hardcoded dev path
-    let dev = std::path::PathBuf::from(r"D:\Exhauster project\TruckFlow\anpr-service");
-    if dev.exists() { return dev; }
     // Try relative to exe
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -199,11 +218,18 @@ fn find_anpr_dir() -> std::path::PathBuf {
             if p.exists() { return p; }
         }
     }
-    dev // fallback even if not found — will error later
+    // Try next to the source directory during development
+    if let Ok(dir) = std::env::current_dir() {
+        let p = dir.join("src-tauri").join("anpr-service");
+        if p.exists() { return p; }
+    }
+    std::path::PathBuf::from("anpr-service") // fallback — will error later
 }
 
 /// Auto-start the ANPR service on app launch. Finds the first active camera,
 /// writes config.json, spawns the Python process, and sets anpr_source=http.
+/// Only auto-starts if the current machine matches the designated machine
+/// (or no machine is designated).
 fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     // Check if this machine is configured as a capture point
@@ -217,18 +243,77 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     if is_capture == 0 {
         return Err("This machine is not a capture point. Enable it in ANPR Settings.".to_string());
     }
-    // Find the first active camera source
-    let camera = conn
+
+    // Check machine fingerprint: only auto-start if current machine matches
+    // the designated machine (or no machine is designated)
+    let designated: Option<String> = conn
+        .query_row(
+            "SELECT designated_machine_id FROM anpr_config WHERE id = ?1",
+            params![crate::db::ANPR_CONFIG_ID],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    drop(conn);
+
+    if let Some(designated_id) = designated {
+        let current_info = anpr::get_machine_info().unwrap_or_else(|_| anpr::MachineInfo {
+            hostname: "unknown".to_string(),
+            mac_address: "unknown".to_string(),
+            machine_id: "unknown".to_string(),
+        });
+        if current_info.machine_id != designated_id {
+            return Err(format!(
+                "This machine ({}) does not match the designated ANPR machine. Auto-start skipped.",
+                current_info.hostname
+            ));
+        }
+    }
+
+    // Read cloud/settings from database
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let prefer_cloud: bool = conn
+        .query_row(
+            "SELECT COALESCE(prefer_cloud, 0) FROM anpr_config WHERE id = ?1",
+            params![crate::db::ANPR_CONFIG_ID],
+            |r| r.get(0),
+        )
+        .unwrap_or(0) != 0;
+    let cloud_api_url: String = conn
+        .query_row(
+            "SELECT value FROM key_value_ref WHERE key = 'cloud_anpr_api_url'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let cloud_api_key: String = conn
+        .query_row(
+            "SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+
+    // Find the first active camera source (optional — service runs in idle if none)
+    let camera: Option<(String, String)> = conn
         .query_row(
             "SELECT source_type, connection_string FROM camera_sources WHERE status = 'active' LIMIT 1",
             [],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
-        .map_err(|_| "No active camera source found. Add one in Camera Settings.")?;
+        .ok();
     drop(conn);
 
-    let (source_type, connection_string) = camera;
-    println!("[ANPR] Auto-starting with {source_type}: {connection_string}");
+    let (source_type, connection_string) = match camera {
+        Some(c) => {
+            println!("[ANPR] Auto-starting with {}: {}", c.0, c.1);
+            c
+        }
+        None => {
+            println!("[ANPR] No active camera source — starting in idle mode");
+            (String::new(), String::new())
+        }
+    };
 
     // Write config.json for the ANPR service
     let anpr_dir = find_anpr_dir();
@@ -236,6 +321,9 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     let cfg = serde_json::json!({
         "source": connection_string,
         "source_type": source_type,
+        "prefer_cloud": prefer_cloud,
+        "cloud_api_url": cloud_api_url,
+        "cloud_api_key": cloud_api_key,
     });
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
         .map_err(|e| format!("Failed to write config.json: {e}"))?;
@@ -275,8 +363,15 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
 fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
     let handle = app.clone();
     let running = state.running.clone();
+    // Read the configured service URL from DB before spawning the thread
+    let service_url = {
+        let Ok(conn) = state.db.lock() else { return };
+        let url = capture::anpr_service_url(&conn);
+        drop(conn);
+        url
+    };
     std::thread::spawn(move || {
-        let http = capture::HttpSource::new();
+        let http = capture::HttpSource::new(service_url);
         while running.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let Some(st) = handle.try_state::<AppState>() else {
@@ -302,7 +397,7 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                     &conn,
                     "anpr_service",
                     "offline",
-                    Some("ANPR service unreachable at 127.0.0.1:9800"),
+                    Some(&format!("ANPR service unreachable at {}", http.service_url)),
                 );
                 drop(conn);
                 continue; // service down — skip this cycle

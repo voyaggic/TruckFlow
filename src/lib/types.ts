@@ -229,8 +229,19 @@ export interface AnprConfigView {
   save_recognition_images: boolean;
   retrain_candidate_threshold: number | null;
   is_capture_point: boolean;
+  /** When true, the cloud OCR API is preferred for character reading; if unreachable, the local engine is used automatically. */
+  prefer_cloud: boolean;
   /** Entry/exit matcher window in hours (09-anpr-page-complete-spec §4.3). */
   max_pending_duration_hours: number | null;
+  /** Machine fingerprint for auto-start (hostname:MAC). */
+  designated_machine_id: string | null;
+}
+
+/** Machine info for ANPR auto-start detection. */
+export interface MachineInfo {
+  hostname: string;
+  mac_address: string;
+  machine_id: string;
 }
 
 /** A stored ANPR credential — only a masked preview is ever returned. */
@@ -256,8 +267,14 @@ export interface AnprDiagnosticsView {
   dependencies: DependencyHealthView[];
   storage_bytes: number;
   storage_detail: string;
+  storage_breakdown: StorageBreakdownItem[];
   service_running: boolean;
   error_log: HealthEventView[];
+}
+
+export interface StorageBreakdownItem {
+  label: string;
+  bytes: number;
 }
 
 export interface CameraSourceView {

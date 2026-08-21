@@ -20,6 +20,7 @@ import type {
   IngestResult,
   ListPermissionItem,
   LoginResult,
+  MachineInfo,
   ModelVersionView,
   OfficerActivityView,
   PasswordResetRequestView,
@@ -464,6 +465,8 @@ export const api = {
     invoke<{ trip_id: string; kind: string; filename: string; size_bytes: number; modified: string }[]>("list_detection_images", { limit }),
   loadDetectionImage: (tripId: string, kind: string, filename: string) =>
     invoke<string>("load_detection_image", { tripId, kind, filename }),
+  deleteDetectionFrames: (actorId: string, tripIds?: string[]) =>
+    invoke<number>("delete_detection_frames", { actorId, tripIds }),
 
   // --- ANPR Service Management ---
   writeAnprConfig: (actorId: string, sourceUrl: string, sourceType?: string, mock?: boolean) =>
@@ -476,6 +479,8 @@ export const api = {
   // --- ANPR Engine Configuration (08 §5 / §6, gated on manage_anpr_config) ---
 
   getAnprConfig: () => invoke<AnprConfigView>("get_anpr_config"),
+
+  getAnprServiceUrl: () => invoke<string>("get_anpr_service_url"),
 
   updateAnprConfig: (
     actorId: string,
@@ -492,6 +497,7 @@ export const api = {
         | "retrain_candidate_threshold"
         | "is_capture_point"
         | "max_pending_duration_hours"
+        | "designated_machine_id"
       >
     >,
   ) =>
@@ -507,6 +513,7 @@ export const api = {
       retrainCandidateThreshold: changes.retrain_candidate_threshold ?? null,
       isCapturePoint: changes.is_capture_point ?? null,
       maxPendingDurationHours: changes.max_pending_duration_hours ?? null,
+      designatedMachineId: changes.designated_machine_id ?? null,
     }),
 
   listCameraSources: () => invoke<CameraSourceView[]>("list_camera_sources"),
@@ -549,6 +556,18 @@ export const api = {
 
   listTrainingCandidates: () => invoke<TrainingCandidateView[]>("list_training_candidates"),
 
+  addTrainingCandidate: (actorId: string, plateNumber: string, framePath: string) =>
+    invoke<TrainingCandidateView>("add_training_candidate", { actorId, plateNumber, framePath }),
+
+  approveTrainingCandidate: (actorId: string, candidateId: string) =>
+    invoke<void>("approve_training_candidate", { actorId, candidateId }),
+
+  rejectTrainingCandidate: (actorId: string, candidateId: string) =>
+    invoke<void>("reject_training_candidate", { actorId, candidateId }),
+
+  approveAllTrainingCandidates: (actorId: string) =>
+    invoke<number>("approve_all_training_candidates", { actorId }),
+
   // --- ANPR credentials + diagnostics (09-anpr-page-complete-spec §1, §8) ---
 
   listAnprCredentials: () => invoke<AnprCredentialView[]>("list_anpr_credentials"),
@@ -560,6 +579,17 @@ export const api = {
     invoke<void>("delete_anpr_credential", { actorId, keyName }),
 
   anprDiagnostics: () => invoke<AnprDiagnosticsView>("anpr_diagnostics"),
+
+  // --- Machine fingerprint for ANPR auto-start ---
+
+  getMachineInfo: () => invoke<MachineInfo>("get_machine_info"),
+
+  setAnprMachine: (actorId: string) =>
+    invoke<MachineInfo>("set_anpr_machine", { actorId }),
+
+  getAnprMachine: () => invoke<string | null>("get_anpr_machine"),
+
+  checkMachineMatch: () => invoke<boolean>("check_machine_match"),
 
   // --- Sync & integrations (Phase 4, gated on manage_integrations) ---
 

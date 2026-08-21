@@ -248,7 +248,7 @@ export default function Reporting({ user }: { user: SessionUser }) {
             </div>
           </div>
 
-          <div className="chart-grid">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <div className="card">
               <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Trips over time</h3>
               {dashboard.trips_over_time.length === 0 ? (
@@ -258,13 +258,29 @@ export default function Reporting({ user }: { user: SessionUser }) {
               )}
             </div>
             <div className="card">
-              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Top {entityLabel("company").toLowerCase()}</h3>
+              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Activity heatmap</h3>
+              {dashboard.trips_over_time.length === 0 ? (
+                <p className="muted small">No data for heatmap.</p>
+              ) : (
+                <Heatmap data={dashboard.trips_over_time.map((d) => ({ label: d.date, value: d.count }))} />
+              )}
+            </div>
+            <div className="card">
+              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Top {entityLabel("company").toLowerCase()} — trips</h3>
               {dashboard.top_companies.length === 0 ? (
                 <p className="muted small">
                   No {entityLabel("company").toLowerCase()} activity in the selected range.
                 </p>
               ) : (
                 <BarChart data={dashboard.top_companies.map((c) => ({ label: c.company_name, value: c.count }))} />
+              )}
+            </div>
+            <div className="card">
+              <h3 style={{ margin: "0 0 8px", fontSize: 15 }}>Top {entityLabel("company").toLowerCase()} — share</h3>
+              {dashboard.top_companies.length === 0 ? (
+                <p className="muted small">No data for pie chart.</p>
+              ) : (
+                <PieChart data={dashboard.top_companies.map((c) => ({ label: c.company_name, value: c.count }))} />
               )}
             </div>
           </div>
@@ -432,6 +448,113 @@ function BarChart({ data }: { data: { label: string; value: number }[] }) {
           <div className="bar-value">{d.value}</div>
         </div>
       ))}
+    </div>
+  );
+}
+
+const PIE_COLORS = [
+  "var(--accent)", "#f59e0b", "#10b981", "#6366f1", "#ec4899",
+  "#14b8a6", "#f97316", "#8b5cf6", "#06b6d4", "#84cc16",
+];
+
+function PieChart({ data }: { data: { label: string; value: number }[] }) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  if (total === 0) return <p className="muted small">No data.</p>;
+  const size = 180;
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = 70;
+  let cumAngle = -Math.PI / 2; // start at top
+  const slices = data.map((d, i) => {
+    const angle = (d.value / total) * 2 * Math.PI;
+    const x1 = cx + r * Math.cos(cumAngle);
+    const y1 = cy + r * Math.sin(cumAngle);
+    cumAngle += angle;
+    const x2 = cx + r * Math.cos(cumAngle);
+    const y2 = cy + r * Math.sin(cumAngle);
+    const large = angle > Math.PI ? 1 : 0;
+    const path = `M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z`;
+    return { path, color: PIE_COLORS[i % PIE_COLORS.length], label: d.label, value: d.value, pct: ((d.value / total) * 100).toFixed(1) };
+  });
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        {slices.map((s, i) => (
+          <path key={i} d={s.path} fill={s.color} stroke="var(--surface)" strokeWidth="1.5" />
+        ))}
+      </svg>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+        {slices.map((s, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, flexShrink: 0 }} />
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.label}>{s.label}</span>
+            <span className="muted">{s.pct}%</span>
+            <span style={{ fontWeight: 600 }}>{s.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Heatmap({ data }: { data: { label: string; value: number }[] }) {
+  if (data.length === 0) return <p className="muted small">No data.</p>;
+  const max = Math.max(1, ...data.map((d) => d.value));
+  // Arrange into a grid (7 columns = days of week)
+  const cellSize = 22;
+  const gap = 3;
+  const cols = 7;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, ${cellSize}px)`, gap }}>
+        {data.map((d, i) => {
+          const intensity = d.value / max;
+          const bg = intensity === 0 ? "var(--surface-2)"
+            : intensity < 0.25 ? "color-mix(in srgb, var(--accent) 20%, transparent)"
+            : intensity < 0.5 ? "color-mix(in srgb, var(--accent) 40%, transparent)"
+            : intensity < 0.75 ? "color-mix(in srgb, var(--accent) 65%, transparent)"
+            : "var(--accent)";
+          return (
+            <div
+              key={i}
+              title={`${d.label}: ${d.value} trips`}
+              style={{
+                width: cellSize,
+                height: cellSize,
+                borderRadius: 3,
+                background: bg,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 9,
+                color: intensity > 0.5 ? "#fff" : "var(--text-muted)",
+                fontWeight: intensity > 0.5 ? 600 : 400,
+              }}
+            >
+              {d.value > 0 ? d.value : ""}
+            </div>
+          );
+        })}
+      </div>
+      <div className="row" style={{ gap: 4, alignItems: "center", marginTop: 4 }}>
+        <span className="muted small">Less</span>
+        {[0, 0.25, 0.5, 0.75, 1].map((pct) => (
+          <div
+            key={pct}
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 2,
+              background: pct === 0 ? "var(--surface-2)"
+                : pct < 0.25 ? "color-mix(in srgb, var(--accent) 20%, transparent)"
+                : pct < 0.5 ? "color-mix(in srgb, var(--accent) 40%, transparent)"
+                : pct < 0.75 ? "color-mix(in srgb, var(--accent) 65%, transparent)"
+                : "var(--accent)",
+            }}
+          />
+        ))}
+        <span className="muted small">More</span>
+      </div>
     </div>
   );
 }

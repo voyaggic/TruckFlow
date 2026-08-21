@@ -767,6 +767,50 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    if current < 23 {
+        // Machine-specific ANPR auto-start: store the designated machine's
+        // fingerprint (hostname + MAC) so auto-start only triggers on the
+        // correct machine even when the same DB is shared across PCs.
+        let exists = conn
+            .prepare("PRAGMA table_info(anpr_config)")
+            .ok()
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(1))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).any(|c| c == "designated_machine_id"))
+            })
+            .unwrap_or(false);
+        if !exists {
+            conn.execute_batch(
+                "ALTER TABLE anpr_config ADD COLUMN designated_machine_id TEXT;",
+            )
+            .map_err(|e| format!("migration 23 add designated_machine_id failed: {e}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 23;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // ── Migration 24: prefer_cloud as independent boolean ──────────────
+    if current < 24 {
+        let exists: bool = conn
+            .prepare("PRAGMA table_info(anpr_config)")
+            .ok()
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(1))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).any(|c| c == "prefer_cloud"))
+            })
+            .unwrap_or(false);
+        if !exists {
+            conn.execute_batch(
+                "ALTER TABLE anpr_config ADD COLUMN prefer_cloud INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| format!("migration 24 add prefer_cloud failed: {e}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 24;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -863,6 +907,7 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
             "view_reporting_dashboard",
             "view_system_health",
             "view_gate_entries",
+            "acknowledge_health_alerts",
         ],
     ),
     ("preset-reporting", "Reporting", &["view_reporting_dashboard", "export_reporting"]),

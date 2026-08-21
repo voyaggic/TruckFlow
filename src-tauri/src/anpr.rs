@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 use serde_json::json;
 use tauri::State;
 
+use crate::capture::anpr_service_url;
 use crate::db::{append_audit, now_iso, ANPR_CONFIG_ID, AppState};
 use crate::models::{
     AnprConfigView, AnprCredentialView, AnprDiagnosticsView, CameraSourceView,
@@ -47,7 +48,7 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
         "SELECT active_ocr_engine, confidence_threshold_paddleocr, confidence_threshold_easyocr,
                 plate_vehicle_ratio_threshold, plate_format_rules, discharge_confirmation_required,
                 save_recognition_images, retrain_candidate_threshold, is_capture_point,
-                max_pending_duration_hours
+                prefer_cloud, max_pending_duration_hours, designated_machine_id
          FROM anpr_config WHERE id = ?1",
         params![ANPR_CONFIG_ID],
         |r| {
@@ -61,11 +62,53 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
                 save_recognition_images: r.get::<_, i64>(6)? != 0,
                 retrain_candidate_threshold: r.get(7)?,
                 is_capture_point: r.get::<_, i64>(8)? != 0,
-                max_pending_duration_hours: r.get(9)?,
+                prefer_cloud: r.get::<_, i64>(9)? != 0,
+                max_pending_duration_hours: r.get(10)?,
+                designated_machine_id: r.get(11)?,
             })
         },
     )
     .map_err(|e| format!("anpr config read failed: {e}"))
+}
+
+/// Sync the prefer_cloud setting (and other runtime config) to config.json
+/// so the running ANPR service picks up changes without restart.
+fn sync_config_json(state: &State<AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let config = read_anpr_config(&conn)?;
+    // Read cloud credentials
+    let cloud_api_url: String = conn
+        .query_row(
+            "SELECT value FROM key_value_ref WHERE key = 'cloud_anpr_api_url'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let cloud_api_key: String = conn
+        .query_row(
+            "SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    // Read current source from existing config.json
+    let anpr_dir = crate::find_anpr_dir();
+    let config_path = anpr_dir.join("config.json");
+    let mut cfg: serde_json::Value = if config_path.exists() {
+        std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    // Update only the fields that the ANPR service reads
+    cfg["prefer_cloud"] = serde_json::json!(config.prefer_cloud);
+    cfg["cloud_api_url"] = serde_json::json!(cloud_api_url);
+    cfg["cloud_api_key"] = serde_json::json!(cloud_api_key);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
+        .map_err(|e| format!("Failed to write config.json: {e}"))?;
+    Ok(())
 }
 
 /// Update configuration. All fields are optional so a single screen can save a
@@ -86,6 +129,8 @@ pub fn update_anpr_config(
     retrain_candidate_threshold: Option<i64>,
     is_capture_point: Option<bool>,
     max_pending_duration_hours: Option<f64>,
+    designated_machine_id: Option<String>,
+    prefer_cloud: Option<bool>,
 ) -> Result<AnprConfigView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
@@ -138,9 +183,10 @@ pub fn update_anpr_config(
             save_recognition_images = COALESCE(?7, save_recognition_images),
             retrain_candidate_threshold = COALESCE(?8, retrain_candidate_threshold),
             is_capture_point = COALESCE(?9, is_capture_point),
-            max_pending_duration_hours = COALESCE(?10, max_pending_duration_hours),
-            updated_by = ?11, updated_at = ?12
-         WHERE id = ?13",
+            prefer_cloud = COALESCE(?10, prefer_cloud),
+            designated_machine_id = COALESCE(?11, designated_machine_id),
+            updated_by = ?12, updated_at = ?13
+         WHERE id = ?14",
         params![
             engine,
             confidence_threshold_paddleocr,
@@ -151,7 +197,8 @@ pub fn update_anpr_config(
             save_recognition_images.map(|b| if b { 1 } else { 0 }),
             retrain_candidate_threshold,
             is_capture_point.map(|b| if b { 1 } else { 0 }),
-            max_pending_duration_hours,
+            prefer_cloud,
+            designated_machine_id,
             actor_id,
             now_iso(),
             ANPR_CONFIG_ID,
@@ -168,7 +215,13 @@ pub fn update_anpr_config(
         )?;
     }
     append_audit(&conn, &actor_id, "updated_anpr_config", None, None)?;
-    read_anpr_config(&conn)
+
+    // Sync prefer_cloud to config.json so the running ANPR service picks it up
+    drop(conn);
+    let _ = sync_config_json(&state);
+
+    let conn2 = state.db.lock().map_err(|e| e.to_string())?;
+    read_anpr_config(&conn2)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +375,18 @@ pub fn delete_camera_source(
         params![source_id],
     )
     .map_err(|e| format!("camera source delete failed: {e}"))?;
-    append_audit(&conn, &actor_id, "deleted_camera_source", Some(&source_id), Some(json!({ "label": label })))?;
+    // Archive all queued trips since a camera source was removed — the queue
+    // is only meaningful while the pipeline that produced those reads is active.
+    let archived = conn
+        .execute(
+            "UPDATE trips SET archived = 1, updated_at = ?1 WHERE status = 'queued' AND COALESCE(archived, 0) = 0",
+            params![crate::db::now_iso()],
+        )
+        .unwrap_or(0);
+    if archived > 0 {
+        println!("[ANPR] Archived {archived} queued trips after deleting camera source '{label}'");
+    }
+    append_audit(&conn, &actor_id, "deleted_camera_source", Some(&source_id), Some(json!({ "label": label, "archived_trips": archived })))?;
     Ok(())
 }
 
@@ -345,7 +409,8 @@ pub fn test_camera_connection(
         .map_err(|_| "Camera source not found.".to_string())?;
 
     let now = now_iso();
-    let result = test_reachable(&source_type, &connection_string);
+    let svc_url = anpr_service_url(&conn);
+    let result = test_reachable(&source_type, &connection_string, &svc_url);
     let status = if result.is_ok() { "active" } else { "inactive" };
     let result_str = match &result {
         Ok(msg) => msg.clone(),
@@ -384,7 +449,7 @@ fn parse_host_port(url: &str) -> (String, u16) {
     (host, port)
 }
 
-fn test_reachable(source_type: &str, connection_string: &str) -> Result<String, String> {
+fn test_reachable(source_type: &str, connection_string: &str, service_url: &str) -> Result<String, String> {
     match source_type {
         "rtsp" => {
             let (host, port) = parse_host_port(connection_string);
@@ -410,8 +475,13 @@ fn test_reachable(source_type: &str, connection_string: &str) -> Result<String, 
             }
         }
         "live_test" => {
-            std::net::TcpStream::connect("127.0.0.1:9800")
-                .map_err(|_| "ANPR service not running on port 9800".to_string())?;
+            // Extract host:port from the configured service URL
+            let addr_str = service_url
+                .strip_prefix("http://").or_else(|| service_url.strip_prefix("https://"))
+                .unwrap_or(service_url)
+                .split('/').next().unwrap_or("127.0.0.1:9800");
+            std::net::TcpStream::connect(addr_str)
+                .map_err(|_| format!("ANPR service not reachable at {addr_str}"))?;
             Ok(format!("ANPR service reachable at {connection_string}"))
         }
         _ => {
@@ -655,6 +725,92 @@ pub fn list_training_candidates(state: State<AppState>) -> Result<Vec<TrainingCa
         .map_err(|e| format!("training candidate read failed: {e}"))
 }
 
+/// Add a training candidate manually (with plate number and frame image).
+/// The image file is copied into the frames directory.
+#[tauri::command]
+pub fn add_training_candidate(
+    state: State<AppState>,
+    actor_id: String,
+    plate_number: String,
+    frame_path: String,
+) -> Result<TrainingCandidateView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_iso();
+    // Copy the frame image into the frames directory
+    let dest = state.frames_dir.join(format!("candidate_{id}.jpg"));
+    std::fs::copy(&frame_path, &dest)
+        .map_err(|e| format!("Failed to copy frame image: {e}"))?;
+    let frame_ref = dest.to_string_lossy().to_string();
+    conn.execute(
+        "INSERT INTO training_candidates (id, frame_ref, reason, created_at, updated_at)
+         VALUES (?1, ?2, 'manual_upload', ?3, ?3)",
+        params![id, frame_ref, now],
+    )
+    .map_err(|e| format!("Failed to insert training candidate: {e}"))?;
+    Ok(TrainingCandidateView {
+        id,
+        source_trip_id: None,
+        plate_number: Some(plate_number),
+        frame_ref,
+        reason: "manual_upload".into(),
+        used_in_model_version_id: None,
+        created_at: now,
+    })
+}
+
+/// Approve a training candidate (mark it as used in training).
+#[tauri::command]
+pub fn approve_training_candidate(
+    state: State<AppState>,
+    actor_id: String,
+    candidate_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    conn.execute(
+        "DELETE FROM training_candidates WHERE id = ?1",
+        params![candidate_id],
+    )
+    .map_err(|e| format!("Failed to approve candidate: {e}"))?;
+    append_audit(&conn, &actor_id, "approved_training_candidate", Some(&candidate_id), None)?;
+    Ok(())
+}
+
+/// Reject a training candidate (remove it from the pool).
+#[tauri::command]
+pub fn reject_training_candidate(
+    state: State<AppState>,
+    actor_id: String,
+    candidate_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    conn.execute(
+        "DELETE FROM training_candidates WHERE id = ?1",
+        params![candidate_id],
+    )
+    .map_err(|e| format!("Failed to reject candidate: {e}"))?;
+    append_audit(&conn, &actor_id, "rejected_training_candidate", Some(&candidate_id), None)?;
+    Ok(())
+}
+
+/// Approve all training candidates (clear the pool).
+#[tauri::command]
+pub fn approve_all_training_candidates(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let count = conn
+        .execute("DELETE FROM training_candidates", [])
+        .map_err(|e| format!("Failed to approve all candidates: {e}"))?;
+    append_audit(&conn, &actor_id, "approved_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
+    Ok(count as i64)
+}
+
 // ---------------------------------------------------------------------------
 // anpr_credentials — API / license keys, masked + rotatable (§8 Credentials
 // sub-tab). Values are stored in the DB row (single-user desktop app) but
@@ -797,22 +953,150 @@ fn credential_by_id(conn: &Connection, key_name: &str) -> Result<AnprCredentialV
 }
 
 // ---------------------------------------------------------------------------
+// Machine fingerprint for ANPR auto-start (machine-specific detection)
+// ---------------------------------------------------------------------------
+
+/// Machine information returned to the frontend for display and matching.
+#[derive(serde::Serialize)]
+pub struct MachineInfo {
+    pub hostname: String,
+    pub mac_address: String,
+    pub machine_id: String,
+}
+
+/// Generate a machine fingerprint from hostname + first non-loopback MAC address.
+fn generate_machine_id() -> MachineInfo {
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Get MAC addresses via ipconfig (Windows) or ifconfig (Linux/Mac)
+    let mac_address = get_primary_mac_address();
+
+    // Combine hostname + MAC for a unique machine ID
+    let machine_id = format!("{}:{}", hostname, mac_address);
+
+    MachineInfo {
+        hostname,
+        mac_address,
+        machine_id,
+    }
+}
+
+/// Get the primary non-loopback MAC address.
+fn get_primary_mac_address() -> String {
+    use std::process::Command;
+
+    // Try Windows ipconfig first
+    if let Ok(output) = Command::new("ipconfig").arg("/all").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_mac = String::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Physical Address") || trimmed.starts_with("适配器") && trimmed.contains("Physical") {
+                // Extract MAC from line like "Physical Address. . . . . . . . . : AA-BB-CC-DD-EE-FF"
+                if let Some(mac_part) = trimmed.split(':').last() {
+                    let mac = mac_part.trim().replace('-', ":");
+                    if mac != "00-00-00-00-00-00" && !mac.contains("00:00:00:00:00:00") && !mac.is_empty() {
+                        current_mac = mac;
+                    }
+                }
+            }
+        }
+        if !current_mac.is_empty() {
+            return current_mac;
+        }
+    }
+
+    // Fallback: try getmac command
+    if let Ok(output) = Command::new("getmac").arg("/fo").arg("csv").arg("/nh").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // CSV format: "AA-BB-CC-DD-EE-FF","Transport Name","..."
+            if let Some(mac_part) = line.split(',').next() {
+                let mac = mac_part.trim().trim_matches('"').replace('-', ":");
+                if !mac.is_empty() && mac != "00:00:00:00:00:00" {
+                    return mac;
+                }
+            }
+        }
+    }
+
+    "unknown".to_string()
+}
+
+/// Get machine info for the current machine.
+#[tauri::command]
+pub fn get_machine_info() -> Result<MachineInfo, String> {
+    Ok(generate_machine_id())
+}
+
+/// Set the current machine as the designated ANPR machine.
+/// Stores the machine fingerprint in anpr_config so auto-start only triggers
+/// on this specific machine.
+#[tauri::command]
+pub fn set_anpr_machine(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<MachineInfo, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    let info = generate_machine_id();
+    conn.execute(
+        "UPDATE anpr_config SET designated_machine_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![info.machine_id, now_iso(), ANPR_CONFIG_ID],
+    )
+    .map_err(|e| format!("machine designation failed: {e}"))?;
+    append_audit(&conn, &actor_id, "designated_anpr_machine", None, Some(json!({
+        "hostname": info.hostname,
+        "machine_id": info.machine_id,
+    })))?;
+    Ok(info)
+}
+
+/// Get the currently designated ANPR machine ID (if any).
+#[tauri::command]
+pub fn get_anpr_machine(state: State<AppState>) -> Result<Option<String>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT designated_machine_id FROM anpr_config WHERE id = ?1",
+            params![ANPR_CONFIG_ID],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(result)
+}
+
+/// Check if the current machine matches the designated ANPR machine.
+/// Returns true if no machine is designated (any machine can auto-start),
+/// or if the current machine's fingerprint matches.
+#[tauri::command]
+pub fn check_machine_match(state: State<AppState>) -> Result<bool, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let designated: Option<String> = conn
+        .query_row(
+            "SELECT designated_machine_id FROM anpr_config WHERE id = ?1",
+            params![ANPR_CONFIG_ID],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    match designated {
+        None => Ok(true), // no designation = any machine can auto-start
+        Some(designated_id) => {
+            let current = generate_machine_id();
+            Ok(current.machine_id == designated_id)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics sub-tab (§1 Diagnostics, §3 dependency checks, §10)
 // ---------------------------------------------------------------------------
 
 /// Whether a program is available on PATH (e.g. ffmpeg). Returns (ok, detail).
-fn program_available(name: &str) -> (bool, String) {
-    use std::process::Command;
-    match Command::new(name).arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(name).to_string();
-            (true, first)
-        }
-        Ok(_) => (false, format!("{name} found but returned an error")),
-        Err(_) => (false, format!("{name} not found on PATH")),
-    }
-}
-
 /// Approximate whether Python has OpenCV importable (the ANPR service's OCR
 /// dependency). Best-effort: `python -c "import cv2"`.
 fn python_opencv_available() -> (bool, String) {
@@ -856,6 +1140,13 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
+/// Return the configured ANPR service URL for the frontend.
+#[tauri::command]
+pub fn get_anpr_service_url(state: State<AppState>) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(anpr_service_url(&conn))
+}
+
 /// Full Diagnostics sub-tab payload: dependency health, storage usage, ANPR
 /// service reachability and the recent service error log. Gated on the same
 /// `manage_anpr_config` permission as the rest of the page.
@@ -864,20 +1155,23 @@ pub fn anpr_diagnostics(state: State<AppState>) -> Result<AnprDiagnosticsView, S
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut deps: Vec<DependencyHealthView> = Vec::new();
 
-    let (ffmpeg_ok, ffmpeg_detail) = program_available("ffmpeg");
-    deps.push(DependencyHealthView { name: "ffmpeg".into(), ok: ffmpeg_ok, detail: ffmpeg_detail });
     let (cv_ok, cv_detail) = python_opencv_available();
     deps.push(DependencyHealthView { name: "OpenCV (cv2)".into(), ok: cv_ok, detail: cv_detail });
 
-    // ANPR service reachability (127.0.0.1:9800) — mirrors the live-test check.
-    let service_ok = std::net::TcpStream::connect("127.0.0.1:9800").is_ok();
+    // ANPR service reachability — use HTTP health check (same as Engine tab).
+    let svc_url = anpr_service_url(&conn);
+    let health_url = format!("{}/health", svc_url.trim_end_matches('/'));
+    let service_ok = match reqwest::blocking::get(&health_url) {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    };
     deps.push(DependencyHealthView {
         name: "ANPR service".into(),
         ok: service_ok,
         detail: if service_ok {
-            "Service reachable on port 9800".to_string()
+            format!("Health check OK at {svc_url}")
         } else {
-            "ANPR service not running — start anpr-service/main.py to capture plates".to_string()
+            format!("Not reachable at {svc_url} — start the ANPR service")
         },
     });
 
@@ -898,6 +1192,10 @@ pub fn anpr_diagnostics(state: State<AppState>) -> Result<AnprDiagnosticsView, S
         human_bytes(db_bytes),
         human_bytes(storage_total)
     );
+    let storage_breakdown = vec![
+        crate::models::StorageBreakdownItem { label: "Captured frames".into(), bytes: frames_bytes },
+        crate::models::StorageBreakdownItem { label: "SQLite database".into(), bytes: db_bytes },
+    ];
 
     // Recent ANPR-service error log from system health events (component = anpr_service).
     let mut stmt = conn
@@ -929,6 +1227,7 @@ pub fn anpr_diagnostics(state: State<AppState>) -> Result<AnprDiagnosticsView, S
         dependencies: deps,
         storage_bytes: storage_total,
         storage_detail,
+        storage_breakdown,
         service_running: service_ok,
         error_log,
     })

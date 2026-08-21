@@ -281,14 +281,14 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   </button>
                 ) : (
                   <button className="primary" disabled title="Only gate officers can approve">
-                    Approve ⛔
+                    Approve
                   </button>
                 )}
                 {canEditTrip ? (
                   <button onClick={() => openResolve(current)}>Edit before confirming</button>
                 ) : (
                   <button disabled title="Only gate officers can edit trips">
-                    Edit ⛔
+                    Edit
                   </button>
                 )}
                 {canResolve ? (
@@ -297,7 +297,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   </button>
                 ) : (
                   <button className="danger" disabled title="Only gate officers can decline">
-                    Decline ⛔
+                    Decline
                   </button>
                 )}
                 {!canResolve && canRegisterVehicle && (
@@ -352,6 +352,26 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
           <h3 style={{ margin: 0, fontSize: 15 }}>
             Verification Queue <span className="badge">{queued.length}</span>
           </h3>
+          {queued.length > 0 && canResolve && (
+            <button
+              className="small danger"
+              onClick={async () => {
+                if (!window.confirm(`Archive all ${queued.length} queued items? They can be restored later by an admin.`)) return;
+                try {
+                  for (const t of queued) {
+                    await api.archiveTrip(user.id, t.id);
+                  }
+                  setFlash(`${queued.length} queued items archived`);
+                  setTimeout(() => setFlash(null), 2500);
+                  await refresh();
+                } catch (e) {
+                  setError(String(e));
+                }
+              }}
+            >
+              Clear All
+            </button>
+          )}
         </div>
         {queued.length === 0 ? (
           <p className="muted small" style={{ margin: "10px 0 0" }}>
@@ -366,13 +386,32 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   <span className="badge">{reasonLabel(t.reason ?? "", entityLabel("vehicle"))}</span>
                   <span className="muted small">{fmtTime(t.time_in)}</span>
                 </div>
-                {canResolve ? (
-                  <button className="primary" onClick={() => openResolve(t)}>
-                    Resolve
-                  </button>
-                ) : (
-                  <span className="muted small">view only</span>
-                )}
+                <div className="row" style={{ gap: 6 }}>
+                  {canResolve ? (
+                    <button className="primary" onClick={() => openResolve(t)}>
+                      Resolve
+                    </button>
+                  ) : (
+                    <span className="muted small">view only</span>
+                  )}
+                  {canResolve && (
+                    <button
+                      className="small danger"
+                      style={{ fontSize: 11, padding: "2px 8px" }}
+                      title="Archive this queued item"
+                      onClick={async () => {
+                        try {
+                          await api.archiveTrip(user.id, t.id);
+                          await refresh();
+                        } catch (e) {
+                          setError(String(e));
+                        }
+                      }}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -860,7 +899,7 @@ function ResolveScreen({
                 </button>
               ) : (
                 <button className="primary" disabled title="Only gate officers can confirm trips">
-                  Confirm ⛔
+                  Confirm
                 </button>
               )}
               {canRegisterVehicle ? (
@@ -869,7 +908,7 @@ function ResolveScreen({
                 </button>
               ) : (
                 <button className="ghost" disabled title="Only admins can register new vehicles">
-                  New vehicle ⛔
+                  New vehicle
                 </button>
               )}
               {canEditTrip ? (
@@ -878,7 +917,7 @@ function ResolveScreen({
                 </button>
               ) : (
                 <button className="danger" disabled title="Only gate officers can discard">
-                  Discard ⛔
+                  Discard
                 </button>
               )}
               {canEditTrip ? (
@@ -887,7 +926,7 @@ function ResolveScreen({
                 </button>
               ) : (
                 <button className="danger" disabled title="Only gate officers can decline">
-                  Decline ⛔
+                  Decline
                 </button>
               )}
               <button className="ghost" onClick={onClose} disabled={busy}>
@@ -980,7 +1019,7 @@ function ResolveScreen({
                     </button>
                   ) : (
                     <button className="primary" disabled title="Only gate officers can confirm trips">
-                      Attach ⛔
+                      Attach
                     </button>
                   )}
                   <button className="ghost" onClick={() => setDupWarning(null)} disabled={busy}>
@@ -997,7 +1036,7 @@ function ResolveScreen({
                 </button>
               ) : (
                 <button className="primary" disabled title="Only admins can register new vehicles">
-                  Register ⛔
+                  Register
                 </button>
               )}
               <button className="ghost" onClick={() => setRegisterNew(false)} disabled={busy}>

@@ -85,18 +85,19 @@ impl AnprSource for SimulatorSource {
 /// Polls a real local ANPR service over HTTP (`{plate, confidence, timestamp,
 /// frames}` JSON). The production Plate Recognizer adapter plugs in here.
 pub struct HttpSource {
+    pub service_url: String,
     last_timestamp: Mutex<Option<String>>,
 }
 
 impl HttpSource {
-    pub fn new() -> Self {
-        Self { last_timestamp: Mutex::new(None) }
+    pub fn new(service_url: String) -> Self {
+        Self { service_url, last_timestamp: Mutex::new(None) }
     }
 }
 
 impl AnprSource for HttpSource {
     fn poll(&self) -> Option<AnprRead> {
-        let url = format!("http://127.0.0.1:9800/latest");
+        let url = format!("{}/latest", self.service_url.trim_end_matches('/'));
         let body = fetch_http(&url)?;
         let v: Value = serde_json::from_str(&body).ok()?;
         let read: AnprRead = serde_json::from_value(v).ok()?;
@@ -117,7 +118,12 @@ impl HttpSource {
     pub fn reachable(&self) -> bool {
         use std::net::TcpStream;
         use std::time::Duration;
-        match "127.0.0.1:9800".parse() {
+        // Extract host:port from service_url (e.g. "http://127.0.0.1:9800" -> "127.0.0.1:9800")
+        let addr_str = self.service_url
+            .strip_prefix("http://").or_else(|| self.service_url.strip_prefix("https://"))
+            .unwrap_or(&self.service_url)
+            .split('/').next().unwrap_or("127.0.0.1:9800");
+        match addr_str.parse() {
             Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(),
             Err(_) => false,
         }
@@ -1123,7 +1129,7 @@ pub fn search_trips(state: State<AppState>, query: String) -> Result<Vec<TripVie
 pub fn list_queued(state: State<AppState>) -> Result<Vec<TripView>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare(&format!("{TRIP_SELECT} WHERE t.status = 'queued' ORDER BY t.time_in ASC"))
+        .prepare(&format!("{TRIP_SELECT} WHERE t.status = 'queued' AND COALESCE(t.archived, 0) = 0 ORDER BY t.time_in ASC"))
         .map_err(|e| format!("queue list failed: {e}"))?;
     let rows = stmt
         .query_map([], read_trip)
@@ -1178,8 +1184,12 @@ pub fn set_capture_settings(
         )
         .map_err(|e| format!("threshold update failed: {e}"))?;
     }
+    let mut should_kill_anpr = false;
     if let Some(e) = anpr_enabled {
         set_setting(&conn, "anpr_enabled", if e { "true" } else { "false" })?;
+        if !e {
+            should_kill_anpr = true;
+        }
     }
     if let Some(s) = anpr_source {
         if s != "simulator" && s != "http" {
@@ -1214,6 +1224,10 @@ pub fn set_capture_settings(
         .map_err(|e| format!("update is_capture_point failed: {e}"))?;
     }
     append_audit(&conn, &actor_id, "updated_capture_settings", None, None)?;
+    drop(conn);
+    if should_kill_anpr {
+        let _ = stop_anpr_service_inner(&state);
+    }
     Ok(())
 }
 
@@ -1709,6 +1723,72 @@ pub fn emit_capture_update(app: &AppHandle) {
 use std::fs;
 use std::process::{Command as StdCommand, Stdio};
 
+/// Find a working Python executable by trying common names.
+/// Returns the first one that resolves to an actual file.
+fn find_python() -> String {
+    let candidates = if cfg!(target_os = "windows") {
+        vec!["python.exe", "python3.exe", "py.exe"]
+    } else {
+        vec!["python3", "python"]
+    };
+    for name in &candidates {
+        // Use `where` on Windows to find the full path
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(output) = StdCommand::new("where").arg(name).output() {
+                if output.status.success() {
+                    let out = String::from_utf8_lossy(&output.stdout);
+                    if let Some(first_line) = out.lines().next() {
+                        let path = first_line.trim().to_string();
+                        if std::path::Path::new(&path).exists() {
+                            eprintln!("[ANPR] Found Python at: {path}");
+                            return path;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Ok(output) = StdCommand::new("which").arg(name).output() {
+                if output.status.success() {
+                    let out = String::from_utf8_lossy(&output.stdout);
+                    if let Some(first_line) = out.lines().next() {
+                        let path = first_line.trim().to_string();
+                        if std::path::Path::new(&path).exists() {
+                            return path;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: try running the command directly (works if it's in PATH)
+        if let Ok(output) = StdCommand::new(name).arg("--version").output() {
+            if output.status.success() {
+                return name.to_string();
+            }
+        }
+    }
+    // Last resort — try common install paths on Windows
+    #[cfg(target_os = "windows")]
+    {
+        let common_paths = [
+            r"C:\Python312\python.exe",
+            r"C:\Python311\python.exe",
+            r"C:\Python310\python.exe",
+            r"C:\Users\*\AppData\Local\Programs\Python\Python3*\python.exe",
+        ];
+        for pattern in &common_paths {
+            if let Ok(output) = StdCommand::new(pattern).arg("--version").output() {
+                if output.status.success() {
+                    return pattern.to_string();
+                }
+            }
+        }
+    }
+    "python".to_string()
+}
+
 /// Path to the ANPR service config.json (written by the app, read by the service)
 fn anpr_config_path() -> String {
     let base = std::env::current_dir().unwrap_or_default();
@@ -1724,10 +1804,41 @@ pub fn write_anpr_config(
     source_type: Option<String>,
     mock: Option<bool>,
 ) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // Read cloud settings from anpr_config and anpr_credentials
+    let active_engine: String = conn
+        .query_row(
+            "SELECT active_ocr_engine FROM anpr_config WHERE id = ?1",
+            params![crate::db::ANPR_CONFIG_ID],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "paddleocr".to_string());
+    let prefer_cloud = active_engine == "cloud_provider";
+
+    let cloud_api_url: String = conn
+        .query_row(
+            "SELECT value FROM key_value_ref WHERE key = 'cloud_anpr_api_url'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "https://api.platerecognizer.com".to_string());
+
+    let cloud_api_key: String = conn
+        .query_row(
+            "SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    drop(conn);
+
     let cfg = serde_json::json!({
         "source": source_url,
         "source_type": source_type,
         "mock": mock.unwrap_or(false),
+        "prefer_cloud": prefer_cloud,
+        "cloud_api_url": cloud_api_url,
+        "cloud_api_key": cloud_api_key,
     });
     let path = anpr_config_path();
     fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
@@ -1745,13 +1856,47 @@ pub fn start_anpr_service(
     // Kill any existing process first
     let _ = stop_anpr_service_inner(&state);
 
-    let anpr_dir = std::env::current_dir().map_err(|e| e.to_string())?.join("anpr-service");
+    let anpr_dir = crate::find_anpr_dir();
     if !anpr_dir.exists() {
         return Err(format!("ANPR service directory not found: {}", anpr_dir.display()));
     }
 
+    // Write config.json from DB settings before starting the service
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let config = crate::anpr::read_anpr_config(&conn)?;
+        let cloud_api_url: String = conn
+            .query_row("SELECT value FROM key_value_ref WHERE key = 'cloud_anpr_api_url'", [], |r| r.get(0))
+            .unwrap_or_default();
+        let cloud_api_key: String = conn
+            .query_row("SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default();
+        // Read current source from DB (may be empty = idle mode)
+        let source: String = conn
+            .query_row("SELECT COALESCE(connection_string, '') FROM camera_sources WHERE status = 'active' LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default();
+        let source_type: String = conn
+            .query_row("SELECT COALESCE(source_type, '') FROM camera_sources WHERE status = 'active' LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default();
+        drop(conn);
+
+        let config_path = anpr_dir.join("config.json");
+        let cfg = serde_json::json!({
+            "source": source,
+            "source_type": source_type,
+            "prefer_cloud": config.prefer_cloud,
+            "cloud_api_url": cloud_api_url,
+            "cloud_api_key": cloud_api_key,
+        });
+        std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
+            .map_err(|e| format!("Failed to write config.json: {e}"))?;
+    }
+
+    // Find Python executable — try common names
+    let python_cmd = find_python();
+
     // Build the command — reads source from config.json
-    let mut cmd = StdCommand::new("python");
+    let mut cmd = StdCommand::new(&python_cmd);
     cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
     cmd.current_dir(&anpr_dir);
 
@@ -1789,10 +1934,48 @@ pub fn stop_anpr_service(
 }
 
 fn stop_anpr_service_inner(state: &State<AppState>) -> Result<usize, String> {
+    // First try graceful shutdown via HTTP endpoint
+    let service_url = {
+        let Ok(conn) = state.db.lock() else {
+            return Err("Cannot lock DB".to_string());
+        };
+        anpr_service_url(&conn)
+    };
+    // Try graceful shutdown via HTTP endpoint
+    {
+        // Parse the service URL to extract host:port for TCP connect
+        let host_port = service_url
+            .strip_prefix("http://")
+            .or_else(|| service_url.strip_prefix("https://"))
+            .unwrap_or(&service_url)
+            .split('/')
+            .next()
+            .unwrap_or("127.0.0.1:9800");
+        if let Ok(mut stream) = std::net::TcpStream::connect(host_port) {
+            let host = host_port.split(':').next().unwrap_or("127.0.0.1");
+            let req = format!("GET /shutdown HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            let _ = std::io::Write::write_all(&mut stream, req.as_bytes());
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    }
+
+    // Then force-kill any remaining processes
     let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
     let mut count = 0;
     for mut child in procs.drain(..) {
-        let _ = child.kill();
+        let pid = child.id();
+        // On Windows, use taskkill to kill the entire process tree
+        // (Python may have spawned child processes that kill() won't reach)
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = child.kill();
+        }
         let _ = child.wait();
         count += 1;
     }
@@ -1852,6 +2035,57 @@ pub struct DetectionImage {
     pub filename: String,
     pub size_bytes: u64,
     pub modified: String,
+}
+
+/// Delete detection frames. If trip_ids is provided, deletes only those trips'
+/// frames. Otherwise deletes ALL captured frames (clear all).
+#[tauri::command]
+pub fn delete_detection_frames(
+    state: State<AppState>,
+    actor_id: String,
+    trip_ids: Option<Vec<String>>,
+) -> Result<usize, String> {
+    let frames_dir = &state.frames_dir;
+    if !frames_dir.exists() {
+        return Ok(0);
+    }
+    let mut deleted = 0;
+    if let Some(ref ids) = trip_ids {
+        // Delete specific trip frames
+        for tid in ids {
+            let trip_dir = frames_dir.join(tid);
+            if trip_dir.exists() {
+                deleted += count_files(&trip_dir);
+                let _ = std::fs::remove_dir_all(&trip_dir);
+            }
+        }
+    } else {
+        // Delete ALL captured frames
+        for entry in std::fs::read_dir(frames_dir).map_err(|e| e.to_string())?.flatten() {
+            if entry.path().is_dir() {
+                deleted += count_files(&entry.path());
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    append_audit(&conn, &actor_id, "deleted_detection_frames", None,
+        Some(serde_json::json!({"count": deleted, "trip_ids": trip_ids.as_ref()})))?;
+    Ok(deleted)
+}
+
+fn count_files(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                count += count_files(&entry.path());
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Load a single detection image as base64 for preview.

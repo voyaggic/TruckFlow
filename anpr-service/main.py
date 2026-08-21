@@ -25,11 +25,11 @@ Endpoints (all JSON unless noted):
   GET /health          {"ok": true}
 
 Run:
-  python main.py --source http://192.168.1.5:8080/videofeed   # phone (MJPEG)
+  python main.py --port 9800                                  # idle (reads config.json)
+  python main.py --source http://IP:8080/videofeed            # phone (MJPEG)
   python main.py --source rtsp://user:pass@cam:554/stream1    # real CCTV (RTSP)
-  python main.py --source C:/path/to/video.mp4                # dev video file
+  python main.py --source /path/to/video.mp4                  # video file
   python main.py --source usb:0                               # webcam
-  python main.py --source file --mock                         # no OCR deps, dev
 """
 
 from __future__ import annotations
@@ -56,14 +56,54 @@ from sort import Sort
 PLATE_FORMAT = "K{:03d}{}{:02d}"  # Kenyan-style: K123AB45
 
 
-class OcrBackend:
-    """Abstraction over plate OCR. Tries paddleocr -> easyocr -> fallback."""
+def _normalize_cloud_response(data: dict) -> list[tuple[str, float]] | None:
+    """Normalize Roboflow workflow JSON → [(plate_text, confidence), ...].
 
-    def __init__(self):
+    Handles:
+      - { "outputs": [ { "results": [ {"text": "ABC123", "confidence": 0.92} ] } ] }
+      - Empty / no results → None (triggers local fallback)
+
+    Update this single function if Roboflow changes their response shape.
+    """
+    try:
+        outputs = data.get("outputs", [])
+        if not outputs:
+            return None
+        results = outputs[0].get("results", [])
+        if not results:
+            return None
+        normalized = []
+        for item in results:
+            plate = "".join(ch for ch in (item.get("text", "") or "").upper() if ch.isalnum())
+            conf = float(item.get("confidence", 0))
+            if len(plate) >= 4 and conf >= 0.35:
+                normalized.append((plate, conf))
+        return normalized if normalized else None
+    except Exception:
+        return None
+
+
+class OcrBackend:
+    """Abstraction over plate OCR. Tries cloud (if configured) -> paddleocr -> easyocr -> fallback."""
+
+    def __init__(self, prefer_cloud: bool = False, cloud_api_url: str = "", cloud_api_key: str = ""):
         self.name = "none"
         self.reader = None
         self.paddle = None
         self.model_version = None
+        self.prefer_cloud = prefer_cloud
+        self.cloud_api_url = cloud_api_url.rstrip("/")
+        self.cloud_api_key = cloud_api_key
+        self._models_loaded = False
+        # Do NOT load models here — defer to first read() call
+        # This keeps the HTTP server responsive during app startup
+        print("[OCR] Engine configured (models will load on first frame)")
+
+    def _ensure_models(self) -> None:
+        """Load OCR models on first use (lazy initialization)."""
+        if self._models_loaded:
+            return
+        self._models_loaded = True
         # Try PaddleOCR first (faster, better for plates)
         try:
             from paddleocr import PaddleOCR  # type: ignore
@@ -71,7 +111,7 @@ class OcrBackend:
             self.paddle = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
             self.name = "paddleocr"
             self.model_version = "paddleocr-en"
-            print("[OCR] Using PaddleOCR")
+            print("[OCR] PaddleOCR loaded (local)")
             return
         except Exception as e:
             print(f"[OCR] PaddleOCR not available: {e}")
@@ -82,19 +122,67 @@ class OcrBackend:
             self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
             self.name = "easyocr"
             self.model_version = "easyocr-en"
-            print("[OCR] Using EasyOCR")
+            print("[OCR] EasyOCR loaded (local)")
             return
         except Exception as e:
             print(f"[OCR] EasyOCR not available: {e}")
         print("[OCR] WARNING: No OCR engine available!")
 
     def read(self, frame: np.ndarray) -> list[tuple[str, float]]:
-        """Return [(plate_text, confidence)] for the plates visible in frame."""
+        """Return [(plate_text, confidence)] for the plates visible in frame.
+
+        If cloud is preferred and the API is reachable, use cloud OCR.
+        On any failure (timeout, network error, API error), fall back to local.
+        Models are loaded lazily on first call.
+        """
+        self._ensure_models()
+        if self.prefer_cloud and self.cloud_api_url and self.cloud_api_key:
+            cloud_result = self._cloud_read(frame)
+            if cloud_result is not None:
+                return cloud_result
+            # Cloud failed — fall through to local
+        # Local fallback: always available
         if self.paddle is not None:
             return self._paddle_read(frame)
         if self.reader is not None:
             return self._easyocr_read(frame)
         return []
+
+    def _cloud_read(self, frame: np.ndarray) -> list[tuple[str, float]] | None:
+        """Try cloud OCR via Roboflow workflow. Returns None on any failure (triggers local fallback)."""
+        try:
+            import cv2
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            img_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+
+            import urllib.request
+            import urllib.error
+
+            # Roboflow Serverless workflow format
+            payload = json.dumps({
+                "api_key": self.cloud_api_key,
+                "inputs": {
+                    "image": {
+                        "type": "base64",
+                        "value": img_b64,
+                    }
+                },
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                self.cloud_api_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            # Normalize Roboflow response → internal format
+            return _normalize_cloud_response(data)
+        except Exception as e:
+            print(f"[OCR] Cloud failed ({e}), using local fallback")
+            return None
 
     def _easyocr_read(self, frame: np.ndarray) -> list[tuple[str, float]]:
         results = []
@@ -464,26 +552,38 @@ class Pipeline:
         multipart streams directly (OpenCV VideoCapture can't handle these
         on Windows). For other sources (video files, USB, RTSP), uses OpenCV.
         Retries on stream drops with exponential backoff.
+        Stops retrying when shutdown signal is received or source is empty.
         """
+        # Bail immediately if no source configured
+        if not self.source or not self.source.strip():
+            print("[ANPR] No source configured — capture thread exiting")
+            return
+
         max_backoff = 30  # seconds
         attempt = 0
         # Use custom MJPEG reader for HTTP/HTTPS sources
         use_mjpeg = self.source_type == "http" and (
             self.source.startswith("http://") or self.source.startswith("https://")
         )
-        while True:
+        while not _shutdown_event.is_set():
             if use_mjpeg:
                 ok, frame = self._run_mjpeg_capture(attempt)
             else:
                 ok, frame = self._run_opencv_capture()
             if ok:
                 break  # EOF / normal exit
+            if _shutdown_event.is_set():
+                break
             # Failed — retry with backoff
             self.running = False
             attempt += 1
             wait = min(max_backoff, 2 ** attempt)
             print(f"[ANPR] Reconnecting in {wait}s (attempt {attempt})...")
-            time.sleep(wait)
+            # Sleep in small increments so we can respond to shutdown quickly
+            for _ in range(int(wait * 2)):
+                if _shutdown_event.is_set():
+                    return
+                time.sleep(0.5)
             self.sort = Sort(max_age=12, min_hits=2)
             self.readings.clear()
 
@@ -494,7 +594,7 @@ class Pipeline:
             self.running = True
             consecutive_failures = 0
             print(f"[ANPR] Camera connected (MJPEG): {self.source}")
-            while True:
+            while not _shutdown_event.is_set():
                 ok, frame = reader.read_frame()
                 if not ok or frame is None:
                     consecutive_failures += 1
@@ -530,7 +630,7 @@ class Pipeline:
             self.running = True
             consecutive_failures = 0
             print(f"[ANPR] Camera connected: {self.source}")
-            while True:
+            while not _shutdown_event.is_set():
                 ok, frame = cap.read()
                 if not ok:
                     consecutive_failures += 1
@@ -791,6 +891,11 @@ def serve(pipeline: Pipeline, port: int) -> None:
             path = self.path.split("?")[0]
             if path == "/status":
                 self._json(pipeline.status())
+            elif path == "/shutdown":
+                self._json({"shutting_down": True})
+                _shutdown_event.set()
+                # Schedule server shutdown from a separate thread to avoid deadlock
+                threading.Thread(target=lambda: (time.sleep(0.5), os._exit(0)), daemon=True).start()
             elif path == "/latest":
                 payload = pipeline.latest_payload()
                 if payload is None:
@@ -874,6 +979,9 @@ def infer_type(source: str) -> str:
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+# Global shutdown event for graceful stop
+_shutdown_event = threading.Event()
+
 
 def load_config() -> dict:
     """Load config from config.json if it exists."""
@@ -896,8 +1004,8 @@ def get_source_from_config() -> tuple[str, str]:
     """Read the camera source from config.json.
     Returns (source_url, source_type)."""
     cfg = load_config()
-    source = cfg.get("source", "http://127.0.0.1:8080/videofeed")
-    source_type = cfg.get("source_type") or infer_type(source)
+    source = cfg.get("source", "")
+    source_type = cfg.get("source_type") or (infer_type(source) if source else "")
     return source, source_type
 
 
@@ -910,21 +1018,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main() -> None:
+    import signal
+
     args = parse_args()
+    cfg = load_config()
     # Priority: CLI --source > config.json > default
     if args.source:
         source = args.source
         source_type = args.type or infer_type(source)
     else:
-        source, source_type = get_source_from_config()
+        source = cfg.get("source", "")
+        source_type = cfg.get("source_type") or infer_type(source) if source else ""
         if args.type:
             source_type = args.type
-    print(f"Camera source: {source} ({source_type})")
-    ocr = OcrBackend()
-    pipeline = Pipeline(source, source_type, ocr, args.port)
 
-    capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
-    capture_thread.start()
+    # If no source configured, start in idle mode (HTTP server only, no capture)
+    has_source = bool(source and source.strip())
+    if has_source:
+        print(f"Camera source: {source} ({source_type})")
+    else:
+        print("[ANPR] No camera source configured — starting in idle mode (HTTP server only)")
+
+    # Cloud OCR preference — read from config.json (written by Rust backend)
+    prefer_cloud = cfg.get("prefer_cloud", False)
+    cloud_api_url = cfg.get("cloud_api_url", "")
+    cloud_api_key = cfg.get("cloud_api_key", "")
+    if prefer_cloud and cloud_api_url:
+        print(f"[OCR] Cloud preferred — will try {cloud_api_url} first, local fallback on failure")
+    else:
+        print("[OCR] Local-only mode (cloud not preferred)")
+
+    ocr = OcrBackend(prefer_cloud=prefer_cloud, cloud_api_url=cloud_api_url, cloud_api_key=cloud_api_key)
+    pipeline = Pipeline(source or "", source_type or "", ocr, args.port)
+
+    # Graceful shutdown on SIGTERM/SIGINT (Windows and Unix)
+    def _shutdown(signum, frame):
+        print("[ANPR] Shutdown signal received")
+        _shutdown_event.set()
+        pipeline.running = False
+        threading.Thread(target=lambda: os._exit(0), daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    if has_source:
+        capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
+        capture_thread.start()
+    else:
+        print("[ANPR] No source — capture thread not started")
     serve(pipeline, args.port)
 
 
