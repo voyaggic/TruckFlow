@@ -1876,12 +1876,14 @@ pub fn start_anpr_service(
             .map_err(|e| format!("Failed to write config.json: {e}"))?;
     }
 
-    // Find Python executable — try common names
+    // Find Python executable — try known paths, fall back to PATH
     let python_cmd = find_python();
+    let main_py = anpr_dir.join("main.py");
+    eprintln!("[ANPR] python={python_cmd} main={} dir={}", main_py.display(), anpr_dir.display());
 
-    // Build the command — reads source from config.json
+    // Use absolute path for main.py and current_dir for the working directory
     let mut cmd = StdCommand::new(&python_cmd);
-    cmd.arg("-u").arg("main.py").arg("--port").arg("9800");
+    cmd.arg("-u").arg(&main_py).arg("--port").arg("9800");
     cmd.current_dir(&anpr_dir);
 
     // Capture stdout/stderr to a log file
