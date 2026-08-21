@@ -1881,21 +1881,20 @@ pub fn start_anpr_service(
     let main_py = anpr_dir.join("main.py");
     eprintln!("[ANPR] python={python_cmd} main={} dir={}", main_py.display(), anpr_dir.display());
 
-    // Use absolute path for main.py and current_dir for the working directory
+    eprintln!("[ANPR] python={} main={} dir={}", python_cmd, main_py.display(), anpr_dir.display());
+
+    // Launch Python with Stdio::null() to avoid the Windows os error 3
+    // that occurs when Stdio::from(File) tries to pass non-inheritable
+    // handles from a GUI/Tauri parent process. The ANPR service writes
+    // its own internal logs; we don't need Rust-side stdout/stderr capture.
     let mut cmd = StdCommand::new(&python_cmd);
     cmd.arg("-u").arg(&main_py).arg("--port").arg("9800");
     cmd.current_dir(&anpr_dir);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
 
-    // Capture stdout/stderr to a log file
-    let log_path = anpr_dir.join("anpr.log");
-    let log_file = fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    let log_file2 = log_file.try_clone().map_err(|e| e.to_string())?;
-    cmd.stdout(Stdio::from(log_file));
-    cmd.stderr(Stdio::from(log_file2));
-
-    eprintln!("[ANPR] Spawning: {python_cmd} -u main.py --port 9800 (dir: {})", anpr_dir.display());
     let child = cmd.spawn().map_err(|e| {
-        let msg = format!("Failed to start ANPR service: {e} (python: {python_cmd}, dir: {})", anpr_dir.display());
+        let msg = format!("Failed to start ANPR: {e} (python: {}, dir: {})", python_cmd, anpr_dir.display());
         eprintln!("[ANPR] {msg}");
         msg
     })?;
