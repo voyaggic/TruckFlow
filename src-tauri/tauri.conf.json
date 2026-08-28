@@ -34,8 +34,12 @@
     "targets": ["nsis", "msi"],
     "createUpdaterArtifacts": true,
     "resources": [
+      "anpr-service/main.py",
+      "anpr-service/sort.py",
+      "anpr-service/_enum_cameras.py",
       "anpr-service/requirements.txt",
-      "anpr-service/config.json"
+      "anpr-service/config.json",
+      "anpr-service/models/**"
     ],
     "windows": {
       "webviewInstallMode": {
