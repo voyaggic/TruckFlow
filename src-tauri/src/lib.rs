@@ -629,6 +629,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
             };
 
             // ── Postgres push (local → central) ──────────────────────────
+            let mut any_pushed = false;
             for (table, _display) in sync::PG_SYNC_TABLES {
                 // Read unsynced rows from dedicated sync connection
                 let rows = {
@@ -644,14 +645,15 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     Ok(ids) => ids,
                     Err(e) => { crate::log::log(&format!("[sync] push {table}: {e}")); continue; }
                 };
+                if !pushed_ids.is_empty() { any_pushed = true; }
                 // Mark synced
                 if !pushed_ids.is_empty() {
                     let Ok(conn) = sync_db.try_lock() else { continue };
                     let _ = sync::mark_rows_synced(&conn, table, &pushed_ids);
                 }
             }
-            // Update last synced timestamp
-            {
+            // Only update last synced timestamp when rows were actually pushed
+            if any_pushed {
                 let Ok(conn) = sync_db.try_lock() else { continue };
                 let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
             }

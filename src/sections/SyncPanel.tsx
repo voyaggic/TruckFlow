@@ -16,6 +16,11 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
 
   useEffect(() => {
     refresh();
+    // Auto-refresh every 5 seconds so pending counts update as the
+    // background poller pushes rows. Pure read-only call — no I/O beyond
+    // a single SQLite query, so no lag or freeze.
+    const id = setInterval(refresh, 5000);
+    return () => clearInterval(id);
   }, [refresh]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);

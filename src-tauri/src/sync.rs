@@ -968,7 +968,7 @@ pub fn sync_status(state: State<AppState>) -> Result<SyncStatusView, String> {
     let pg = pg_sync_state_impl(&conn, &*state.pg)?;
     let sheets = sheets_state_impl(&conn, &*state.sheets)?;
     Ok(SyncStatusView {
-        online: pg.connected,
+        online: pg.connected || sheets.connected,
         pg,
         sheets,
     })
@@ -991,7 +991,7 @@ pub fn sync_now_pg(state: State<AppState>, actor_id: String, handle: AppHandle) 
         // Phase 1: collect unsynced rows
         let (rows_by_table, pending_counts) = {
             let Ok(conn) = db.lock() else {
-                let _ = handle.emit("pg-sync-error", json!({ "error": "database busy" }));
+                let _ = handle.emit("pg-sync-done", json!({ "pushed": 0, "error": "database busy" }));
                 return;
             };
             let mut rows_by_table: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
@@ -1016,28 +1016,43 @@ pub fn sync_now_pg(state: State<AppState>, actor_id: String, handle: AppHandle) 
         // Phase 2: push to Postgres (no lock held)
         let mut total_pushed = 0i64;
         let mut pushed_ids_by_table: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut errors: Vec<String> = Vec::new();
         for (name, rows) in &rows_by_table {
             if pg.connected() && !rows.is_empty() {
-                if let Ok(ids) = pg.push_rows(name, rows) {
-                    total_pushed += rows.len() as i64;
-                    pushed_ids_by_table.insert(name.clone(), ids);
+                match pg.push_rows(name, rows) {
+                    Ok(ids) => {
+                        total_pushed += ids.len() as i64;
+                        pushed_ids_by_table.insert(name.clone(), ids);
+                    }
+                    Err(e) => {
+                        errors.push(e.clone());
+                        crate::log::log(&format!("[sync] manual push {name}: {e}"));
+                    }
                 }
             }
         }
 
         // Phase 3: mark synced + emit result
         {
-            let Ok(conn) = db.lock() else { return; };
+            let Ok(conn) = db.lock() else {
+                let _ = handle.emit("pg-sync-done", json!({ "pushed": total_pushed, "error": "database busy" }));
+                return;
+            };
             for (name, ids) in &pushed_ids_by_table {
                 for id in ids {
                     let _ = conn.execute(&format!("UPDATE {name} SET synced = 1 WHERE id = ?1"), params![id]);
                 }
             }
-            let _ = set_setting(&conn, "pg_last_synced_at", &now_iso());
+            // Only update last_synced_at when rows were actually pushed —
+            // otherwise the UI misleadingly shows a recent sync time.
+            if total_pushed > 0 {
+                let _ = set_setting(&conn, "pg_last_synced_at", &now_iso());
+            }
             let _ = append_audit(&conn, &actor, "manual_postgres_sync", None, Some(json!({ "pushed": total_pushed })));
         }
 
-        let _ = handle.emit("pg-sync-done", json!({ "pushed": total_pushed }));
+        let error_msg = if errors.is_empty() { None } else { Some(errors.join("; ")) };
+        let _ = handle.emit("pg-sync-done", json!({ "pushed": total_pushed, "error": error_msg }));
     });
     Ok("syncing".to_string())
 }

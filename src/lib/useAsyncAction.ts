@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /**
@@ -27,12 +27,52 @@ interface ActionEntry {
   successMsg?: string;
 }
 
+/** How long to wait for a backend event before giving up (ms). */
+const EVENT_TIMEOUT_MS = 30_000;
+
 export function useAsyncAction() {
   const [actions, setActions] = useState<Record<string, ActionEntry>>({});
-  const listenersRef = useRef<UnlistenFn[]>([]);
+  // Keep a ref in sync so the timeout callback always sees the latest state
+  // without needing `actions` in the dependency array of `fire`.
+  const actionsRef = useRef(actions);
+  actionsRef.current = actions;
+
+  // Track listeners by action key — one active listener per key, not an
+  // ever-growing array. Prevents memory leak when the user clicks Sync
+  // multiple times (each click used to pile up a new listener that was
+  // never cleaned up until component unmount).
+  const listenersRef = useRef<Map<string, UnlistenFn>>(new Map());
+  // Track safety-net timeouts per action key so we can clear them on
+  // success or on unmount.
+  const timeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
+
+  // Clean up all listeners and timeouts on unmount
+  useEffect(() => {
+    return () => {
+      for (const unlisten of listenersRef.current.values()) {
+        unlisten();
+      }
+      listenersRef.current.clear();
+      for (const t of timeoutsRef.current.values()) {
+        clearTimeout(t);
+      }
+      timeoutsRef.current.clear();
+    };
+  }, []);
 
   const updateAction = useCallback((key: string, entry: ActionEntry) => {
     setActions((prev) => ({ ...prev, [key]: entry }));
+  }, []);
+
+  /** Clear the safety-net timeout for a given action key. */
+  const clearSafetyTimeout = useCallback((key: string) => {
+    const t = timeoutsRef.current.get(key);
+    if (t) {
+      clearTimeout(t);
+      timeoutsRef.current.delete(key);
+    }
   }, []);
 
   /**
@@ -62,24 +102,69 @@ export function useAsyncAction() {
       // Immediately show pending state — user sees something happened
       updateAction(key, { state: "pending" });
 
+      // If there's a success event, register the listener FIRST so the
+      // backend emit can never race ahead of the JS listener attachment.
+      // This prevents the "Syncing…" button getting stuck forever when
+      // the spawned thread finishes before the listener is ready.
+      if (options?.successEvent) {
+        // Clean up any previous listener for this key before adding a new one.
+        // Without this, clicking Sync 3x creates 3 listeners that all fire
+        // and call refresh(), causing duplicate state updates.
+        const prev = listenersRef.current.get(key);
+        if (prev) {
+          prev();
+          listenersRef.current.delete(key);
+        }
+
+        // Also clear any existing safety-net timeout for this key.
+        clearSafetyTimeout(key);
+
+        listen(options.successEvent, (event) => {
+          // Event arrived — cancel the safety-net timeout.
+          clearSafetyTimeout(key);
+          updateAction(key, { state: "success", successMsg: options.successMsg });
+          options.onSuccess?.(event.payload);
+          options.refresh?.();
+          // Unlisten — we got what we came for.
+          const unlisten = listenersRef.current.get(key);
+          if (unlisten) {
+            unlisten();
+            listenersRef.current.delete(key);
+          }
+          // Auto-clear success state after 4 seconds
+          setTimeout(() => updateAction(key, { state: "idle" }), 4000);
+        }).then((unlisten) => {
+          listenersRef.current.set(key, unlisten);
+        });
+
+        // Safety-net timeout: if the backend event never fires (thread
+        // crashed, emit missed, etc.), resolve the action so the button
+        // doesn't stay stuck "Syncing…" forever.
+        const timer = setTimeout(() => {
+          // Only resolve if still pending (user may have clicked something else).
+          if (actionsRef.current[key]?.state === "pending") {
+            const unlisten = listenersRef.current.get(key);
+            if (unlisten) {
+              unlisten();
+              listenersRef.current.delete(key);
+            }
+            timeoutsRef.current.delete(key);
+            updateAction(key, {
+              state: "error",
+              error: "Sync timed out — the backend did not respond within 30 seconds.",
+            });
+            options?.refresh?.();
+            setTimeout(() => updateAction(key, { state: "idle" }), 6000);
+          }
+        }, EVENT_TIMEOUT_MS);
+        timeoutsRef.current.set(key, timer);
+      }
+
       // Fire the backend command — does NOT block the UI
       fn()
         .then(() => {
-          // Command dispatched successfully (backend accepted the request)
-          // If there's a success event, wait for it
-          if (options?.successEvent) {
-            // Listen for the backend's result event
-            listen(options.successEvent, (event) => {
-              updateAction(key, { state: "success", successMsg: options.successMsg });
-              options.onSuccess?.(event.payload);
-              options.refresh?.();
-              // Auto-clear success state after 4 seconds
-              setTimeout(() => updateAction(key, { state: "idle" }), 4000);
-            }).then((unlisten) => {
-              listenersRef.current.push(unlisten);
-            });
-          } else {
-            // No event expected — show success immediately
+          // If no success event expected, resolve immediately
+          if (!options?.successEvent) {
             updateAction(key, { state: "success", successMsg: options?.successMsg });
             options?.onSuccess?.(null);
             options?.refresh?.();
@@ -88,6 +173,7 @@ export function useAsyncAction() {
         })
         .catch((e) => {
           // Command failed to dispatch (e.g., network error before backend received it)
+          clearSafetyTimeout(key);
           const msg = String(e);
           updateAction(key, { state: "error", error: msg });
           options?.onError?.(msg);
@@ -95,7 +181,7 @@ export function useAsyncAction() {
           setTimeout(() => updateAction(key, { state: "idle" }), 6000);
         });
     },
-    [updateAction]
+    [updateAction, clearSafetyTimeout]
   );
 
   const getState = useCallback(
