@@ -1950,9 +1950,11 @@ pub fn ensure_anpr_deps(anpr_dir: &std::path::Path, handle: Option<&AppHandle>) 
     let python = find_python();
     crate::log::log(&format!("[ANPR] [1/4] Checking for Python at: {python}"));
     emit_anpr_progress(handle, "checking", "Checking for Python...", None);
-    let python_works = std::process::Command::new(&python)
-        .arg("--version")
-        .output()
+    let mut python_check = std::process::Command::new(&python);
+    python_check.arg("--version");
+    #[cfg(target_os = "windows")]
+    python_check.creation_flags(CREATE_NO_WINDOW);
+    let python_works = python_check.output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if python_works {
@@ -2470,9 +2472,11 @@ pub fn check_anpr_ready(_state: State<AppState>) -> Result<AnprSetupStatus, Stri
     let has_exe = crate::find_anpr_exe().is_some();
 
     let python = find_python();
-    let has_python = !python.is_empty() && std::process::Command::new(&python)
-        .arg("--version")
-        .output()
+    let mut py_check = std::process::Command::new(&python);
+    py_check.arg("--version");
+    #[cfg(target_os = "windows")]
+    py_check.creation_flags(CREATE_NO_WINDOW);
+    let has_python = !python.is_empty() && py_check.output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
@@ -2501,11 +2505,13 @@ fn check_pip_deps_installed(python_path: &str, anpr_dir: &std::path::Path) -> bo
     // Quick check: try importing the key packages
     let test_imports = ["numpy", "cv2", "paddleocr"];
     for pkg in &test_imports {
-        let out = std::process::Command::new(python_path)
-            .args(["-c", &format!("import {pkg}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
+        let mut imp_cmd = std::process::Command::new(python_path);
+        imp_cmd.args(["-c", &format!("import {pkg}")]);
+        imp_cmd.stdout(std::process::Stdio::null());
+        imp_cmd.stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        imp_cmd.creation_flags(CREATE_NO_WINDOW);
+        let out = imp_cmd.output();
         if !out.map(|o| o.status.success()).unwrap_or(false) {
             return false;
         }
