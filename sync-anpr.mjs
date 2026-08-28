@@ -10,7 +10,7 @@
  *   main.py, sort.py, _enum_cameras.py, requirements.txt, models/
  *
  * Files NOT synced (Tauri-bundled dir has its own copies):
- *   config.json, anpr-service.exe, _internal/, easyocr_models/
+ *   anpr-service.exe, _internal/, easyocr_models/
  */
 
 import { cpSync, existsSync, mkdirSync } from "node:fs";
@@ -28,6 +28,7 @@ const SYNC清单 = [
   "sort.py",
   "_enum_cameras.py",
   "requirements.txt",
+  "config.json",
 ];
 
 // Directory to sync recursively
