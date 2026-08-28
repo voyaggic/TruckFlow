@@ -645,17 +645,37 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     Ok(ids) => ids,
                     Err(e) => { crate::log::log(&format!("[sync] push {table}: {e}")); continue; }
                 };
-                if !pushed_ids.is_empty() { any_pushed = true; }
+                if !pushed_ids.is_empty() {
+                    any_pushed = true;
+                    crate::log::log(&format!("[sync] push {table}: {}/{} rows synced", pushed_ids.len(), rows.len()));
+                }
                 // Mark synced
                 if !pushed_ids.is_empty() {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
-                    let _ = sync::mark_rows_synced(&conn, table, &pushed_ids);
+                    let Ok(conn) = sync_db.try_lock() else {
+                        crate::log::log(&format!("[sync] mark {table}: sync_db lock failed"));
+                        continue;
+                    };
+                    if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
+                        crate::log::log(&format!("[sync] mark {table}: {e}"));
+                    }
                 }
             }
             // Only update last synced timestamp when rows were actually pushed
             if any_pushed {
                 let Ok(conn) = sync_db.try_lock() else { continue };
                 let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
+            } else if !pg.connected() {
+                // One log line per cycle when PG is offline — helps diagnose
+                // why the pending count never decreases.
+                if let Ok(conn) = sync_db.try_lock() {
+                    let total_pending: i64 = sync::PG_SYNC_TABLES
+                        .iter()
+                        .map(|(t, _)| sync::pending_for_table(&conn, t).unwrap_or(0))
+                        .sum();
+                    if total_pending > 0 {
+                        crate::log::log(&format!("[sync] pg offline — {total_pending} rows waiting"));
+                    }
+                }
             }
 
             // ── Postgres pull (central → local) ──────────────────────────

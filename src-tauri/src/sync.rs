@@ -345,7 +345,7 @@ pub fn run_pg_sync_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<S
     })
 }
 
-fn pending_for_table(conn: &Connection, table: &str) -> Result<i64, String> {
+pub fn pending_for_table(conn: &Connection, table: &str) -> Result<i64, String> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE synced = 0"), [], |r| r.get(0))
         .map_err(|e| format!("{table} count failed: {e}"))
 }
@@ -362,7 +362,11 @@ pub fn collect_unsynced_rows(conn: &Connection, table: &str) -> Result<Vec<serde
 
 /// Phase 2 (NO lock): push rows to central DB via network.
 pub fn push_rows_to_central(pg: &dyn PostgresAdapter, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
-    if rows.is_empty() || !pg.connected() {
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+    if !pg.connected() {
+        crate::log::log(&format!("[sync] skip push {table}: {} rows ready but PG is offline", rows.len()));
         return Ok(vec![]);
     }
     pg.push_rows(table, rows).map_err(|e| format!("{table} push failed: {e}"))
@@ -1834,17 +1838,19 @@ impl PostgresAdapter for RealPostgres {
                 result
             }
             None => {
-                // Worker timed out but is still processing. is_connected stays
-                // true (worker will restore it). is_busy stays true (worker
-                // clears it when done).
-                Err(format!("{table} push deferred — worker busy (will retry next cycle)"))
+                // Worker timed out — it may still be processing. Clear is_busy
+                // anyway so the next poller cycle can retry. If the worker is
+                // truly stuck (e.g. dead TCP connection), leaving is_busy=true
+                // permanently blocks ALL future pushes and pulls.
+                self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                Err(format!("{table} push timed out — worker stuck, retrying next cycle"))
             }
         };
-        // Only clear is_busy if we got a result (push completed or failed).
-        // If timed out, the worker will clear it when done.
-        if result.is_ok() || result.is_err() {
-            self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+        // Always clear is_busy. The worker also clears it when done, but if
+        // the worker hangs (dead connection, infinite retry loop), we must
+        // not let is_busy stay true forever — that permanently blocks all
+        // subsequent push/pull operations.
+        self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
     fn configure(&self, conn_string: Option<String>) -> Result<(), String> {

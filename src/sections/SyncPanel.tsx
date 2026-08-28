@@ -81,6 +81,19 @@ function PostgresPanel({
   const [tripRetention, setTripRetention] = useState("");
   const pg = status?.pg;
 
+  // Track the pending count when sync starts so we can show incremental
+  // progress ("3 of 120 rows synced") as the background poller pushes.
+  // Baseline resets to 0 when all synced, or ratchets up if new rows arrive.
+  const [pgBaseline, setPgBaseline] = useState(0);
+  useEffect(() => {
+    if (totalPending > 0) {
+      setPgBaseline((prev) => (prev === 0 || totalPending > prev ? totalPending : prev));
+    } else {
+      setPgBaseline(0);
+    }
+  }, [totalPending]);
+  const pgSynced = pgBaseline > 0 ? pgBaseline - totalPending : 0;
+
   const saveTripRetention = () => {
     const v = tripRetention.trim();
     const days = v === "" ? null : Number(v);
@@ -179,10 +192,34 @@ function PostgresPanel({
             </table>
           )}
 
+          {pgSynced > 0 && (
+            <div style={{ margin: '4px 0 8px' }}>
+              <div style={{
+                height: 4,
+                borderRadius: 2,
+                background: 'var(--border, #e0e0e0)',
+                overflow: 'hidden',
+                marginBottom: 4,
+              }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(pgSynced / pgBaseline) * 100}%`,
+                  background: 'var(--primary, #1976d2)',
+                  borderRadius: 2,
+                  transition: 'width 0.4s ease',
+                }} />
+              </div>
+              <p className="muted small" style={{ margin: 0 }}>
+                Syncing… {pgSynced} of {pgBaseline} rows pushed by background sync.
+              </p>
+            </div>
+          )}
           <p className="muted small">
             {totalPending === 0
               ? "All data synced."
-              : `${totalPending} record${totalPending === 1 ? "" : "s"} waiting for connectivity.`}{" "}
+              : pg?.connected
+                ? `${totalPending} record${totalPending === 1 ? "" : "s"} pending — sync in progress.`
+                : `${totalPending} record${totalPending === 1 ? "" : "s"} waiting for connectivity.`}{" "}
             {status?.pg.last_synced_at ? `Last sync: ${new Date(status.pg.last_synced_at).toLocaleString()}` : "No sync yet."}
           </p>
 
@@ -391,6 +428,19 @@ function SheetsPanel({
   const [frequency, setFrequency] = useState<string>("realtime");
   const [retention, setRetention] = useState<string>("");
 
+  // Track the pending count when export starts so we can show incremental
+  // progress as the background poller pushes trips to the sheet.
+  const sheetsPending = sheets?.pending ?? 0;
+  const [sheetsBaseline, setSheetsBaseline] = useState(0);
+  useEffect(() => {
+    if (sheetsPending > 0) {
+      setSheetsBaseline((prev) => (prev === 0 || sheetsPending > prev ? sheetsPending : prev));
+    } else {
+      setSheetsBaseline(0);
+    }
+  }, [sheetsPending]);
+  const sheetsSynced = sheetsBaseline > 0 ? sheetsBaseline - sheetsPending : 0;
+
   const saveRetention = () => {
     const v = retention.trim();
     const days = v === "" ? null : Number(v);
@@ -543,6 +593,16 @@ function SheetsPanel({
             </button>
           </div>
 
+          {sheetsSynced > 0 && (
+            <div style={{ margin: '4px 0 8px' }}>
+              <div style={{ height: 4, borderRadius: 2, background: 'var(--border, #e0e0e0)', overflow: 'hidden', marginBottom: 4 }}>
+                <div style={{ height: '100%', width: `${(sheetsSynced / sheetsBaseline) * 100}%`, background: 'var(--primary, #1976d2)', borderRadius: 2, transition: 'width 0.4s ease' }} />
+              </div>
+              <p className="muted small" style={{ margin: 0 }}>
+                Exporting… {sheetsSynced} of {sheetsBaseline} trips pushed to sheet.
+              </p>
+            </div>
+          )}
           <p className="muted small">
             {sheets.pending === 0
               ? "All logged trips exported."
