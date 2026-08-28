@@ -42,14 +42,12 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Read signature
+      - name: Read signature (base64)
         id: sig
         shell: bash
         run: |
           SIG_FILE=$(find src-tauri/target/release/bundle/nsis -name '*.sig' | head -1)
-          echo "CONTENT<<EOF" >> "$GITHUB_OUTPUT"
-          cat "$SIG_FILE" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "B64=$(base64 -w 0 "$SIG_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -61,16 +59,15 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.sig
           generate_release_notes: true
 
-      - name: Generate latest.json
+      - name: Generate latest.json and deploy
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          SIG="${{ steps.sig.outputs.CONTENT }}"
+          SIG=$(echo "${{ steps.sig.outputs.B64 }}" | base64 -d)
           INSTALLER_URL="${{ github.server_url }}/${{ github.repository }}/releases/download/v${VERSION}/TruckFlow_${VERSION}_x64-setup.exe"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          mkdir -p docs
-          cat > docs/latest.json << EOF
+          cat > latest.json << ENDJSON
           {
             "version": "${VERSION}",
             "notes": "TruckFlow v${VERSION}",
@@ -82,11 +79,13 @@ jobs:
               }
             }
           }
-          EOF
+          ENDJSON
+
+          cat latest.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs
-          keep_files: true
+          publish_dir: ./
+          include_files: latest.json
