@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TruckFlow",
+  "version": "0.1.1",
+  "identifier": "com.truckflow.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TruckFlow",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "center": true,
+        "devtools": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "createUpdaterArtifacts": true,
+    "resources": [
+      "anpr-service/requirements.txt",
+      "anpr-service/config.json"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY5NDEwNEU0M0E0N0Y3RQpSV1IrZjZSRFRoQ1VEM1IwaWs4NDJ1RUdPaE1Qd3VVaFBQd0JiUnJTMzZQempyZVIvQklUSnNodAo=",
+      "endpoints": ["https://voyaggic.github.io/TruckFlow/latest.json"],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

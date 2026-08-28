@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+src-tauri/gen/
+_anpr_build_cache/
+
+# ANPR runtime
+anpr-service/__pycache__/
+anpr-service/models/
+anpr-service/*.log
+anpr-service/*.err
+src-tauri/anpr-service/
+
+# Local DB
+src-tauri/database.sqlite3
+
+# Signing keys (SECRET)
+.updater-keys/
+
+# Debug / temp
+*.dmp
+*.log
+*.txt
+!doc for agents/*.txt
+analyze*.py
+dump-*.dmp
+resolve_addrs.py
+windbg/
+updates/
+tmp_*
+*.bat
+*.ps1
+!scripts/*.ps1
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Tauri
+src-tauri/.cargo/

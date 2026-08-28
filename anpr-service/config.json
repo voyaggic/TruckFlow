@@ -1,0 +1,13 @@
+{
+  "cloud_api_key": "",
+  "cloud_api_url": "",
+  "prefer_cloud": false,
+  "source": "0",
+  "source_type": "usb",
+  "sources": [
+    {
+      "source": "0",
+      "source_type": "usb"
+    }
+  ]
+}

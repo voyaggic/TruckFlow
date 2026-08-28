@@ -1,11 +1,11 @@
 {
-  "version": "0.1.1",
-  "notes": "TruckFlow v0.1.1",
-  "pub_date": "2026-08-28T00:00:00Z",
+  "version": "0.1.2",
+  "notes": "TruckFlow v0.1.2",
+  "pub_date": "2026-08-28T07:09:54Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "PLACEHOLDER",
-      "url": "https://github.com/voyaggic/TruckFlow/releases/download/v0.1.1/TruckFlow_0.1.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSK2Y2UkRUaENVRDhWdjkvMWVQSXpsdG0vVTJIeW1FOEVzU3RTR2YzSkZFOEE2dDE3NlNlSkNBR3E2ZmtGRmFPVVJSTi85MVpBZFRCWVNLeVNFS2xmZVlMaVdYM3k3RkE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3OTAwOTkwCWZpbGU6VHJ1Y2tGbG93XzAuMS4xX3g2NC1zZXR1cC5leGUKWk1MSnRjbE5TUVg5RytiN2IwZ3JMV3dwcitIQmhvTisyNDdqa0NoNTdlZEFnUnFFYmllMklvd055QjZyaUdrRTlQTUhaVjVQdlB6NWprOHNhbDU3QUE9PQo=",
+      "url": "https://github.com/voyaggic/TruckFlow/releases/download/v0.1.2/TruckFlow_0.1.2_x64-setup.exe"
     }
   }
 }
