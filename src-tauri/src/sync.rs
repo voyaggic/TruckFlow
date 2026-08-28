@@ -1408,6 +1408,13 @@ fn make_tls_connector() -> postgres_native_tls::MakeTlsConnector {
 fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
     let mut config: postgres::Config = cs.parse().map_err(|e| format!("invalid connection string: {e}"))?;
     config.connect_timeout(std::time::Duration::from_secs(6));
+    // TCP keepalive: detect dead connections at the OS level so the worker
+    // doesn't hang forever on a half-open socket. Without this, a silently
+    // dropped connection (server crash, network outage) causes every push
+    // and pull to block indefinitely.
+    config.keepalives(true);
+    config.keepalives_idle(std::time::Duration::from_secs(30));
+    config.keepalives_interval(std::time::Duration::from_secs(5));
     let tls = make_tls_connector();
     let make_client = |cfg: &mut postgres::Config| -> Result<postgres::Client, String> {
         let mut c = cfg.connect(tls.clone()).map_err(|e| {
@@ -1581,6 +1588,9 @@ struct PostgresWorker {
     schema_validated: bool,
     last_connect_fail: i64,
     connect_backoff: i64,
+    /// Epoch seconds of the last successful health-check ping. Used to
+    /// rate-limit pings so we don't add latency to every command.
+    last_health_check: i64,
 }
 
 impl PostgresWorker {
@@ -1592,6 +1602,7 @@ impl PostgresWorker {
             schema_validated: false,
             last_connect_fail: 0,
             connect_backoff: 0,
+            last_health_check: 0,
         }
     }
 
@@ -1622,6 +1633,29 @@ impl PostgresWorker {
                 self.last_connect_fail = now;
                 Err(e)
             }
+        }
+    }
+
+    /// Lightweight connection health check, rate-limited to once every 30s.
+    /// Pings the server with `SELECT 1`. If the ping fails or the connection
+    /// is dead, drops the client so `ensure_client` will reconnect on the
+    /// next command. This prevents the worker from silently hanging on a
+    /// half-open TCP connection after a server crash or network blip.
+    fn check_health(&mut self) {
+        let now = chrono::Utc::now().timestamp();
+        if now - self.last_health_check < 30 {
+            return; // rate-limited
+        }
+        self.last_health_check = now;
+        let healthy = match self.client.as_mut() {
+            Some(c) if !c.is_closed() => c.simple_query("SELECT 1").is_ok(),
+            _ => false,
+        };
+        if !healthy {
+            crate::log::log("[sync] pg health check failed — dropping connection, will reconnect");
+            self.client = None;
+            self.schema_validated = false;
+            self.last_err = Some("connection lost, reconnecting".to_string());
         }
     }
 
@@ -1730,6 +1764,10 @@ fn spawn_pg_worker(
             while let Ok(cmd) = rx.recv() {
                 let is_stop = matches!(cmd, PgCommand::Stop);
                 is_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Proactively detect dead connections before processing each
+                // command. Without this, a half-open TCP socket causes every
+                // push/pull to block indefinitely.
+                worker.check_health();
                 worker.handle(cmd);
                 is_busy.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Push the worker's last_err into the shared cache so
