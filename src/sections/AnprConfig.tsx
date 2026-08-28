@@ -1,13 +1,16 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import AnprSetupWizard from "../components/AnprSetupWizard";
 import type {
   AnprConfigView,
   AnprCredentialView,
   AnprDiagnosticsView,
   CameraSourceView,
   ConfidenceTrendPoint,
+  DetectedCamera,
   MachineInfo,
   ModelVersionView,
   OcrEngine,
@@ -41,17 +44,20 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<AnprTabId>("live");
+  const anprUrl = useAnprServiceUrl();
 
-  // Batch-load the two things every tab needs on mount (config + cameras)
+  // Batch-load everything every tab needs on mount (config + cameras + diagnostics)
   const refreshCore = useCallback(() => {
     Promise.allSettled([
       api.getAnprConfig(),
       api.listCameraSources(),
-    ]).then(([configRes, camerasRes]) => {
+      api.anprDiagnostics(),
+    ]).then(([configRes, camerasRes, diagRes]) => {
       if (configRes.status === "fulfilled") setConfig(configRes.value);
       else setError(String(configRes.reason));
       if (camerasRes.status === "fulfilled") setCameras(camerasRes.value);
       else setError(String(camerasRes.reason));
+      if (diagRes.status === "fulfilled") setDiagnostics(diagRes.value);
     });
   }, []);
 
@@ -76,11 +82,28 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
 
   useEffect(() => {
     refreshCore();
-    // Refresh diagnostics every 5s so service status stays current
-    const t = setInterval(() => {
+    // Fetch diagnostics immediately when live/diagnostics tab activates,
+    // then poll every 10s. Without the immediate fetch, the UI shows
+    // "ANPR Stopped" for ~10s after navigating back to the live tab.
+    let t: ReturnType<typeof setInterval> | undefined;
+    if (activeTab === "diagnostics" || activeTab === "live") {
       api.anprDiagnostics().then(setDiagnostics).catch(() => undefined);
-    }, 5000);
-    return () => clearInterval(t);
+      t = setInterval(() => {
+        api.anprDiagnostics().then(setDiagnostics).catch(() => undefined);
+      }, 10000);
+    }
+    return () => { if (t) clearInterval(t); };
+  }, [refreshCore]);
+
+  // Re-sync cameras after every ANPR (re)start. Pause/Resume triggers a
+  // BACKGROUND service restart (5-8s) — an immediate refresh would keep the
+  // stale pipeline mapping, so feeds appeared under the wrong camera name.
+  useEffect(() => {
+    const unlisten = listen("anpr-started", () => {
+      setTimeout(refreshCore, 2500); // after pipelines connect
+      setTimeout(refreshCore, 7000); // settle pass for slow sources (RTSP)
+    });
+    return () => { unlisten.then((f) => f()); };
   }, [refreshCore]);
 
   const run = async (fn: () => Promise<unknown>, okMsg: string) => {
@@ -89,9 +112,11 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
     try {
       await fn();
       setNotice(okMsg);
+      setTimeout(() => setNotice(null), 3500);
       refreshCore();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -114,7 +139,7 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
         ))}
       </div>
 
-      {activeTab === "live" && <LivePreviewTab cameras={cameras} actor={user} onRun={run} serviceRunning={diagnostics?.service_running ?? false} />}
+      {activeTab === "live" && <LivePreviewTab cameras={cameras} actor={user} onRun={run} serviceRunning={diagnostics?.service_running ?? false} onStopped={() => api.anprDiagnostics().then(setDiagnostics).catch(() => undefined)} anprUrl={anprUrl} />}
 
       {activeTab === "settings" && (
         <SettingsTab config={config} cameras={cameras} actor={user} onRun={run} onConfigSave={(c) => run(() => api.updateAnprConfig(user.id, c), "Settings saved.")} />
@@ -128,6 +153,8 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
             onSave={(changes) => run(() => api.updateAnprConfig(user.id, changes), "Engine settings saved.")}
             onRun={run}
             serviceRunning={diagnostics?.service_running ?? false}
+            onStopped={() => api.anprDiagnostics().then(setDiagnostics).catch(() => undefined)}
+            anprUrl={anprUrl}
           />
         ) : (
           <div className="card"><div className="center-fill"><div className="spinner" /></div></div>
@@ -144,9 +171,11 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
           setNotice(null);
           fn().then(() => {
             setNotice(okMsg);
+            setTimeout(() => setNotice(null), 3500);
             // Only refresh training candidates, not config+cameras
             api.listTrainingCandidates().then(setCandidates).catch(() => undefined);
-          }).catch((e) => setError(String(e)));
+          }).catch((e) => { setError(String(e)); setTimeout(() => setError(null), 6000); });
+          setTimeout(() => setError(null), 6000);
         }} />
       )}
 
@@ -164,14 +193,17 @@ function LivePreviewTab({
   actor,
   onRun,
   serviceRunning,
+  onStopped,
+  anprUrl,
 }: {
   cameras: CameraSourceView[];
   actor: SessionUser;
   onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
   serviceRunning: boolean;
+  onStopped?: () => void;
+  anprUrl: string;
 }) {
   const [expanded, setExpanded] = useState<CameraSourceView | null>(null);
-  const anprUrl = useAnprServiceUrl();
   const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [lastPlate, setLastPlate] = useState<{ plate: string; confidence: number; timestamp: string } | null>(null);
@@ -204,7 +236,9 @@ function LivePreviewTab({
       }
     };
     poll();
-    const t = setInterval(poll, 1000);
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") poll();
+    }, 500);
     return () => clearInterval(t);
   }, [anprUrl, cameras]);
 
@@ -215,9 +249,6 @@ function LivePreviewTab({
 
   const isPortrait = orientation === "portrait";
 
-  const online = (c: CameraSourceView) =>
-    c.status === "active" && (c.source_type === "http" || c.source_type === "rtsp" || c.source_type === "live_test");
-
   // Dynamic grid: 1 camera = full, 2 = side-by-side, 3+ = grid
   const cameraCount = cameras.length;
   const gridCols = cameraCount === 1
@@ -226,9 +257,17 @@ function LivePreviewTab({
       ? "1fr 1fr"
       : `repeat(${Math.min(cameraCount, 4)}, 1fr)`;
 
+  // Pipeline index = position among ACTIVE + TRACKED sources — must match the
+  // config writer order (created_at ASC) so ?camera=N hits the right feed.
+  const trackedActive = cameras.filter((c) => c.status === "active" && c.tracked);
+  const pipelineIndexOf = (id: string): number | undefined => {
+    const i = trackedActive.findIndex((c) => c.id === id);
+    return i >= 0 ? i : undefined;
+  };
+
   return (
     <div className="stack" style={{ height: "100%" }}>
-      <ServiceStatusBar cameras={cameras} actor={actor} serviceRunning={serviceRunning} />
+      <ServiceStatusBar cameras={cameras} actor={actor} serviceRunning={serviceRunning} lastPlate={lastPlate} onStopped={onStopped} anprUrl={anprUrl} />
 
       {/* Orientation toggle */}
       <div className="row" style={{ gap: 8, alignItems: "center" }}>
@@ -270,7 +309,9 @@ function LivePreviewTab({
               onExpand={() => setExpanded(c)}
               onRun={onRun}
               actor={actor}
-              online={online(c)}
+              pipelineIndex={pipelineIndexOf(c.id)}
+              serviceRunning={serviceRunning}
+              anprUrl={anprUrl}
             />
           ))}
         </div>
@@ -323,7 +364,7 @@ function LivePreviewTab({
               justifyContent: "center",
               border: lastPlate ? "3px solid var(--success)" : "3px solid transparent",
             }}>
-              <CameraThumb camera={expanded} previewUrl={previews[expanded.id]} large />
+              <CameraThumb camera={expanded} previewUrl={previews[expanded.id]} large pipelineIndex={pipelineIndexOf(expanded.id)} serviceRunning={serviceRunning} anprUrl={anprUrl} />
             </div>
             {expanded.last_connection_check_result && (
               <div className="small muted" style={{ marginTop: 8 }}>
@@ -345,7 +386,9 @@ function CameraCard({
   onExpand,
   onRun,
   actor,
-  online,
+  pipelineIndex,
+  serviceRunning,
+  anprUrl,
 }: {
   camera: CameraSourceView;
   previewUrl?: string;
@@ -353,7 +396,9 @@ function CameraCard({
   onExpand: () => void;
   onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
   actor: SessionUser;
-  online: boolean;
+  pipelineIndex?: number;
+  serviceRunning?: boolean;
+  anprUrl: string;
 }) {
   return (
     <div
@@ -404,16 +449,16 @@ function CameraCard({
           border: lastPlate ? "2px solid var(--success)" : "2px solid transparent",
         }}
       >
-        <CameraThumb camera={camera} previewUrl={previewUrl} />
+        <CameraThumb camera={camera} previewUrl={previewUrl} pipelineIndex={pipelineIndex} serviceRunning={serviceRunning} anprUrl={anprUrl} />
       </div>
 
       <div className="row" style={{ gap: 4, padding: "0 8px 8px" }}>
-        {online ? (
+        {camera.status === "active" ? (
           <button
             className="ghost small"
             onClick={(e) => {
               e.stopPropagation();
-              onRun(() => api.setCameraSourceStatus(actor.id, camera.id, "inactive"), "Feed paused.");
+              onRun(() => api.setCameraSourceStatus(actor.id, camera.id, "inactive"), "Feed paused — it will stop being analyzed in a few seconds.");
             }}
           >
             Pause
@@ -423,7 +468,7 @@ function CameraCard({
             className="ghost small"
             onClick={(e) => {
               e.stopPropagation();
-              onRun(() => api.setCameraSourceStatus(actor.id, camera.id, "active"), "Feed resumed.");
+              onRun(() => api.setCameraSourceStatus(actor.id, camera.id, "active"), "Feed resumed — it will restart in a few seconds.");
             }}
           >
             Resume
@@ -437,17 +482,53 @@ function CameraCard({
   );
 }
 
-function CameraThumb({ camera, previewUrl, large }: { camera: CameraSourceView; previewUrl?: string; large?: boolean }) {
+function CameraThumb({ camera, previewUrl, large, pipelineIndex, serviceRunning, anprUrl }: { camera: CameraSourceView; previewUrl?: string; pipelineIndex?: number; serviceRunning?: boolean; large?: boolean; anprUrl: string }) {
   const h = large ? "65vh" : "100%";
-  const anprUrl = useAnprServiceUrl();
-  // Always proxy through ANPR service — it handles the camera connection,
-  // so the UI just needs to show the locally-served preview frame.
-  const proxySrc = `${anprUrl}/preview_frame?t=${Date.now()}`;
+
+  // Live-source polling tick. React RULES OF HOOKS: every hook must run on
+  // EVERY render, before any early return. An early return above the hooks
+  // changes the hook count when a camera's status/type flips (e.g. clicking
+  // Pause) and crashes the whole app to a blank screen.
+  const isLiveType = ["http", "rtsp", "usb", "live_test"].includes(camera.source_type);
+  const shouldPoll = isLiveType && camera.status === "active" && pipelineIndex !== undefined && serviceRunning !== false;
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!shouldPoll) return;
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") setTick((v) => v + 1);
+    }, 200);
+    return () => clearInterval(t);
+  }, [shouldPoll]);
+
+  // Paused feeds are NOT shown and NOT analyzed — a frozen last frame would
+  // wrongly suggest the camera is still being watched.
+  if (camera.status !== "active") {
+    return (
+      <div style={{
+        width: "100%", height: h, display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", gap: 6,
+        background: "repeating-linear-gradient(45deg, #1a1a1a, #1a1a1a 12px, #222 12px, #222 24px)",
+        color: "#9ca3af", borderRadius: 6,
+      }}>
+        <span style={{ fontSize: large ? 40 : 24 }}>⏸</span>
+        <span className="small" style={{ fontWeight: 600 }}>PAUSED</span>
+        <span className="small" style={{ opacity: 0.7, textAlign: "center", padding: "0 12px" }}>
+          This feed is not being analyzed. Click Resume to restore it.
+        </span>
+      </div>
+    );
+  }
   // For video files, use the converted file src
   if (camera.source_type === "video_file" || camera.source_type === "nvr_export") {
-    return <video src={previewUrl ?? convertFileSrc(camera.connection_string)} controls={!!large} muted autoPlay={!!large} style={{ width: "100%", height: h, objectFit: "contain" }} />;
+    // muted+autoPlay+loop: a paused <video> shows a black tile — always play.
+    return <video src={previewUrl ?? convertFileSrc(camera.connection_string)} controls muted autoPlay loop playsInline style={{ width: "100%", height: h, objectFit: "contain" }} />;
   }
-  // For live sources (HTTP, RTSP, USB), try the ANPR service proxy first
+  const liveSrc = shouldPoll ? `${anprUrl}/preview_frame?camera=${pipelineIndex}&t=${tick}` : null;
+  if (liveSrc) {
+    return <img src={liveSrc} alt={`${camera.label} live feed`} style={{ width: "100%", height: h, objectFit: "contain" }} />;
+  }
+  // Fallback: single snapshot when the service isn't running / index unknown
+  const proxySrc = `${anprUrl}/preview_frame?t=${Date.now()}`;
   return (
     <img
       src={proxySrc}
@@ -480,102 +561,112 @@ function useAnprServiceUrl() {
   return url;
 }
 
-/** Auto-refreshing live preview from the ANPR service. Updates every 500ms. */
-function LivePreview() {
-  const anprUrl = useAnprServiceUrl();
-  const [src, setSrc] = useState(`${anprUrl}/preview_frame?t=${Date.now()}`);
+/** Auto-refreshing live preview from the ANPR service. ?camera=N selects the feed in multi-camera mode. */
+function LivePreview({ cameraIdx, anprUrl }: { cameraIdx?: number; anprUrl: string }) {
+  const camQ = cameraIdx !== undefined ? `camera=${cameraIdx}&` : "";
+  const [src, setSrc] = useState(`${anprUrl}/preview_frame?${camQ}t=${Date.now()}`);
 
   useEffect(() => {
+    setSrc(`${anprUrl}/preview_frame?${camQ}t=${Date.now()}`);
     const timer = setInterval(() => {
-      setSrc(`${anprUrl}/preview_frame?t=${Date.now()}`);
-    }, 500);
+      if (document.visibilityState === "visible") {
+        setSrc(`${anprUrl}/preview_frame?${camQ}t=${Date.now()}`);
+      }
+    }, 1000);
     return () => clearInterval(timer);
-  }, [anprUrl]);
+  }, [anprUrl, camQ]);
 
   return (
     <img
       src={src}
       alt="Live camera feed"
-      style={{ width: "100%", maxHeight: 300, objectFit: "contain" }}
+      style={{ width: "100%", maxHeight: 300, objectFit: "contain", background: "#000", borderRadius: 6 }}
       onError={() => {
-        // If preview_frame fails, try the /preview endpoint
-        setSrc(`${anprUrl}/preview?t=${Date.now()}`);
+        // If preview_frame fails, try the /preview MJPEG endpoint
+        setSrc(`${anprUrl}/preview?${camQ}t=${Date.now()}`);
       }}
     />
   );
 }
 
-function ServiceStatusBar({ cameras, actor, serviceRunning }: { cameras: CameraSourceView[]; actor: SessionUser; serviceRunning: boolean }) {
-  const [lastPlate, setLastPlate] = useState<{ plate: string; confidence: number; timestamp: string } | null>(null);
+function ServiceStatusBar({ cameras, actor, serviceRunning, lastPlate, onStopped, anprUrl }: { cameras: CameraSourceView[]; actor: SessionUser; serviceRunning: boolean; lastPlate: { plate: string; confidence: number; timestamp: string } | null; onStopped?: () => void; anprUrl: string }) {
   const [starting, setStarting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const anprUrl = useAnprServiceUrl();
+  const [showSetup, setShowSetup] = useState(false);
+  const [setupComplete, setSetupComplete] = useState(false);
 
-  // Poll /latest for the plate display (doesn't determine running status)
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const resp = await fetch(`${anprUrl}/latest`);
-        if (resp.ok) {
-          const data = await resp.json();
-          setLastPlate({ plate: data.plate, confidence: data.confidence, timestamp: data.timestamp });
-        }
-      } catch {
-        // Service not running — ignore
-      }
-    };
-    poll();
-    const t = setInterval(poll, 2000);
-    return () => clearInterval(t);
-  }, [anprUrl]);
+  /** Sources the service will actually capture: active AND tracked */
+  const trackedActive = cameras.filter(c => c.status === "active" && c.tracked);
 
-  /** Find the first active camera source */
-  const activeCamera = cameras.find(c => c.status === "active");
-
-  /** Start the ANPR service using the active camera source */
-  const handleStart = useCallback(async () => {
-    if (!activeCamera) {
-      setMessage("No active camera source. Add one in Camera Settings and set it active.");
-      return;
-    }
+  /** Actually start the ANPR service (called after setup is complete or skipped) */
+  const doStart = useCallback(async () => {
     setStarting(true);
     setMessage(null);
     try {
-      // 1. Write config.json with the active camera source
-      await api.writeAnprConfig(actor.id, activeCamera.connection_string, activeCamera.source_type, false);
-      // 2. Start the ANPR service
-      const pid = await api.startAnprService(actor.id);
-      setMessage(`ANPR service started (PID ${pid}). Connecting to ${activeCamera.connection_string}...`);
-      // 3. Poll until it's up
+      await api.startAnprService(actor.id);
+      setMessage(`ANPR service starting — ${trackedActive.length} tracked camera(s)...`);
       let tries = 0;
       const check = async () => {
         try {
           const resp = await fetch(`${anprUrl}/health`);
           if (resp.ok) {
-            setMessage(`ANPR service running — connected to ${activeCamera.connection_string}`);
+            setMessage(`ANPR service running — tracking ${trackedActive.length} camera(s)`);
+            onStopped?.();
             return;
           }
         } catch {}
-        if (++tries < 15) setTimeout(check, 1000);
+        if (++tries < 30) setTimeout(check, 1000);
         else setMessage("ANPR service started but not responding yet — check logs.");
       };
       setTimeout(check, 2000);
     } catch (e: any) {
+      // If the backend says ANPR isn't ready, show the setup wizard
+      if (e === "anpr_not_ready" || String(e).includes("anpr_not_ready")) {
+        setShowSetup(true);
+        setStarting(false);
+        return;
+      }
       setMessage(`Failed: ${e}`);
     } finally {
       setStarting(false);
     }
-  }, [activeCamera, actor, anprUrl]);
+  }, [trackedActive, actor, anprUrl]);
+
+  /** Start the ANPR service — checks readiness first */
+  const handleStart = useCallback(async () => {
+    if (trackedActive.length === 0) {
+      setMessage("No active tracked camera source. In Camera Settings, set a camera Active + Tracked (☑).");
+      return;
+    }
+    // If we already verified readiness (after setup wizard), skip the check
+    if (setupComplete) {
+      doStart();
+      return;
+    }
+    // Check if ANPR is ready
+    try {
+      const status = await api.checkAnprReady();
+      if (status.ready) {
+        doStart();
+      } else {
+        setShowSetup(true);
+      }
+    } catch {
+      // If check fails, try to start anyway (will show wizard on error)
+      doStart();
+    }
+  }, [trackedActive, setupComplete, doStart]);
 
   /** Stop the ANPR service */
   const handleStop = useCallback(async () => {
     try {
       await api.stopAnprService(actor.id);
       setMessage("ANPR service stopped.");
+      onStopped?.();
     } catch (e: any) {
       setMessage(`Failed: ${e}`);
     }
-  }, [actor]);
+  }, [actor, onStopped]);
 
   return (
     <div className="card">
@@ -599,10 +690,22 @@ function ServiceStatusBar({ cameras, actor, serviceRunning }: { cameras: CameraS
         </div>
       )}
 
-      {/* Live service preview — shown only when running */}
-      {serviceRunning && (
-        <div style={{ marginTop: 12 }}>
-          <LivePreview />
+      {/* Live per-camera previews — one tile per active+tracked source */}
+      {serviceRunning && trackedActive.length > 0 && (
+        <div style={{
+          marginTop: 12,
+          display: "grid",
+          gridTemplateColumns: trackedActive.length === 1 ? "1fr" : "repeat(2, 1fr)",
+          gap: 8,
+        }}>
+          {trackedActive.map((c, i) => (
+            <div key={c.id}>
+              <div className="muted small" style={{ marginBottom: 2 }}>
+                Camera {i + 1}: {c.label} <span className="badge" style={{ fontSize: 10 }}>{c.source_type}</span>
+              </div>
+              <LivePreview cameraIdx={i} anprUrl={anprUrl} />
+            </div>
+          ))}
         </div>
       )}
 
@@ -613,6 +716,17 @@ function ServiceStatusBar({ cameras, actor, serviceRunning }: { cameras: CameraS
           <span className="badge active">{Math.round(lastPlate.confidence * 100)}% confidence</span>
           <span className="muted small">{new Date(lastPlate.timestamp).toLocaleTimeString()}</span>
         </div>
+      )}
+
+      {showSetup && (
+        <AnprSetupWizard
+          onComplete={() => {
+            setShowSetup(false);
+            setSetupComplete(true);
+            doStart();
+          }}
+          onSkip={() => setShowSetup(false)}
+        />
       )}
     </div>
   );
@@ -773,7 +887,7 @@ const TYPE_TEMPLATES: Record<string, string> = {
   nvr_export: "/path/to/export.mp4",
   usb: "0",
   video_file: "",
-  live_test: "http://127.0.0.1:9800/stream",
+  live_test: "http://127.0.0.1:9800/preview",
 };
 
 const TYPE_HELP: Record<string, string> = {
@@ -782,8 +896,149 @@ const TYPE_HELP: Record<string, string> = {
   nvr_export: "A video export path from your NVR (local .mp4/.avi file)",
   usb: "USB webcam device index, e.g. 0 for the first camera",
   video_file: "Pick a video file from your computer",
-  live_test: "Test HTTP stream URL for pipeline verification",
+  live_test: "Loopback test through the ANPR service's own annotated stream (/preview)",
 };
+
+/** Auto-detect available USB/webcam devices and show live preview. */
+function DetectCamerasPanel({ onAdd, configured }: { onAdd: (index: number, name: string) => void; configured?: CameraSourceView[] }) {
+  const [cameras, setCameras] = useState<DetectedCamera[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+
+  const scan = async () => {
+    setScanning(true);
+    setError(null);
+    try {
+      const found = await api.enumerateCameras();
+      setCameras(found);
+      if (found.length === 0) setError("No cameras detected.");
+    } catch (e) {
+      setError(String(e));
+      setTimeout(() => setError(null), 6000);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const addDetected = (cam: DetectedCamera) => {
+    onAdd(cam.index, cam.name || `Camera ${cam.index}`);
+  };
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, background: "var(--surface-2)", marginTop: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>Detect Cameras</div>
+        <button className="ghost small" onClick={scan} disabled={scanning}>
+          {scanning ? "Scanning…" : "Scan for cameras"}
+        </button>
+      </div>
+      <p className="muted small" style={{ marginTop: -4 }}>
+        Detects real camera hardware connected to this PC. Only cameras with a live feed (frames actually changing) can be added.
+      </p>
+      {error && <div className="small" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</div>}
+      {/* Configured network sources — no probing needed, they're already known */}
+      {configured && configured.some((c) => !["usb", "video_file"].includes(c.source_type)) && (
+        <div style={{ marginTop: 10 }}>
+          <div className="muted small" style={{ marginBottom: 4 }}>Configured network sources (already in your list):</div>
+          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            {configured
+              .filter((c) => !["usb", "video_file"].includes(c.source_type))
+              .map((c) => (
+                <span key={c.id} className="badge" title={c.connection_string}>
+                  {c.source_type} · {c.label}
+                </span>
+              ))}
+          </div>
+        </div>
+      )}
+      {cameras.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 10, marginTop: 8 }}>
+          {cameras.map((cam) => (
+            <div
+              key={cam.index}
+              style={{
+                border: selectedIdx === cam.index ? "2px solid var(--primary)" : "1px solid var(--border)",
+                borderRadius: "var(--radius)",
+                padding: 10, cursor: "pointer",
+                background: selectedIdx === cam.index ? "var(--surface-3)" : "var(--surface)",
+              }}
+              onClick={() => setSelectedIdx(selectedIdx === cam.index ? null : cam.index)}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <b style={{ fontSize: 13 }}>{cam.name || `Camera ${cam.index}`}</b>
+                {cam.is_live ? (
+                  <span className="badge active">{cam.status === "in_service" ? "LIVE · IN SERVICE" : "LIVE"}</span>
+                ) : cam.status === "busy" ? (
+                  <span className="badge">BUSY</span>
+                ) : cam.status === "error" ? (
+                  <span className="badge disabled">UNAVAILABLE</span>
+                ) : cam.status === "black" ? (
+                  <span className="badge disabled">BLACK</span>
+                ) : (
+                  <span className="badge disabled">STATIC</span>
+                )}
+              </div>
+              <div className="muted small" style={{ marginTop: 4 }}>
+                Index {cam.index} · {cam.width}×{cam.height} · {cam.backend}
+                {cam.device_type && (
+                  <span className="badge" style={{ fontSize: 10, marginLeft: 6 }} title="virtual = software camera output (vMix/OBS/EOS Utility), integrated = built-in, external = real USB device">
+                    {cam.device_type}
+                  </span>
+                )}
+              </div>
+              {cam.is_live && cam.status === "in_service" ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--success)" }} />
+                  <span className="small" style={{ color: "var(--success)" }}>Already live in the running ANPR service — verified there</span>
+                </div>
+              ) : !cam.is_live && cam.status === "busy" ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--warning, #f59e0b)" }} />
+                  <span className="small" style={{ color: "var(--warning, #f59e0b)" }}>Held by the ANPR service but its feed is down — check the Live tab</span>
+                </div>
+              ) : !cam.is_live && cam.status === "error" ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--warning, #f59e0b)" }} />
+                  <span className="small" style={{ color: "var(--warning, #f59e0b)" }}>Cannot open right now — device busy or disconnected</span>
+                </div>
+              ) : cam.is_live ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--success)" }} />
+                  <span className="small" style={{ color: "var(--success)" }}>Live feed detected — frames changing</span>
+                </div>
+              ) : cam.status === "black" ? (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#ef4444" }} />
+                  <span className="small" style={{ color: "#ef4444" }}>Camera delivers pure black — device not exposing. On a DSLR: set Movie mode 🎥, remove lens cap, wake the camera, restart its webcam utility.</span>
+                </div>
+              ) : (
+                <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--warning, #f59e0b)" }} />
+                  <span className="small" style={{ color: "var(--warning, #f59e0b)" }}>Static image — no live feed (test pattern or disconnected)</span>
+                </div>
+              )}
+              {selectedIdx === cam.index && cam.is_live && (
+                <button className="primary small" style={{ marginTop: 6, width: "100%" }} onClick={(e) => { e.stopPropagation(); addDetected(cam); }}>
+                  + Add to sources
+                </button>
+              )}
+              {selectedIdx === cam.index && !cam.is_live && (
+                <div className="small muted" style={{ marginTop: 6, textAlign: "center" }}>
+                  {cam.status === "black"
+                    ? "Pure black feed — the camera hardware is connected but not sending an image. Fix it on the camera: Movie mode, lens cap off, keep it awake, then rescan."
+                    : cam.status === "busy" || cam.status === "error"
+                    ? "Another program may be using this camera — close it or stop the ANPR service, then rescan"
+                    : "This camera shows a static image — check if the lens cap is on or the camera is in the right mode"}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function CameraPanel({
   cameras,
@@ -797,6 +1052,9 @@ function CameraPanel({
   const [label, setLabel] = useState("");
   const [type, setType] = useState<CameraSourceView["source_type"]>("rtsp");
   const [conn, setConn] = useState(TYPE_TEMPLATES.rtsp);
+  // Real DirectShow device name captured from detection — persisted with the
+  // source so the service can re-resolve the USB index on any machine.
+  const [usbDeviceName, setUsbDeviceName] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editLabel, setEditLabel] = useState("");
   const [editType, setEditType] = useState<CameraSourceView["source_type"]>("rtsp");
@@ -830,7 +1088,8 @@ function CameraPanel({
 
   const add = () =>
     onRun(async () => {
-      await api.addCameraSource(actor.id, label, type, conn);
+      await api.addCameraSource(actor.id, label, type, conn, usbDeviceName ?? undefined);
+      setUsbDeviceName(null);
       setLabel("");
       setConn(TYPE_TEMPLATES[type] ?? "");
     }, "Camera source added.");
@@ -915,6 +1174,12 @@ function CameraPanel({
         </div>
       </div>
 
+      {/* Auto-detect cameras */}
+      <DetectCamerasPanel
+        onAdd={(idx, name) => { setType("usb"); setConn(String(idx)); setLabel(name); setUsbDeviceName(name); }}
+        configured={cameras}
+      />
+
       {/* Existing camera sources */}
       {cameras.length > 0 && (
         <table className="table" style={{ marginTop: 12 }}>
@@ -924,6 +1189,7 @@ function CameraPanel({
               <th>Type</th>
               <th>Connection</th>
               <th>Status</th>
+              <th title="Include in ANPR processing when the service starts">Tracked</th>
               <th>Last check</th>
               <th />
             </tr>
@@ -965,6 +1231,17 @@ function CameraPanel({
                     )}
                   </td>
                   <td><span className={`badge ${c.status === "active" ? "active" : "disabled"}`}>{c.status}</span></td>
+                  <td>
+                    <input
+                      type="checkbox"
+                      title="Include this source in ANPR processing when the service starts"
+                      checked={c.tracked}
+                      onChange={(e) => {
+                        const v = e.target.checked;
+                        onRun(() => api.setCameraSourceTracked(actor.id, c.id, v), v ? "Tracking enabled." : "Tracking disabled.");
+                      }}
+                    />
+                  </td>
                   <td className="small muted">{c.last_connection_check_result ?? "—"}</td>
                   <td>
                     {tr && (
@@ -1071,14 +1348,17 @@ function EngineTab({
   onRun,
   actor,
   serviceRunning,
+  onStopped,
+  anprUrl,
 }: {
   config: AnprConfigView;
   onSave: (changes: Partial<AnprConfigView>) => void;
   onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
   actor: SessionUser;
   serviceRunning: boolean;
+  onStopped?: () => void;
+  anprUrl: string;
 }) {
-  const anprUrl = useAnprServiceUrl();
   const [engine, setEngine] = useState<OcrEngine>(config.active_ocr_engine);
   const [paddle, setPaddle] = useState(config.confidence_threshold_paddleocr);
   const [easy, setEasy] = useState(config.confidence_threshold_easyocr);
@@ -1090,6 +1370,7 @@ function EngineTab({
   const [isCapturePoint, setIsCapturePoint] = useState(config.is_capture_point);
   const [userAutoStart, setUserAutoStart] = useState(false);
   const [preferCloud, setPreferCloud] = useState(config.prefer_cloud);
+  const [plateMode, setPlateMode] = useState<string>('universal');
   const [confirmingSwap, setConfirmingSwap] = useState(false);
   const [machineInfo, setMachineInfo] = useState<MachineInfo | null>(null);
   const [designatedMachine, setDesignatedMachine] = useState<string | null>(config.designated_machine_id ?? null);
@@ -1110,11 +1391,15 @@ function EngineTab({
     setPreferCloud(config.prefer_cloud);
   }, [config]);
 
-  // Load machine info and user auto-start preference on mount
+  // Load machine info, user auto-start preference, and plate mode on mount
   useEffect(() => {
     api.getMachineInfo().then(setMachineInfo).catch(() => undefined);
     api.checkMachineMatch().then(setMachineMatch).catch(() => undefined);
     api.getUserAutoStart(actor.id).then(setUserAutoStart).catch(() => undefined);
+    // Load OCR plate mode from app_settings
+    invoke<string | null>('get_app_setting', { key: 'ocr_plate_mode' })
+      .then((v: string | null) => { if (v) setPlateMode(v); })
+      .catch(() => undefined);
   }, [actor.id]);
 
   const num = (v: string, fallback: number) => {
@@ -1137,7 +1422,13 @@ function EngineTab({
     prefer_cloud: preferCloud,
   });
 
-  const save = () => {
+  const save = async () => {
+    // Save plate mode to app_settings (separate from ANPR config)
+    if (plateMode !== 'universal') {
+      await api.setOcrPlateMode(actor.id, plateMode);
+    } else {
+      await api.setOcrPlateMode(actor.id, 'universal');
+    }
     if (engine !== config.active_ocr_engine) {
       setConfirmingSwap(true);
     } else {
@@ -1164,19 +1455,20 @@ function EngineTab({
         return;
       }
       await api.writeAnprConfig(actor.id, active.connection_string, active.source_type, false);
-      const pid = await api.startAnprService(actor.id);
-      setServiceMessage(`ANPR service started (PID ${pid}). Connecting...`);
-      // Poll until it's up — parent will refresh diagnostics automatically
+      await api.startAnprService(actor.id);
+      setServiceMessage("ANPR service starting...");
+      // Poll until it's up — Python + OCR models can take 15-25s to start
       let tries = 0;
       const check = async () => {
         try {
           const resp = await fetch(`${anprUrl}/health`);
           if (resp.ok) {
             setServiceMessage("ANPR service running.");
+            onStopped?.(); // refresh diagnostics (works for both start and stop)
             return;
           }
         } catch {}
-        if (++tries < 15) setTimeout(check, 1000);
+        if (++tries < 30) setTimeout(check, 1000);
         else setServiceMessage("ANPR service started but not responding yet — check logs.");
       };
       setTimeout(check, 2000);
@@ -1190,6 +1482,7 @@ function EngineTab({
     try {
       await api.stopAnprService(actor.id);
       setServiceMessage("ANPR service stopped.");
+      onStopped?.();
     } catch (e: any) {
       setServiceMessage(`Failed: ${e}`);
     }
@@ -1247,6 +1540,30 @@ function EngineTab({
           When enabled, the configured cloud OCR API is tried first for each plate read.
           If the cloud API is unreachable or returns no result, the local OCR engine
           (PaddleOCR) is used automatically — the read never fails.
+        </p>
+      </div>
+
+      {/* OCR Plate Mode — Universal vs Kenyan */}
+      <div className="field">
+        <label>Plate format filter</label>
+        <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+          <button
+            className={plateMode === 'universal' ? 'active' : ''}
+            onClick={() => setPlateMode('universal')}
+          >
+            Universal (any plate)
+          </button>
+          <button
+            className={plateMode === 'kenyan' ? 'active' : ''}
+            onClick={() => setPlateMode('kenyan')}
+          >
+            Kenyan only (KBA 123A)
+          </button>
+        </div>
+        <p className="muted small" style={{ marginTop: 4, marginBottom: 0 }}>
+          {plateMode === 'kenyan'
+            ? 'Only plates matching Kenyan format (3 letters + 3 digits + 1 letter) are accepted. Other plates are rejected.'
+            : 'Any plate format is accepted. Switch to Kenyan only if you want to filter out non-Kenyan plates.'}
         </p>
       </div>
 

@@ -150,27 +150,44 @@ fn ping_database(conn: &Connection) -> Result<(), String> {
 
 #[tauri::command]
 pub fn health_dashboard(state: State<AppState>, actor_id: String) -> Result<HealthDashboard, String> {
-    let components = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        crate::commands::ensure_admin_permission(&conn, &actor_id, "view_system_health")?;
-        if let Err(e) = ping_database(&conn) {
-            let _ = record_health_event(&conn, "database", "offline", Some(&e));
-        }
-        let components = components_status(&conn)?;
-        let open_alerts = open_events(&conn)?;
-        let recent_history = recent_history(&conn, 50)?;
-        // Drop the lock before asking the live adapters, which re-acquire it.
-        std::mem::drop(conn);
-        let sync = crate::sync::sync_status(state.clone())?;
-        let anpr = crate::capture::anpr_status(state)?;
-        (components, open_alerts, recent_history, sync, anpr)
+    // Single lock hold for ALL database queries — eliminates the triple
+    // lock cycle (db -> sync_status -> anpr_status) that caused UI lag.
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, "view_system_health")?;
+    if let Err(e) = ping_database(&conn) {
+        let _ = record_health_event(&conn, "database", "offline", Some(&e));
+    }
+    let components = components_status(&conn)?;
+    let open_alerts = open_events(&conn)?;
+    let recent_history = recent_history(&conn, 50)?;
+    // Build sync + anpr status inline (no separate lock acquisitions).
+    let pg = crate::sync::pg_sync_state_impl(&conn, &*state.pg)?;
+    let sheets = crate::sync::sheets_state_impl(&conn, &*state.sheets)?;
+    let sync = crate::models::SyncStatusView {
+        online: pg.connected,
+        pg,
+        sheets,
+    };
+    let anpr_source = crate::capture::anpr_source(&conn);
+    let anpr_enabled = crate::capture::anpr_enabled(&conn);
+    let anpr_pending = if anpr_source == "simulator" { state.simulator.pending() } else { 0 };
+    let (last_at, last_plate) = match state.anpr_last.try_lock() {
+        Ok(last) => last.as_ref().map(|(a, p)| (Some(a.clone()), Some(p.clone()))).unwrap_or((None, None)),
+        Err(_) => (None, None),
+    };
+    let anpr = crate::models::AnprStatus {
+        enabled: anpr_enabled,
+        source: anpr_source,
+        last_read_at: last_at,
+        last_plate,
+        pending_reads: anpr_pending,
     };
     Ok(HealthDashboard {
-        components: components.0,
-        open_alerts: components.1,
-        recent_history: components.2,
-        sync: components.3,
-        anpr: components.4,
+        components,
+        open_alerts,
+        recent_history,
+        sync,
+        anpr,
     })
 }
 

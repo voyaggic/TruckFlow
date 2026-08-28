@@ -1,16 +1,18 @@
 {
   "name": "truckflow",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build -- --no-default-features",
-    "tauri:build:dev": "tauri build"
+    "tauri:dev": "npm run sync-anpr && tauri dev",
+    "tauri:build": "npm run sync-anpr && node scripts/sign-and-build.mjs build --bundles nsis,msi -- --no-default-features",
+    "tauri:build:dev": "npm run sync-anpr && node scripts/sign-and-build.mjs build --bundles nsis,msi",
+    "sync-anpr": "node sync-anpr.mjs",
+    "release:update-json": "node scripts/update-latest.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

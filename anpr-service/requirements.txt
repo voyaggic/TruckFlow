@@ -5,6 +5,7 @@ opencv-python>=4.8
 # OCR backends — install at least one for real plate reading.
 # Without any of these the service runs in deterministic mock mode
 # (pipeline still works end-to-end, but plates are synthetic).
-easyocr>=1.7        # pip install easyocr  (downloads models on first use)
-# paddlepaddle>=2.5  # uncomment for the PaddleOCR engine
-# paddleocr>=2.7     # uncomment for the PaddleOCR engine
+paddlepaddle>=2.5  # PaddleOCR runtime (CPU-only build — no CUDA needed)
+paddleocr>=2.7     # PaddleOCR engine (downloads models on first use)
+# easyocr>=1.7     # alternative: EasyOCR (requires PyTorch ~1.5 GB)
+pygrabber>=0.2

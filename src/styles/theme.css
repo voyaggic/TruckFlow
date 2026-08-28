@@ -218,6 +218,11 @@ label {
   margin-bottom: 18px;
 }
 
+@keyframes banner-slide-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 .error-banner {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
@@ -226,6 +231,7 @@ label {
   padding: 10px 12px;
   font-size: 13px;
   margin-bottom: 14px;
+  animation: banner-slide-in 0.2s ease-out;
 }
 
 .success-banner {
@@ -236,6 +242,7 @@ label {
   padding: 10px 12px;
   font-size: 13px;
   margin-bottom: 14px;
+  animation: banner-slide-in 0.2s ease-out;
 }
 
 .checklist {

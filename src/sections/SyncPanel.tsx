@@ -1,41 +1,29 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
 
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const { fire, isPending, getError, getSuccess } = useAsyncAction();
 
   const refresh = useCallback(() => {
     api
       .syncStatus()
       .then(setStatus)
-      .catch((e) => setError(String(e)));
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  const run = async (fn: () => Promise<unknown>, okMsg: string) => {
-    setError(null);
-    setNotice(null);
-    setBusy(true);
-    try {
-      await fn();
-      setNotice(okMsg);
-      refresh();
-      setTimeout(() => setNotice(null), 4000);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
+
+  // Non-blocking run: fires action, shows pending on that item, never freezes UI
+  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => {
+    fire(key, fn, { successMsg: okMsg, successEvent: event, refresh });
+  };
 
   return (
     <div>
@@ -46,12 +34,12 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
         every 10 seconds so nothing waits for a manual "send".
       </p>
 
-      {error && <div className="error-banner">{error}</div>}
-      {notice && <div className="success-banner">{notice}</div>}
+      {getError("pg-connect") && <div className="error-banner">{getError("pg-connect")}</div>}
+      {getSuccess("pg-connect") && <div className="success-banner">{getSuccess("pg-connect")}</div>}
 
-      <PostgresPanel status={status} totalPending={totalPending} busy={busy} actor={user} onRun={run} />
-      <SheetsPanel status={status} busy={busy} actor={user} onRun={run} />
-      {status?.sheets?.configured && <ColumnMappingPanel actor={user} onRun={run} />}
+      <PostgresPanel status={status} totalPending={totalPending} actor={user} run={run} isPending={isPending} getError={getError} />
+      <SheetsPanel status={status} actor={user} run={run} isPending={isPending} getError={getError} />
+      {status?.sheets?.configured && <ColumnMappingPanel actor={user} run={run} isPending={isPending} />}
     </div>
   );
 }
@@ -72,15 +60,17 @@ function AdapterError({ message }: { message: string | null | undefined }) {
 function PostgresPanel({
   status,
   totalPending,
-  busy,
   actor,
-  onRun,
+  run,
+  isPending,
+  getError,
 }: {
   status: SyncStatusView | null;
   totalPending: number;
-  busy: boolean;
   actor: SessionUser;
-  onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  isPending: (key: string) => boolean;
+  getError: (key: string) => string | undefined;
 }) {
   const [connString, setConnString] = useState("");
   const [tripRetention, setTripRetention] = useState("");
@@ -93,8 +83,7 @@ function PostgresPanel({
       window.alert("Enter a number of days (at least 1), or leave blank to keep entries forever.");
       return;
     }
-    onRun(
-      () => api.setTripRetention(actor.id, days),
+    run("trip-retention", () => api.setTripRetention(actor.id, days),
       days
         ? `Daily entries older than ${days} day${days === 1 ? "" : "s"} will be deleted from local + PostgreSQL automatically.`
         : "Retention disabled — daily entries are kept forever.",
@@ -102,12 +91,12 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    onRun(() => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.");
+    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured");
   };
 
   const disconnect = () => {
     if (window.confirm("Disconnect PostgreSQL? Pending records stop syncing; local capture is unaffected.")) {
-      onRun(() => api.disconnectPostgres(actor.id), "PostgreSQL disconnected.");
+      run("pg-disconnect", () => api.disconnectPostgres(actor.id), "PostgreSQL disconnected.", "pg-disconnected");
     }
   };
 
@@ -128,8 +117,8 @@ function PostgresPanel({
           on confirmed receipt — reconnect is safe, nothing is ever duplicated.
         </p>
         {pg?.configured && (
-          <button className="ghost small" disabled={busy} onClick={() => onRun(() => api.syncNowPg(actor.id), "Postgres sync run complete.")}>
-            Sync now
+          <button className="ghost small" disabled={isPending("pg-sync")} onClick={() => run("pg-sync", () => api.syncNowPg(actor.id), "Postgres sync run complete.", "pg-sync-done")}>
+            {isPending("pg-sync") ? "Syncing…" : "Sync now"}
           </button>
         )}
       </div>
@@ -152,9 +141,10 @@ function PostgresPanel({
             </div>
             <div className="field">
               <label>&nbsp;</label>
-              <button className="primary" onClick={connect} disabled={busy || !connString.trim()}>
-                {busy ? "Connecting…" : "Connect"}
+              <button className="primary" onClick={connect} disabled={isPending("pg-connect") || !connString.trim()}>
+                {isPending("pg-connect") ? "Connecting…" : "Connect"}
               </button>
+              {getError("pg-connect") && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{getError("pg-connect")}</p>}
             </div>
           </div>
           <AdapterError message={pg?.last_error} />
@@ -201,8 +191,8 @@ function PostgresPanel({
                 onChange={(e) => setTripRetention(e.target.value)}
                 placeholder="Blank = keep forever"
               />
-              <button className="ghost small" disabled={busy} onClick={saveTripRetention}>
-                Save
+              <button className="ghost small" disabled={isPending("trip-retention")} onClick={saveTripRetention}>
+                {isPending("trip-retention") ? "Saving…" : "Save"}
               </button>
             </div>
             <p className="muted small" style={{ marginTop: 6 }}>
@@ -215,8 +205,8 @@ function PostgresPanel({
 
           <AdapterError message={pg?.last_error} />
           <div className="row">
-            <button className="danger small" onClick={disconnect} disabled={busy}>
-              Disconnect
+            <button className="danger small" onClick={disconnect} disabled={isPending("pg-disconnect")}>
+              {isPending("pg-disconnect") ? "Disconnecting…" : "Disconnect"}
             </button>
           </div>
         </div>
@@ -231,10 +221,12 @@ function PostgresPanel({
 
 function ColumnMappingPanel({
   actor,
-  onRun,
+  run,
+  isPending: _isPending,
 }: {
   actor: SessionUser;
-  onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  isPending: (key: string) => boolean;
 }) {
   const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -252,7 +244,7 @@ function ColumnMappingPanel({
 
   const save = () => {
     const updated = mapping.map((e) => ({ ...e, header: editHeader[e.field_key] || e.header }));
-    onRun(
+    run("col-map",
       () => api.setSheetColumnMapping(actor.id, updated),
       "Column mapping saved — next sync will use the new layout.",
     );
@@ -376,14 +368,16 @@ function ColumnMappingPanel({
 
 function SheetsPanel({
   status,
-  busy,
   actor,
-  onRun,
+  run,
+  isPending,
+  getError,
 }: {
   status: SyncStatusView | null;
-  busy: boolean;
   actor: SessionUser;
-  onRun: (fn: () => Promise<unknown>, okMsg: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  isPending: (key: string) => boolean;
+  getError: (key: string) => string | undefined;
 }) {
   const sheets = status?.sheets;
   const [saJson, setSaJson] = useState("");
@@ -399,16 +393,14 @@ function SheetsPanel({
       window.alert("Enter a number of days (at least 1), or leave blank to disable pruning.");
       return;
     }
-    onRun(
-      () => api.setSheetsRetention(actor.id, days),
+    run("sheets-retention", () => api.setSheetsRetention(actor.id, days),
       days ? `Sheet will keep ${days} day${days === 1 ? "" : "s"} of trips — older rows prune automatically.` : "Retention disabled — the sheet keeps everything until you clear it.",
     );
   };
 
   const connect = () => {
-    onRun(
-      () =>
-        api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
+    run("sheets-connect",
+      () => api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
       "Google Sheets connected — logged trips will now export.",
     );
   };
@@ -416,7 +408,7 @@ function SheetsPanel({
   const changeFrequency = (f: string) => {
     setFrequency(f);
     if (sheets?.connected) {
-      onRun(() => api.setGoogleSheetsFrequency(actor.id, f), "Sync frequency updated.");
+      run("sheets-freq", () => api.setGoogleSheetsFrequency(actor.id, f), "Sync frequency updated.");
     }
   };
 
@@ -475,9 +467,10 @@ function SheetsPanel({
             </div>
           </div>
           <div className="row">
-            <button className="primary" onClick={connect} disabled={busy || !saJson.trim() || !sheetId.trim()}>
-              {busy ? "Connecting…" : "Connect Google Sheets"}
+            <button className="primary" onClick={connect} disabled={isPending("sheets-connect") || !saJson.trim() || !sheetId.trim()}>
+              {isPending("sheets-connect") ? "Connecting…" : "Connect Google Sheets"}
             </button>
+            {getError("sheets-connect") && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{getError("sheets-connect")}</p>}
           </div>
           <AdapterError message={sheets?.last_error} />
         </div>
@@ -488,19 +481,19 @@ function SheetsPanel({
               Target sheet: <b>{sheets.target_sheet_id || "—"}</b>. Service account:{" "}
               <b>{sheets.service_account_email || "—"}</b>. Shared with: <b>{sheets.shared_group || "—"}</b>.
             </p>
-            <button className="ghost small" disabled={busy} onClick={() => onRun(() => api.syncNowSheets(actor.id), "Sheets sync run complete.")}>
-              Sync now
+            <button className="ghost small" disabled={isPending("sheets-sync")} onClick={() => run("sheets-sync", () => api.syncNowSheets(actor.id), "Sheets sync run complete.", "sheets-sync-done")}>
+              {isPending("sheets-sync") ? "Syncing…" : "Sync now"}
             </button>
             <button
               className="danger small"
-              disabled={busy}
+              disabled={isPending("sheets-disconnect")}
               onClick={() => {
                 if (window.confirm("Disconnect Google Sheets? Export stops immediately; Postgres sync and local capture are unaffected.")) {
-                  onRun(() => api.disconnectGoogleSheets(actor.id), "Google Sheets disconnected.");
+                  run("sheets-disconnect", () => api.disconnectGoogleSheets(actor.id), "Google Sheets disconnected.");
                 }
               }}
             >
-              Disconnect
+              {isPending("sheets-disconnect") ? "Disconnecting…" : "Disconnect"}
             </button>
           </div>
 
@@ -527,21 +520,21 @@ function SheetsPanel({
                   onChange={(e) => setRetention(e.target.value)}
                   placeholder="Blank = no pruning"
                 />
-                <button className="ghost small" disabled={busy} onClick={saveRetention}>
-                  Save
+                <button className="ghost small" disabled={isPending("sheets-retention")} onClick={saveRetention}>
+                  {isPending("sheets-retention") ? "Saving…" : "Save"}
                 </button>
               </div>
             </div>
             <button
               className="danger small"
-              disabled={busy}
+              disabled={isPending("sheets-clear")}
               onClick={() => {
                 if (window.confirm("Remove every exported trip from the sheet now? The header stays; only new trips will be appended. PostgreSQL and local data are not affected.")) {
-                  onRun(() => api.clearExportedTrips(actor.id), "Sheet cleared — only new trips will append.");
+                  run("sheets-clear", () => api.clearExportedTrips(actor.id), "Sheet cleared — only new trips will append.");
                 }
               }}
             >
-              Clear exported trips
+              {isPending("sheets-clear") ? "Clearing…" : "Clear exported trips"}
             </button>
           </div>
 

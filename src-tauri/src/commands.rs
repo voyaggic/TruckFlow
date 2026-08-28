@@ -443,13 +443,24 @@ pub fn login_password(state: State<AppState>, username: String, password: String
 
 #[tauri::command]
 pub fn logout(state: State<AppState>) -> Result<(), String> {
-    let mut session = state.session.lock().map_err(|e| e.to_string())?;
-    if let Some(s) = session.as_ref() {
+    // Lock order: db → session (matches app_status, get_current_user).
+    // Previously session → db which caused lock-order inversion deadlock.
+    // Phase 1: read session user_id (no db lock needed — session is independent).
+    let user_id: Option<String> = {
+        let session = state.session.lock().map_err(|e| e.to_string())?;
+        session.as_ref().map(|s| s.user_id.clone())
+    };
+    // Phase 2: DB writes (fast, db released between phases).
+    if let Some(ref uid) = user_id {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let _ = delete_session_token(&conn, &s.user_id);
-        let _ = append_audit(&conn, &s.user_id, "logout", Some(&s.user_id), None);
+        let _ = delete_session_token(&conn, uid);
+        let _ = append_audit(&conn, uid, "logout", Some(uid), None);
     }
-    *session = None;
+    // Phase 3: clear session.
+    {
+        let mut session = state.session.lock().map_err(|e| e.to_string())?;
+        *session = None;
+    }
     Ok(())
 }
 

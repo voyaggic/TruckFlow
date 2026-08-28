@@ -787,10 +787,6 @@ pub fn list_officer_activity(
 pub fn report_dashboard(state: State<AppState>, actor_id: String, filters: ReportFilters) -> Result<ReportDashboard, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, REPORT_PERM)?;
-    // Phase 5 repoint: read the permanent PostgreSQL archive when available.
-    if let Some(dash) = central_dashboard(&*state.pg, &filters)? {
-        return Ok(dash);
-    }
     Ok(ReportDashboard {
         summary: report_summary(&conn, &filters)?,
         trips_over_time: trips_over_time(&conn, &filters)?,
@@ -824,9 +820,6 @@ pub fn report_trips_drill(
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, REPORT_PERM)?;
     let limit = limit.clamp(1, 2000);
-    if let Some(rows) = try_central(&*state.pg, |pg| pg_report_trips(pg, &filters, limit))? {
-        return Ok(rows);
-    }
     report_trips(&conn, &filters, limit)
 }
 
@@ -834,9 +827,6 @@ pub fn report_trips_drill(
 pub fn report_export(state: State<AppState>, actor_id: String, filters: ReportFilters) -> Result<Vec<ReportExportRow>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, REPORT_PERM)?;
-    if let Some(rows) = try_central(&*state.pg, |pg| pg_report_export_rows(pg, &filters))? {
-        return Ok(rows);
-    }
     report_export_rows(&conn, &filters)
 }
 
@@ -853,11 +843,10 @@ pub fn report_export_csv(
 ) -> Result<String, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, REPORT_PERM)?;
-    let rows = match try_central(&*state.pg, |pg| pg_report_export_rows(pg, &filters))? {
-        Some(rows) => rows,
-        None => report_export_rows(&conn, &filters)?,
-    };
+    let rows = report_export_rows(&conn, &filters)?;
+    drop(conn);
 
+    // Build CSV and write to disk (no lock held)
     let path = if let Some(tp) = target_path.as_deref() {
         std::path::PathBuf::from(tp)
     } else {
@@ -867,7 +856,6 @@ pub fn report_export_csv(
         dir.join(format!("truckflow-report-{ts}.csv"))
     };
 
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("export dir create failed: {e}"))?;
     }
@@ -907,10 +895,8 @@ pub fn report_export_xlsx(
 ) -> Result<String, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, REPORT_PERM)?;
-    let rows = match try_central(&*state.pg, |pg| pg_report_export_rows(pg, &filters))? {
-        Some(rows) => rows,
-        None => report_export_rows(&conn, &filters)?,
-    };
+    let rows = report_export_rows(&conn, &filters)?;
+    drop(conn);
 
     let path = if let Some(tp) = target_path.as_deref() {
         std::path::PathBuf::from(tp)
@@ -921,7 +907,6 @@ pub fn report_export_xlsx(
         dir.join(format!("truckflow-report-{ts}.xlsx"))
     };
 
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("export dir create failed: {e}"))?;
     }
@@ -943,23 +928,15 @@ pub fn report_export_xlsx(
         let _ = worksheet.write_string(row, 3, &r.company);
         let _ = worksheet.write_string(row, 4, &r.driver);
         match r.capacity_at_trip {
-            Some(v) => {
-                let _ = worksheet.write_number(row, 5, v);
-            }
-            None => {
-                let _ = worksheet.write_string(row, 5, "");
-            }
+            Some(v) => { let _ = worksheet.write_number(row, 5, v); }
+            None => { let _ = worksheet.write_string(row, 5, ""); }
         }
         let _ = worksheet.write_string(row, 6, &r.capacity_unit);
         let _ = worksheet.write_string(row, 7, r.receipt_no.as_deref().unwrap_or(""));
         let _ = worksheet.write_string(row, 8, &r.capture_method);
         match r.confidence_score {
-            Some(v) => {
-                let _ = worksheet.write_number(row, 9, v);
-            }
-            None => {
-                let _ = worksheet.write_string(row, 9, "");
-            }
+            Some(v) => { let _ = worksheet.write_number(row, 9, v); }
+            None => { let _ = worksheet.write_string(row, 9, ""); }
         }
     }
     workbook

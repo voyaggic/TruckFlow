@@ -44,12 +44,14 @@ import type {
   EntityRecordView,
   SheetColumnEntry,
   SheetsStateView,
-  SyncRunResult,
   SyncStatusView,
   TrainingCandidateView,
   TripView,
   UserView,
   VehicleView,
+  DetectedCamera,
+  OnvifDevice,
+  OnvifStreamUri,
 } from "./types";
 
 export const api = {
@@ -89,6 +91,10 @@ export const api = {
 
   setUserTheme: (userId: string, themeMode: string, themeAccent: string) =>
     invoke<void>("set_user_theme", { userId, themeMode, themeAccent }),
+
+  getFramesDir: () => invoke<string>("get_frames_dir"),
+  setFramesDir: (newDir: string) => invoke<string>("set_frames_dir", { newDir }),
+  pickFolder: () => invoke<string | null>("pick_folder"),
 
   setUserStatus: (actorId: string, userId: string, status: "active" | "disabled") =>
     invoke<void>("set_user_status", { actorId, userId, status }),
@@ -395,6 +401,8 @@ export const api = {
 
   anprStatus: () => invoke<AnprStatus>("anpr_status"),
 
+  anprServiceStatus: () => invoke<Record<string, unknown>>("anpr_service_status"),
+
   simulatorPushReads: (reads: AnprRead[]) =>
     invoke<number>("simulator_push_reads", { reads }),
 
@@ -472,9 +480,21 @@ export const api = {
   writeAnprConfig: (actorId: string, sourceUrl: string, sourceType?: string, mock?: boolean) =>
     invoke<string>("write_anpr_config", { actorId, sourceUrl, sourceType, mock }),
   startAnprService: (actorId: string) =>
-    invoke<number>("start_anpr_service", { actorId }),
+    invoke<string>("start_anpr_service", { actorId }),
   stopAnprService: (actorId: string) =>
     invoke<string>("stop_anpr_service", { actorId }),
+
+  checkAnprReady: () =>
+    invoke<{
+      ready: boolean;
+      has_python: boolean;
+      has_deps: boolean;
+      has_main_py: boolean;
+      has_exe: boolean;
+      anpr_dir: string;
+    }>("check_anpr_ready"),
+
+  ensureAnprSetup: () => invoke<string>("ensure_anpr_setup"),
 
   // --- ANPR Engine Configuration (08 §5 / §6, gated on manage_anpr_config) ---
 
@@ -518,8 +538,8 @@ export const api = {
 
   listCameraSources: () => invoke<CameraSourceView[]>("list_camera_sources"),
 
-  addCameraSource: (actorId: string, label: string, sourceType: string, connectionString: string) =>
-    invoke<CameraSourceView>("add_camera_source", { actorId, label, sourceType, connectionString }),
+  addCameraSource: (actorId: string, label: string, sourceType: string, connectionString: string, deviceName?: string) =>
+    invoke<CameraSourceView>("add_camera_source", { actorId, label, sourceType, connectionString, deviceName }),
 
   updateCameraSource: (
     actorId: string,
@@ -532,11 +552,25 @@ export const api = {
   setCameraSourceStatus: (actorId: string, sourceId: string, status: "active" | "inactive") =>
     invoke<CameraSourceView>("set_camera_source_status", { actorId, sourceId, status }),
 
+  setCameraSourceTracked: (actorId: string, sourceId: string, tracked: boolean) =>
+    invoke<CameraSourceView>("set_camera_source_tracked", { actorId, sourceId, tracked }),
+
   deleteCameraSource: (actorId: string, sourceId: string) =>
     invoke<void>("delete_camera_source", { actorId, sourceId }),
 
   testCameraConnection: (actorId: string, sourceId: string) =>
     invoke<CameraSourceView>("test_camera_connection", { actorId, sourceId }),
+
+  enumerateCameras: () => invoke<DetectedCamera[]>("enumerate_cameras"),
+
+  discoverOnvifCameras: () => invoke<OnvifDevice[]>("discover_onvif_cameras"),
+
+  onvifStreamUri: (deviceUrl: string, username: string, password: string) =>
+    invoke<OnvifStreamUri>("onvif_stream_uri", {
+      deviceUrl,
+      username,
+      password,
+    }),
 
   listModelVersions: () => invoke<ModelVersionView[]>("list_model_versions"),
 
@@ -592,6 +626,9 @@ export const api = {
 
   getAnprMachine: () => invoke<string | null>("get_anpr_machine"),
 
+  setOcrPlateMode: (actorId: string, mode: string) =>
+    invoke<string>("set_ocr_plate_mode", { actorId, mode }),
+
   checkMachineMatch: () => invoke<boolean>("check_machine_match"),
 
   getUserAutoStart: (actorId: string) => invoke<boolean>("get_user_auto_start", { actorId }),
@@ -602,7 +639,7 @@ export const api = {
 
   syncStatus: () => invoke<SyncStatusView>("sync_status"),
 
-  syncNowPg: (actorId: string) => invoke<SyncRunResult>("sync_now_pg", { actorId }),
+  syncNowPg: (actorId: string) => invoke<string>("sync_now_pg", { actorId }),
 
   connectGoogleSheets: (
     actorId: string,
@@ -623,7 +660,7 @@ export const api = {
   setGoogleSheetsFrequency: (actorId: string, syncFrequency: string) =>
     invoke<SheetsStateView>("set_google_sheets_frequency", { actorId, syncFrequency }),
 
-  syncNowSheets: (actorId: string) => invoke<SyncRunResult>("sync_now_sheets", { actorId }),
+  syncNowSheets: (actorId: string) => invoke<string>("sync_now_sheets", { actorId }),
 
   setSheetsRetention: (actorId: string, days: number | null) =>
     invoke<SheetsStateView>("set_sheets_retention", { actorId, days }),
@@ -644,10 +681,10 @@ export const api = {
     invoke<void>("simulate_connectivity", { postgresOnline, sheetsOnline }),
 
   configurePostgres: (actorId: string, connectionString: string) =>
-    invoke<SyncStatusView["pg"]>("configure_postgres", { actorId, connectionString }),
+    invoke<string>("configure_postgres", { actorId, connectionString }),
 
   disconnectPostgres: (actorId: string) =>
-    invoke<SyncStatusView["pg"]>("disconnect_postgres", { actorId }),
+    invoke<string>("disconnect_postgres", { actorId }),
 
   configureGoogleSheets: (
     actorId: string,

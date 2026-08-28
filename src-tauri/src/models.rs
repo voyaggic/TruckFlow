@@ -317,6 +317,7 @@ pub struct CameraSourceView {
     pub source_type: String,
     pub connection_string: String,
     pub status: String,
+    pub tracked: bool,
     pub last_connection_check_at: Option<String>,
     pub last_connection_check_result: Option<String>,
 }

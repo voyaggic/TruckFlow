@@ -1,6 +1,6 @@
 [package]
 name = "truckflow"
-version = "0.1.0"
+version = "0.1.1"
 description = "TruckFlow — gate trip management"
 authors = ["TruckFlow"]
 edition = "2021"
@@ -45,3 +45,10 @@ postgres-native-tls = "0.5"
 postgres = "0.19.14"
 serde_json = "1.0.151"
 tauri = { version = "2", features = ["test"] }
+
+[profile.release]
+opt-level = "s"        # optimize for binary size
+lto = true             # link-time optimization
+codegen-units = 1      # single codegen unit for max optimization
+strip = true           # strip debug symbols
+panic = "abort"        # smaller binary, no unwinding

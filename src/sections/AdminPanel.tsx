@@ -159,6 +159,7 @@ function TripArchive({ actor }: { actor: SessionUser }) {
       setTimeout(() => setNotice(null), 6000);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -332,13 +333,16 @@ function OversightSection({ actor }: { actor: SessionUser }) {
       setError(null);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actor.id, from, to, action]);
 
+  const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
+
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    refreshBg();
+  }, [refreshBg]);
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -358,9 +362,10 @@ function OversightSection({ actor }: { actor: SessionUser }) {
     try {
       await api.deleteAuditEntries(actor.id, ids);
       setSelected([]);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setDeleting(false);
     }
@@ -638,6 +643,7 @@ function ResetRequests({ users, actor }: { users: UserView[]; actor: SessionUser
       refresh();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -650,6 +656,7 @@ function ResetRequests({ users, actor }: { users: UserView[]; actor: SessionUser
       refresh();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -765,6 +772,7 @@ function AddUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -860,6 +868,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -879,6 +888,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -893,6 +903,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -912,6 +923,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -927,6 +939,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -946,6 +959,7 @@ function EditUserForm({
       onDone();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -1135,14 +1149,17 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       setDriverFields(df);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
     // Keep the rest of the app in sync with renamed labels app-wide.
     refreshRefFields();
   }, [refreshRefFields]);
 
+  const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
+
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    refreshBg();
+  }, [refreshBg]);
 
   const run = async (fn: () => Promise<unknown>, okMsg: string) => {
     setError(null);
@@ -1150,9 +1167,10 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       await fn();
       onNotice(okMsg);
       setTimeout(() => onNotice(""), 4000);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -1169,6 +1187,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       setTimeout(() => onNotice(""), 5000);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -1186,6 +1205,7 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       setImportPreview(preview);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setImportBusy(false);
     }
@@ -1470,6 +1490,7 @@ function ImportWizard({
       onClose();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -2314,6 +2335,7 @@ function GenericRecordsTable({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -2328,6 +2350,7 @@ function GenericRecordsTable({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -2616,6 +2639,7 @@ function FieldManager({
       setFields(f);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   }, [entityTab]);
 
@@ -2648,6 +2672,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setSavingName(false);
     }
@@ -2672,6 +2697,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setSavingParent(false);
     }
@@ -2702,6 +2728,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setDeletingParentBusy(false);
     }
@@ -2753,6 +2780,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -2777,6 +2805,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -2794,6 +2823,7 @@ function FieldManager({
       onChanged();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 

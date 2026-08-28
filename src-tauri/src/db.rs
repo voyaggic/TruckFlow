@@ -15,11 +15,22 @@ pub struct Session {
 }
 
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    /// Primary connection — used by all Tauri command handlers (UI actions).
+    pub db: Arc<Mutex<Connection>>,
+    /// Dedicated connection for the background sync poller (Postgres + Sheets).
+    /// Never contends with UI commands.
+    pub sync_db: Arc<Mutex<Connection>>,
+    /// Dedicated connection for the background ANPR poller.
+    /// Never contends with UI commands or the sync poller.
+    pub anpr_db: Arc<Mutex<Connection>>,
     pub session: Mutex<Option<Session>>,
     pub simulator: Arc<SimulatorSource>,
     pub anpr_last: Mutex<Option<(String, String)>>,
     pub running: Arc<std::sync::atomic::AtomicBool>,
+    /// Guard: true while a user-initiated ANPR start is in progress.
+    /// The poller skips auto-restart while this is set, preventing the
+    /// race where poller restart kills a freshly spawned process.
+    pub anpr_starting: Arc<std::sync::atomic::AtomicBool>,
     /// Root directory where frame evidence files are stored (04 §7.4).
     pub frames_dir: PathBuf,
     /// PostgreSQL sync adapter (mock in dev, real driver swappable later).
@@ -27,7 +38,7 @@ pub struct AppState {
     /// Google Sheets export adapter (mock in dev).
     pub sheets: Arc<dyn SheetsProvider>,
     /// ANPR service child processes (managed by start/stop commands).
-    pub anpr_processes: Mutex<Vec<std::process::Child>>,
+    pub anpr_processes: Arc<Mutex<Vec<std::process::Child>>>,
 }
 
 pub fn now_iso() -> String {
@@ -47,13 +58,23 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
         .map_err(|e| format!("cannot resolve app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create app data dir: {e}"))?;
     let db_path = dir.join("truckflow.db");
+    // Three separate connections — zero contention between UI, sync, and ANPR.
+    // SQLite WAL mode allows concurrent reads; writes serialize at OS level but
+    // are sub-ms for single-row operations, so no perceptible blocking.
     let conn = open_db(&db_path)?;
-    let frames_dir = dir.join("frames");
+    let sync_conn = open_db(&db_path)?;
+    let anpr_conn = open_db(&db_path)?;
+    // Check if user has set a custom frames directory
+    let frames_dir = get_setting(&conn, "frames_dir")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.join("frames"));
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("cannot create frames dir: {e}"))?;
     let pg = crate::sync::real_postgres(&conn);
     let sheets = crate::sync::real_sheets(&conn);
     Ok(AppState {
-        db: Mutex::new(conn),
+        db: Arc::new(Mutex::new(conn)),
+        sync_db: Arc::new(Mutex::new(sync_conn)),
+        anpr_db: Arc::new(Mutex::new(anpr_conn)),
         session: Mutex::new(None),
         simulator: Arc::new(SimulatorSource::new()),
         anpr_last: Mutex::new(None),
@@ -61,7 +82,8 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
         frames_dir,
         pg,
         sheets,
-        anpr_processes: Mutex::new(Vec::new()),
+        anpr_processes: Arc::new(Mutex::new(Vec::new())),
+        anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -863,7 +885,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             }
         }
         if backfilled > 0 {
-            println!("[DB] Migration 26: backfilled {backfilled} training candidate frame_ref paths to absolute");
+            crate::log::log(&format!("[DB] Migration 26: backfilled {backfilled} training candidate frame_ref paths to absolute"));
         }
         conn.execute_batch("PRAGMA user_version = 26;")
             .map_err(|e| format!("version bump failed: {e}"))?;
@@ -923,7 +945,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 granted += 1;
             }
             if granted > 0 {
-                println!("[DB] Migration 28: granted resolve_queue to {granted} admin user(s)");
+                crate::log::log(&format!("[DB] Migration 28: granted resolve_queue to {granted} admin user(s)"));
             }
         }
         conn.execute_batch("PRAGMA user_version = 28;")
@@ -943,6 +965,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             [],
         ).ok();
         conn.execute_batch("PRAGMA user_version = 29;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // ── Migration 30: camera source tracking selection ────────────────────
+    // `tracked` = include this source in ANPR processing when the service
+    // starts. Default 1 so existing sources keep working (backward compat).
+    if current < 30 {
+        conn.execute_batch(
+            "ALTER TABLE camera_sources ADD COLUMN tracked INTEGER NOT NULL DEFAULT 1;",
+        )
+        .map_err(|e| format!("migration 30 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 30;")
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 

@@ -25,43 +25,43 @@ fn main() -> ExitCode {
     }
     match args[1].as_str() {
         "db-path" => {
-            println!("{}", truckflow_lib::db::default_db_path().display());
+            truckflow_lib::log::log(&format!("{}", truckflow_lib::db::default_db_path().display()));
             ExitCode::SUCCESS
         }
         "reset-admin" => {
             if args.len() != 4 {
-                eprintln!("usage: truckflow reset-admin <username> <new-password>");
+                truckflow_lib::log::log(&format!("usage: truckflow reset-admin <username> <new-password>"));
                 return ExitCode::FAILURE;
             }
             match cli_reset_admin(&args[2], &args[3]) {
                 Ok(msg) => {
-                    println!("{msg}");
+                    truckflow_lib::log::log(&format!("{msg}"));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    truckflow_lib::log::log(&format!("error: {e}"));
                     ExitCode::FAILURE
                 }
             }
         }
         "set-recovery-code" => {
             if args.len() != 2 {
-                eprintln!("usage: truckflow set-recovery-code");
+                truckflow_lib::log::log(&format!("usage: truckflow set-recovery-code"));
                 return ExitCode::FAILURE;
             }
             match cli_set_recovery_code() {
                 Ok(msg) => {
-                    println!("{msg}");
+                    truckflow_lib::log::log(&format!("{msg}"));
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    truckflow_lib::log::log(&format!("error: {e}"));
                     ExitCode::FAILURE
                 }
             }
         }
         _ => {
-            eprintln!("unknown command: {} (expected reset-admin | set-recovery-code | db-path)", args[1]);
+            truckflow_lib::log::log(&format!("unknown command: {} (expected reset-admin | set-recovery-code | db-path)", args[1]));
             ExitCode::FAILURE
         }
     }

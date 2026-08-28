@@ -283,8 +283,40 @@ export interface CameraSourceView {
   source_type: "rtsp" | "http" | "nvr_export" | "usb" | "video_file" | "live_test";
   connection_string: string;
   status: "active" | "inactive";
+  /** Included in ANPR processing when the service starts. */
+  tracked: boolean;
   last_connection_check_at: string | null;
   last_connection_check_result: string | null;
+}
+
+export interface DetectedCamera {
+  index: number;
+  name: string;
+  width: number;
+  height: number;
+  fps: number;
+  backend: string;
+  status: "ok" | "static" | "black" | "error" | "in_service" | "busy" | "unverified";
+  is_live: boolean;
+  device_type: string;
+  avg_frame_diff: number;
+  brightness: number;
+}
+
+export interface OnvifDevice {
+  ip: string;
+  port: number;
+  device_url: string;
+  name: string;
+  manufacturer: string;
+  model: string;
+  hardware: string;
+}
+
+export interface OnvifStreamUri {
+  uri: string;
+  profile_token: string;
+  profiles_available: number;
 }
 
 export interface ModelVersionView {

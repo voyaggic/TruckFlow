@@ -8,7 +8,7 @@ import type { RecoveryCodeInfo, SessionUser } from "../lib/types";
 import PasswordChecklist from "../components/PasswordChecklist";
 import { api } from "../lib/api";
 
-type Section = "theme" | "credential" | "profile" | "about" | "recovery";
+type Section = "theme" | "credential" | "profile" | "about" | "recovery" | "storage";
 
 export default function Settings({
   user,
@@ -96,11 +96,13 @@ export default function Settings({
     try {
       await api.changeOwnCredential(user.id, current, next);
       setOk("Password updated. Use it the next time you sign in.");
+      setTimeout(() => setOk(null), 3500);
       setCurrent("");
       setNext("");
       setConfirm("");
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -149,6 +151,9 @@ export default function Settings({
             Recovery code
           </button>
         )}
+        <button className={section === "storage" ? "active" : ""} onClick={() => switchSection("storage")}>
+          Storage
+        </button>
         <button className={section === "about" ? "active" : ""} onClick={() => switchSection("about")}>
           About
         </button>
@@ -257,6 +262,8 @@ export default function Settings({
           <ProfileSettings user={user} onOk={setOk} onError={setError} />
         </div>
       )}
+
+      {section === "storage" && <StorageSettings />}
 
       {section === "about" && <AboutPanel />}
 
@@ -598,4 +605,86 @@ function initials(name: string): string {
     .slice(0, 2)
     .map((w) => w[0].toUpperCase())
     .join("");
+}
+
+function StorageSettings() {
+  const [framesDir, setFramesDir] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getFramesDir().then(setFramesDir).catch(() => {}).finally(() => setLoading(false));
+  }, []);
+
+  const handlePickFolder = async () => {
+    try {
+      const folder = await api.pickFolder();
+      if (folder) {
+        setFramesDir(folder);
+        setMsg(null);
+        setErr(null);
+      }
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
+  const handleSave = async () => {
+    if (!framesDir.trim()) {
+      setErr("Path cannot be empty.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      await api.setFramesDir(framesDir.trim());
+      setMsg("Storage path saved. Restart the app for the change to take full effect.");
+      setTimeout(() => setMsg(null), 4000);
+    } catch (e) {
+      setErr(String(e));
+      setTimeout(() => setErr(null), 6000);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return <div className="card"><div className="center-fill"><div className="spinner" /></div></div>;
+  }
+
+  return (
+    <div className="card stack">
+      <div style={{ fontWeight: 600, fontSize: 15 }}>Data Storage</div>
+      <p className="muted small">
+        Choose where captured frames, evidence photos, and training data are saved on this computer.
+      </p>
+
+      {err && <div className="error-banner">{err}</div>}
+      {msg && <div className="success-banner">{msg}</div>}
+
+      <div className="field">
+        <label>Frames & Evidence Directory</label>
+        <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+          <input
+            style={{ flex: 1, fontFamily: "monospace", fontSize: 13 }}
+            value={framesDir}
+            onChange={(e) => { setFramesDir(e.target.value); setMsg(null); setErr(null); }}
+            placeholder="C:\Users\...\frames"
+          />
+          <button className="ghost" onClick={handlePickFolder}>Browse...</button>
+        </div>
+      </div>
+
+      <p className="muted small" style={{ marginBottom: 0 }}>
+        All trip photos, plate crops, and training candidate images are stored under this directory. Changing the path moves future saves; existing files stay at the old location.
+      </p>
+
+      <button className="primary" onClick={handleSave} disabled={saving}>
+        {saving ? "Saving..." : "Save"}
+      </button>
+    </div>
+  );
 }

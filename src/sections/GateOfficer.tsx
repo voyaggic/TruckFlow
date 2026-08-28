@@ -46,6 +46,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
   const [resolving, setResolving] = useState<TripView | null>(null);
   const [declineTarget, setDeclineTarget] = useState<TripView | null>(null);
   const [dischargePrompt, setDischargePrompt] = useState<TripView | null>(null);
+  const [clearing, setClearing] = useState(false);
   const mountedAt = useRef(Date.now());
 
   const refresh = useCallback(async () => {
@@ -63,15 +64,18 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     setSync(sy);
   }, []);
 
+  // Fire-and-forget wrapper — never block the UI waiting for refresh.
+  const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
+
   useEffect(() => {
-    refresh().catch((e) => setError(String(e)));
+    refreshBg();
     const unlisten = listen("capture-updated", () => {
-      refresh().catch((e) => setError(String(e)));
+      refreshBg();
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [refresh]);
+  }, [refreshBg]);
 
   const now = new Date();
   const sessionMinutes = Math.round((now.getTime() - mountedAt.current) / 60000);
@@ -86,10 +90,11 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
       } else {
         setFlash(`Trip ${trip.plate_number} approved`);
         setTimeout(() => setFlash(null), 2500);
-        await refresh();
+        refreshBg();
       }
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -100,7 +105,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
       setDeclineTarget(null);
       setFlash(`Read ${trip.plate_number} declined — kept locally, not counted.`);
       setTimeout(() => setFlash(null), 2500);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
       throw e;
@@ -118,7 +123,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
           : `Trip ${trip.plate_number} logged as a non-discharge entry.`,
       );
       setTimeout(() => setFlash(null), 2500);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
       throw e;
@@ -139,10 +144,11 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
       if (res.trip && res.trip.status === "logged" && res.trip.is_discharge_trip == null) {
         setDischargePrompt(res.trip);
       } else {
-        await refresh();
+        refreshBg();
       }
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -155,9 +161,10 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
       await api.setCaptureSettings(user.id, {
         consent_mode: settings.consent_mode === "confirm_required" ? "fully_automatic" : "confirm_required",
       });
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -358,18 +365,20 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
               onClick={async () => {
                 if (!window.confirm(`Archive all ${queued.length} queued items? They can be restored later by an admin.`)) return;
                 try {
-                  for (const t of queued) {
-                    await api.archiveTrip(user.id, t.id);
-                  }
+                  setClearing(true);
+                  await Promise.all(queued.map((t) => api.archiveTrip(user.id, t.id)));
                   setFlash(`${queued.length} queued items archived`);
                   setTimeout(() => setFlash(null), 2500);
-                  await refresh();
+                  refresh().catch(() => {});
                 } catch (e) {
                   setError(String(e));
+                  setTimeout(() => setError(null), 6000);
+                } finally {
+                  setClearing(false);
                 }
               }}
             >
-              Clear All
+              {clearing ? "Archiving…" : "Clear All"}
             </button>
           )}
         </div>
@@ -402,9 +411,10 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                       onClick={async () => {
                         try {
                           await api.archiveTrip(user.id, t.id);
-                          await refresh();
+                          refreshBg();
                         } catch (e) {
                           setError(String(e));
+                          setTimeout(() => setError(null), 6000);
                         }
                       }}
                     >
@@ -447,6 +457,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   setTimeout(() => setFlash(null), 4000);
                 } catch (e) {
                   setError(String(e));
+                  setTimeout(() => setError(null), 6000);
                 }
               }}
             >
@@ -461,9 +472,10 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   const n = await api.clearTodayTrips(user.id);
                   setFlash(`${n} entries archived`);
                   setTimeout(() => setFlash(null), 2500);
-                  await refresh();
+                  refreshBg();
                 } catch (e) {
                   setError(String(e));
+                  setTimeout(() => setError(null), 6000);
                 }
               }}
             >
@@ -530,9 +542,10 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                       onClick={async () => {
                         try {
                           await api.archiveTrip(user.id, t.id);
-                          await refresh();
+                          refreshBg();
                         } catch (e) {
                           setError(String(e));
+                          setTimeout(() => setError(null), 6000);
                         }
                       }}
                     >
@@ -565,7 +578,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
             if (trip && settings?.discharge_confirmation_required && trip.is_discharge_trip == null) {
               setDischargePrompt(trip);
             } else {
-              await refresh();
+              refreshBg();
             }
           }}
         />
@@ -700,6 +713,7 @@ function ResolveScreen({
       await onDone(`Trip ${logged.plate_number} resolved.`, logged);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -743,6 +757,7 @@ function ResolveScreen({
       await onDone(`Trip ${trip.plate_number} discarded — not counted.`, null);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setBusy(false);
     }
@@ -1090,6 +1105,7 @@ function ConfirmAction({
       await onConfirm();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
       setBusy(false);
     }
   };
@@ -1136,6 +1152,7 @@ function DischargeStep({
       await onConfirm(pick);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
       setBusy(false);
     }
   };

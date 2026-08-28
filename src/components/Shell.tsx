@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { memo, useEffect, useState } from "react";
 import type { SessionUser } from "../lib/types";
 import { api } from "../lib/api";
 import GateOfficer from "../sections/GateOfficer";
@@ -30,10 +30,9 @@ export function hasPerm(user: SessionUser, key: string): boolean {
 
 export type TabId = "gate" | "reporting" | "admin" | "monitor" | "anpr" | "settings";
 
-interface Tab {
+interface TabDef {
   id: TabId;
   label: string;
-  render: () => ReactNode;
 }
 
 export default function Shell({
@@ -57,6 +56,11 @@ export default function Shell({
     return "settings";
   });
 
+  // Track which tabs have been visited so we can lazy-mount them.
+  // On first visit: mount + fire API calls.
+  // On subsequent visits: already mounted, instant switch via display toggle.
+  const [visited, setVisited] = useState<Set<TabId>>(() => new Set([tab]));
+
   useEffect(() => {
     api
       .getProfilePhoto(user.id)
@@ -64,12 +68,13 @@ export default function Shell({
       .catch(() => undefined);
   }, [user.id]);
 
-  const tabs: Tab[] = [];
+  // Build stable tab list — permissions don't change mid-session.
+  const tabs: TabDef[] = [];
   if (hasPerm(user, PERM.gateEntries)) {
-    tabs.push({ id: "gate", label: "Gate", render: () => <GateOfficer user={user} canResolve={hasPerm(user, PERM.queue)} canRegisterVehicle={hasPerm(user, PERM.registerNewVehicle)} canEditTrip={hasPerm(user, PERM.editTrip)} /> });
+    tabs.push({ id: "gate", label: "Gate" });
   }
   if (hasPerm(user, PERM.reporting)) {
-    tabs.push({ id: "reporting", label: "Reporting", render: () => <Reporting user={user} /> });
+    tabs.push({ id: "reporting", label: "Reporting" });
   }
   if (
     hasPerm(user, PERM.manageUsers) ||
@@ -77,17 +82,28 @@ export default function Shell({
     hasPerm(user, PERM.manageIntegrations) ||
     hasPerm(user, PERM.viewAudit)
   ) {
-    tabs.push({ id: "admin", label: "Admin", render: () => <AdminPanel user={user} /> });
+    tabs.push({ id: "admin", label: "Admin" });
   }
   if (hasPerm(user, PERM.systemHealth)) {
-    tabs.push({ id: "monitor", label: "System Monitor", render: () => <SystemMonitor user={user} /> });
+    tabs.push({ id: "monitor", label: "System Monitor" });
   }
   if (hasPerm(user, PERM.manageAnprConfig)) {
-    tabs.push({ id: "anpr", label: "ANPR", render: () => <AnprConfig user={user} /> });
+    tabs.push({ id: "anpr", label: "ANPR" });
   }
-  tabs.push({ id: "settings", label: "Settings", render: () => <Settings user={user} onThemeChanged={onThemeChanged} /> });
+  tabs.push({ id: "settings", label: "Settings" });
 
   const active = tabs.find((t) => t.id === tab) ?? tabs[tabs.length - 1];
+
+  const switchTab = (id: TabId) => {
+    setTab(id);
+    // Mark as visited so the component mounts on next render (or immediately).
+    setVisited((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  };
 
   return (
     <div className="app-root">
@@ -113,7 +129,7 @@ export default function Shell({
 
       <div className="tabbar">
         {tabs.map((t) => (
-          <button key={t.id} className={active.id === t.id ? "active" : ""} onClick={() => setTab(t.id)}>
+          <button key={t.id} className={active.id === t.id ? "active" : ""} onClick={() => switchTab(t.id)}>
             {t.label}
           </button>
         ))}
@@ -121,12 +137,65 @@ export default function Shell({
 
       <PendingUpgradeBanner user={user} onApplied={onPermissionsApplied} />
 
-      <div className="section">{active.render()}</div>
+      <div className="section">
+        {/*
+          Lazy-mount: only render a tab's content once it has been visited.
+          First click: mounts + fires API calls (~10ms).
+          Subsequent clicks: already mounted, display toggle only (~0ms).
+        */}
+        {tabs.map((t) =>
+          visited.has(t.id) ? (
+            <div key={t.id} style={{ display: t.id === active.id ? "block" : "none" }}>
+              <TabContent
+                tabId={t.id}
+                user={user}
+                canResolve={hasPerm(user, PERM.queue)}
+                canRegisterVehicle={hasPerm(user, PERM.registerNewVehicle)}
+                canEditTrip={hasPerm(user, PERM.editTrip)}
+                onThemeChanged={onThemeChanged}
+                onPermissionsApplied={onPermissionsApplied}
+              />
+            </div>
+          ) : null
+        )}
+      </div>
     </div>
   );
 }
 
-function initials(name: string): string {
+const TabContent = memo(function TabContent({
+  tabId,
+  user,
+  canResolve,
+  canRegisterVehicle,
+  canEditTrip,
+  onThemeChanged,
+}: {
+  tabId: TabId;
+  user: SessionUser;
+  canResolve: boolean;
+  canRegisterVehicle: boolean;
+  canEditTrip: boolean;
+  onThemeChanged?: (themeMode: string, themeAccent: string) => void;
+  onPermissionsApplied?: () => void;
+}) {
+  switch (tabId) {
+    case "gate":
+      return <GateOfficer user={user} canResolve={canResolve} canRegisterVehicle={canRegisterVehicle} canEditTrip={canEditTrip} />;
+    case "reporting":
+      return <Reporting user={user} />;
+    case "admin":
+      return <AdminPanel user={user} />;
+    case "monitor":
+      return <SystemMonitor user={user} />;
+    case "anpr":
+      return <AnprConfig user={user} />;
+    case "settings":
+      return <Settings user={user} onThemeChanged={onThemeChanged} />;
+  }
+});
+
+function initials(name: string) {
   return name
     .split(/\s+/)
     .filter(Boolean)

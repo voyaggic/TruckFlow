@@ -32,16 +32,52 @@ Run:
   python main.py --source usb:0                               # webcam
 """
 
+
 from __future__ import annotations
+
+
+
+# ---------------------------------------------------------------------------
+# EasyOCR model path — must be set BEFORE easyocr is imported anywhere.
+#
+# When running as a PyInstaller-compiled executable, sys.frozen is True and
+# sys.executable points to the .exe itself (not python.exe). We look for a
+# pre-bundled easyocr_models/ directory alongside the exe and, if found, point
+# EasyOCR at it via EASYOCR_MODULE_PATH.
+#
+# build_anpr.py creates this directory at build time by pre-downloading the
+# English model weights. This means:
+#   - No internet download on first run for end users.
+#   - No silent hang waiting for a 200 MB download to complete.
+#   - Works on air-gapped / offline machines.
+#
+# In dev (running plain `python main.py`), sys.frozen is not set, this block
+# is a no-op, and EasyOCR uses its default ~/.EasyOCR/model/ path as normal.
+# ---------------------------------------------------------------------------
+import os
+import sys
+
+_self_dir = os.path.dirname(os.path.abspath(
+    sys.executable if getattr(sys, "frozen", False) else __file__
+))
+_bundled_models = os.path.join(_self_dir, "easyocr_models")
+if os.path.isdir(_bundled_models) and "EASYOCR_MODULE_PATH" not in os.environ:
+    os.environ["EASYOCR_MODULE_PATH"] = _bundled_models
+    print(f"[OCR] Using pre-bundled model weights: {_bundled_models}", flush=True)
+elif not os.path.isdir(_bundled_models):
+    print(
+        "[OCR] No pre-bundled models found — EasyOCR will download models on first use "
+        f"(expected at: {_bundled_models})",
+        flush=True,
+    )
 
 import argparse
 import base64
 import io
 import json
 import math
-import os
-import sys
 import threading
+import queue
 import time
 from datetime import datetime, timezone
 
@@ -100,11 +136,17 @@ class OcrBackend:
         print("[OCR] Engine configured (models will load on first frame)")
 
     def _ensure_models(self) -> None:
-        """Load OCR models on first use (lazy initialization)."""
+        """Load OCR models on first use (lazy initialization).
+
+        Priority: PaddleOCR (primary) → EasyOCR (fallback) → mock mode.
+        PaddleOCR is preferred: faster inference, smaller model footprint,
+        no PyTorch dependency.
+        """
         if self._models_loaded:
             return
         self._models_loaded = True
-        # Try PaddleOCR first (faster, better for plates)
+
+        # Try PaddleOCR first (primary engine — faster, better for plates)
         try:
             from paddleocr import PaddleOCR  # type: ignore
 
@@ -115,18 +157,21 @@ class OcrBackend:
             return
         except Exception as e:
             print(f"[OCR] PaddleOCR not available: {e}")
-        # Fallback to EasyOCR
+
+        # Fallback to EasyOCR (only if easyocr is installed)
         try:
             import easyocr  # type: ignore
 
             self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
             self.name = "easyocr"
             self.model_version = "easyocr-en"
-            print("[OCR] EasyOCR loaded (local)")
+            print("[OCR] EasyOCR loaded (local, fallback)")
             return
         except Exception as e:
             print(f"[OCR] EasyOCR not available: {e}")
-        print("[OCR] WARNING: No OCR engine available!")
+
+        print("[OCR] WARNING: No OCR engine available — running in mock mode")
+
 
     def read(self, frame: np.ndarray) -> list[tuple[str, float]]:
         """Return [(plate_text, confidence)] for the plates visible in frame.
@@ -189,8 +234,10 @@ class OcrBackend:
         try:
             for (_, text, conf) in self.reader.readtext(frame, detail=1):
                 plate = "".join(ch for ch in text.upper() if ch.isalnum())
-                if len(plate) >= 4 and conf >= 0.35:
-                    results.append((plate, float(conf)))
+                if should_accept_plate(plate) and conf >= 0.35:
+                    priority = plate_priority(plate)
+                    adjusted_conf = float(conf) * (1.0 + priority * 0.1)
+                    results.append((plate, adjusted_conf))
         except Exception:
             pass
         return results
@@ -203,8 +250,12 @@ class OcrBackend:
                 for item in line or []:
                     box, (text, conf) = item[0], item[1]
                     plate = "".join(ch for ch in str(text).upper() if ch.isalnum())
-                    if len(plate) >= 4 and conf >= 0.35:
-                        results.append((plate, float(conf)))
+                    if should_accept_plate(plate) and conf >= 0.35:
+                        # Boost confidence for Kenyan-format plates so they
+                        # win over partial/garbage reads.
+                        priority = plate_priority(plate)
+                        adjusted_conf = float(conf) * (1.0 + priority * 0.1)
+                        results.append((plate, adjusted_conf))
         except Exception:
             pass
         return results
@@ -238,37 +289,131 @@ def downscale_crop(crop: np.ndarray, max_width: int = 320) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Plate detection — contour heuristics over the frame (boxes for the tracker)
-# ---------------------------------------------------------------------------
+# ── Kenyan plate format validation ─────────────────────────────────────
+# Kenyan plates: 3 letters + 3 digits + 1 letter = 7 characters
+# e.g. KBA 123A, KBT 456Z, SBA 789C
+import re
+_KENYAN_PLATE_RE = re.compile(r'^[A-Z]{3}\d{3}[A-Z]$')
+
+def is_valid_plate(plate: str) -> bool:
+    """Check if a plate string matches the Kenyan format.
+
+    Kenyan standard: 3 uppercase letters + 3 digits + 1 uppercase letter.
+    Also accepts the old 4-char minimum for backward compatibility with
+    non-Kenyan plates (CCTV footage, test videos, etc.).
+    """
+    return bool(_KENYAN_PLATE_RE.match(plate))
+
+
+# OCR plate mode — set from config.json, read at startup.
+# 'universal' = accept any plate format (default)
+# 'kenyan'    = only accept Kenyan format (3 letters + 3 digits + 1 letter)
+_ocr_plate_mode = 'universal'
+
+def set_ocr_plate_mode(mode: str) -> None:
+    global _ocr_plate_mode
+    _ocr_plate_mode = mode.lower().strip()
+    print(f'[OCR] Plate mode set to: {_ocr_plate_mode}')
+
+def should_accept_plate(plate: str) -> bool:
+    """Filter OCR results based on the configured plate mode."""
+    if _ocr_plate_mode == 'kenyan':
+        return bool(_KENYAN_PLATE_RE.match(plate))
+    # universal mode: accept any plate with 4+ chars
+    return len(plate) >= 4
+
+
+def plate_priority(plate: str) -> int:
+    """Priority for plate readings — Kenyan format gets highest priority.
+
+    2 = Kenyan format (3 letters + 3 digits + 1 letter)
+    1 = Partial match (at least 5 chars, starts with letter)
+    0 = Generic (any 4+ chars)
+    """
+    if _KENYAN_PLATE_RE.match(plate):
+        return 2
+    if len(plate) >= 5 and plate[0].isalpha():
+        return 1
+    return 0
+
+
+# ── Plate detection ─────────────────────────────────────────────────────
+# Priority: YOLO (fine-tuned model) → contour heuristics (fallback)
+
+_yolo_model = None  # lazy-loaded singleton
+
+def _load_yolo():
+    """Load the fine-tuned YOLO license plate detector (lazy, once)."""
+    global _yolo_model
+    if _yolo_model is not None:
+        return _yolo_model
+    # Search multiple locations for the model
+    candidates = [
+        os.path.join(_self_dir, 'models', 'license_plate_detector.pt'),
+        os.path.join(os.path.dirname(_self_dir), 'anpr-service', 'models', 'license_plate_detector.pt'),
+    ]
+    model_path = next((p for p in candidates if os.path.exists(p)), None)
+    if model_path is None:
+        print('[DETECT] YOLO model not found — using contour fallback')
+        return None
+    try:
+        import torch
+        # PyTorch 2.6+ requires weights_only=True by default; our model
+        # uses ultralytics DetectionModel which needs unpickling.
+        _orig_load = torch.load
+        def _patched_load(*a, **kw):
+            kw.setdefault('weights_only', False)
+            return _orig_load(*a, **kw)
+        torch.load = _patched_load
+        try:
+            from ultralytics import YOLO
+            _yolo_model = YOLO(model_path)
+            print(f'[DETECT] YOLO model loaded: {model_path}')
+        finally:
+            torch.load = _orig_load
+        return _yolo_model
+    except Exception as e:
+        print(f'[DETECT] YOLO load failed ({e}) — using contour fallback')
+        return None
+
 
 def detect_plate_boxes(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
     """Return (x1, y1, x2, y2) candidate plate boxes.
 
-    Uses high-contrast rectangular blobs. This is intentionally simple — real
-    deployments swap in the detector that ships with the chosen OCR engine
-    (the boxes only feed the tracker; the OCR backend reads the crop).
+    Uses contour heuristics — fast (~5ms), finds plates at any distance,
+    and works in any lighting.  YOLO is disabled: it was trained on
+    close-up plates and filters out real plates at CCTV distances.
     """
+    # ── Contour detection (primary — fast, accurate, distance-agnostic) ──
     try:
         import cv2  # type: ignore
     except Exception:
-        # No OpenCV: treat the whole lower-middle band as one "vehicle" so the
-        # tracker still demonstrates correctly in mock mode.
         h, w = frame.shape[:2]
         return [(int(w * 0.15), int(h * 0.45), int(w * 0.85), int(h * 0.95))]
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    _, thresh_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_adaptive = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10
+    )
+    contours_otsu, _ = cv2.findContours(thresh_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_adaptive, _ = cv2.findContours(thresh_adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    tagged = [(c, 'otsu') for c in contours_otsu] + [(c, 'adaptive') for c in contours_adaptive]
     boxes: list[tuple[int, int, int, int]] = []
     h, w = gray.shape[:2]
-    for c in contours:
+    frame_area = w * h
+    for c, source in tagged:
         x, y, bw, bh = cv2.boundingRect(c)
         area = bw * bh
-        if area < (w * h) * 0.0015 or area > (w * h) * 0.25:
+        max_pct = 0.60 if source == 'adaptive' else 0.40
+        if area < frame_area * 0.0008 or area > frame_area * max_pct:
             continue
         aspect = bw / max(1, bh)
-        if 1.6 < aspect < 6.5 and 12 < bh < h * 0.4:
+        if 1.4 < aspect < 7.0 and 8 < bh < h * 0.70:
             boxes.append((x, y, x + bw, y + bh))
     return boxes
 
@@ -278,7 +423,11 @@ def detect_plate_boxes(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
 # ---------------------------------------------------------------------------
 
 class TrackedReading:
-    """One best-reading slot per SORT track id (09 §4.1 — never more)."""
+    """One best-reading slot per SORT track id (09 §4.1 — never more).
+
+    Updated from the OCR worker thread, so mutations are guarded by
+    Pipeline.lock (held by the worker when writing, by the capture
+    thread when reading)."""
 
     def __init__(self, track_id: int):
         self.track_id = track_id
@@ -522,7 +671,13 @@ class MjpegFrameReader:
 
 
 class Pipeline:
-    """Owns the capture thread, SORT tracker and the finalized sighting list."""
+    """Owns the capture thread, SORT tracker and the finalized sighting list.
+
+    CAPTURE → DETECTION → TRACKING runs on the capture thread (fast, <5 ms).
+    OCR runs on a SEPARATE background worker thread so it never blocks frame
+    capture.  This eliminates the ~0.5–1 s stutter that PaddleOCR/EasyOCR
+    per-plate latency used to cause in the live preview and ANPR feed.
+    """
 
     def __init__(self, source: str, source_type: str, ocr: OcrBackend, port: int):
         self.source = source
@@ -541,24 +696,35 @@ class Pipeline:
         self.running = False
         self.lock = threading.Lock()
         self.current_frame: np.ndarray | None = None
+        # ── OCR worker thread (decoupled from capture) ──
+        # Jobs are (track_id, crop_ndarray_copy, frame_num).  The capture thread
+        # enqueues; the worker dequeues, runs OCR (~0.5–1 s), and updates the
+        # TrackedReading under self.lock.  Bounded queue prevents memory
+        # blow-up if OCR falls behind.
+        self._ocr_queue: queue.Queue = queue.Queue(maxsize=30)
+        self._ocr_worker_running = True
+        self._ocr_thread = threading.Thread(target=self._ocr_worker, daemon=True, name="ocr-worker")
+        self._ocr_thread.start()
         self._frame_key = 0
 
     # -- capture ------------------------------------------------------------
 
     def capture_frames(self) -> None:
         """Pull frames from the configured source and feed the tracker.
-        
+
         For HTTP/HTTPS sources, uses a custom MJPEG reader that parses
         multipart streams directly (OpenCV VideoCapture can't handle these
         on Windows). For other sources (video files, USB, RTSP), uses OpenCV.
-        Retries on stream drops with exponential backoff.
-        Stops retrying when shutdown signal is received or source is empty.
+        Live sources retry on stream drops with exponential backoff.
+        Video files stop cleanly at EOF — no retry loop, no resource drain.
         """
         # Bail immediately if no source configured
         if not self.source or not self.source.strip():
             print("[ANPR] No source configured — capture thread exiting")
             return
 
+        # nvr_export is an NVR video export file — identical semantics to video_file
+        is_video_file = self.source_type in ("video_file", "nvr_export")
         max_backoff = 30  # seconds
         attempt = 0
         # Use custom MJPEG reader for HTTP/HTTPS sources
@@ -574,7 +740,15 @@ class Pipeline:
                 break  # EOF / normal exit
             if _shutdown_event.is_set():
                 break
-            # Failed — retry with backoff
+            # Video files: EOF reached — finalize tracks and stop cleanly.
+            # Do NOT retry: the file is finite, reconnecting would just loop
+            # forever, consuming CPU/memory and potentially starving the WebView.
+            if is_video_file:
+                print("[ANPR] Video file ended — finalizing all tracks and stopping")
+                self.finalize_all()
+                self.running = False
+                break
+            # Live source — retry with backoff
             self.running = False
             attempt += 1
             wait = min(max_backoff, 2 ** attempt)
@@ -586,6 +760,9 @@ class Pipeline:
                 time.sleep(0.5)
             self.sort = Sort(max_age=12, min_hits=2)
             self.readings.clear()
+
+        # Drain any pending OCR jobs and stop the worker thread.
+        self._stop_ocr_worker()
 
     def _run_mjpeg_capture(self, attempt: int) -> tuple[bool, bool]:
         """Run the MJPEG frame reader loop. Returns (eof, error)."""
@@ -622,10 +799,16 @@ class Pipeline:
         return True, False
 
     def _run_opencv_capture(self) -> tuple[bool, bool]:
-        """Run the OpenCV capture loop. Returns (eof, error)."""
+        """Run the OpenCV capture loop. Returns (eof, error).
+
+        For video files, a single failed read means EOF — return immediately
+        so the caller can stop cleanly. For live sources, tolerate a few
+        consecutive failures before reporting a dropped stream.
+        """
         cap = self._open_capture()
         if cap is None:
             return False, True
+        is_video_file = self.source_type in ("video_file", "nvr_export")
         try:
             self.running = True
             consecutive_failures = 0
@@ -634,7 +817,19 @@ class Pipeline:
                 ok, frame = cap.read()
                 if not ok:
                     consecutive_failures += 1
-                    if consecutive_failures >= 15:
+                    # Video files: EOF is immediate — one failed read = done.
+                    # Live sources: tolerate transient failures before giving up.
+                    threshold = 1 if is_video_file else 15
+                    if consecutive_failures >= threshold:
+                        if is_video_file:
+                            # LOOP the video instead of stopping — a finite
+                            # file would otherwise freeze on its last frame /
+                            # go black after a single play-through.
+                            print("[ANPR] Video file reached EOF — looping back to start")
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            consecutive_failures = 0
+                            time.sleep(0.05)
+                            continue
                         print("[ANPR] Stream dropped, reconnecting...")
                         return False, False
                     time.sleep(0.05)
@@ -669,7 +864,7 @@ class Pipeline:
         try:
             import cv2  # type: ignore
         except Exception:
-            if self.source_type in ("http", "rtsp", "usb", "video_file"):
+            if self.source_type in ("http", "rtsp", "usb", "video_file", "nvr_export"):
                 print("OpenCV (cv2) is required for this source. Install: pip install opencv-python")
                 return None
             return None
@@ -688,10 +883,22 @@ class Pipeline:
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
             return cap
-        if self.source_type == "video_file":
+        if self.source_type in ("video_file", "nvr_export"):
             return cv2.VideoCapture(self.source)
         if self.source_type == "usb":
-            return cv2.VideoCapture(int(self.source))
+            # CAP_DSHOW matches the detection script and _test_source.py.
+            # The default backend (MSMF on Windows) enumerates devices in a
+            # different order and often fails on virtual cameras, causing the
+            # detected index to open a DIFFERENT physical device at runtime.
+            # Accept both bare index ("1") and prefixed ("usb:1").
+            idx = int(self.source.removeprefix("usb:"))
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(idx)  # fallback to default backend
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            return cap
         if self.source_type in ("http", "rtsp", "live_test"):
             # Set FFmpeg options for network streams
             if self.source.startswith("rtsp://"):
@@ -705,31 +912,82 @@ class Pipeline:
 
     # -- one frame ----------------------------------------------------------
 
+    # ── OCR worker thread (runs in background, never blocks capture) ──────
+
+    def _ocr_worker(self) -> None:
+        """Background thread that runs OCR on crops enqueued by tick().
+
+        PaddleOCR / EasyOCR takes ~0.5–1 s per plate on CPU.  By running
+        on a separate thread, the capture loop continues grabbing frames
+        at full camera FPS — eliminating the preview stutter.
+        """
+        while self._ocr_worker_running or not self._ocr_queue.empty():
+            try:
+                tid, crop, fnum = self._ocr_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                reads = self.ocr.read(crop)
+                with self.lock:
+                    slot = self.readings.get(tid)
+                    if slot is not None:
+                        for plate, conf in reads:
+                            slot.consider(plate, conf, crop)
+            except Exception as e:
+                print(f"[ANPR] OCR worker error (track {tid}): {e}")
+            finally:
+                self._ocr_queue.task_done()
+
+    def _stop_ocr_worker(self) -> None:
+        """Signal the OCR worker to finish and wait for it."""
+        self._ocr_worker_running = False
+        try:
+            self._ocr_thread.join(timeout=3.0)
+        except Exception:
+            pass
+
+    # ── capture-thread fast path (detection + tracking, < 5 ms) ──────────
+
     def tick(self, frame: np.ndarray) -> None:
+        """Detect plate candidates, run SORT tracker, enqueue OCR jobs.
+
+        This method runs on the capture thread and MUST stay fast (< 5 ms)
+        so frames keep flowing to the preview.  OCR is offloaded to
+        _ocr_worker via the bounded queue.
+        """
         boxes = detect_plate_boxes(frame)
         dets = np.array(boxes, dtype=float).reshape(-1, 4) if boxes else np.empty((0, 4))
         tracked = self.sort.update(dets)
 
-        # Collect best reading for every tracked box by cropping + OCR.
-        # OCR is throttled per track: a track only needs its highest-confidence
-        # read, so re-reading every frame just burns CPU (EasyOCR on CPU is
-        # ~1s/call). Every OCR_INTERVAL frames per track is plenty and keeps
-        # the live pipeline fast.
+        # Enqueue OCR jobs for tracks that are due — capture thread never
+        # blocks on OCR; the worker handles it in the background.
         for row in tracked:
             x1, y1, x2, y2, tid = (int(v) for v in row)
             if x2 <= x1 or y2 <= y1:
                 continue
-            slot = self.readings.setdefault(tid, TrackedReading(tid))
-            if self.frame_num - slot.last_ocr_frame < OCR_INTERVAL:
-                continue
-            slot.last_ocr_frame = self.frame_num
-            crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+            with self.lock:
+                slot = self.readings.setdefault(tid, TrackedReading(tid))
+                if self.frame_num - slot.last_ocr_frame < OCR_INTERVAL:
+                    continue
+                slot.last_ocr_frame = self.frame_num
+            # Pad the crop 50% on each side so OCR sees the FULL plate,
+            # not just the contour-detected portion.  A contour might find
+            # only the numbers ("878S") while the letters ("KBW") are
+            # adjacent — padding gives PaddleOCR the context to read both.
+            bw, bh = x2 - x1, y2 - y1
+            pad_x, pad_y = bw // 2, bh // 2
+            crop = frame[
+                max(0, y1 - pad_y):min(frame.shape[0], y2 + pad_y),
+                max(0, x1 - pad_x):min(frame.shape[1], x2 + pad_x)
+            ]
             if crop.size == 0:
                 continue
-            crop = downscale_crop(crop, max_width=320)
-            reads = self.ocr.read(crop)
-            for plate, conf in reads:
-                slot.consider(plate, conf, crop)
+            # COPY the crop — the frame buffer will be overwritten on next read.
+            crop_copy = downscale_crop(crop, max_width=320).copy()
+            try:
+                self._ocr_queue.put_nowait((tid, crop_copy, self.frame_num))
+            except queue.Full:
+                pass  # drop this OCR attempt; next frame will retry
 
         # Tracks the tracker dropped (vehicle left frame) -> finalize sightings.
         live_ids = {int(r[4]) for r in tracked}
@@ -756,6 +1014,10 @@ class Pipeline:
         self.last_emitted = None
 
     def finalize_all(self) -> None:
+        # Drain any pending OCR jobs so their results land in readings
+        # before we finalize — otherwise the last plate read per track
+        # would be lost.
+        self._ocr_queue.join()
         for tid in list(self.readings.keys()):
             self.finalize_track(tid)
 
@@ -907,16 +1169,70 @@ def serve(pipeline: Pipeline, port: int) -> None:
                     self._json(pipeline.sightings)
             elif path == "/health":
                 self._json({"ok": True})
+            elif path.startswith("/camera_preview"):
+                # Capture a single frame from a USB camera by index.
+                # Used by the Detect Cameras panel to show live thumbnails.
+                import urllib.parse
+                qs = urllib.parse.urlparse(self.path).query
+                params = urllib.parse.parse_qs(qs)
+                idx = int(params.get("index", ["0"])[0])
+                try:
+                    import cv2 as _cv2
+                    cap = _cv2.VideoCapture(idx, _cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error": "camera not available"}')
+                        return
+                    ret, frame = cap.read()
+                    cap.release()
+                    if not ret or frame is None:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error": "cannot read frame"}')
+                        return
+                    data = _jpeg(frame)
+                    if not data:
+                        self.send_response(500)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(f'{{"error": "{e}"}}'.encode())
             elif path == "/preview_frame":
-                with pipeline.lock:
-                    frame = pipeline.current_frame
+                # Support multi-camera: ?camera=N selects a specific camera
+                import urllib.parse as _up
+                _qs = _up.urlparse(self.path).query
+                _qp = _up.parse_qs(_qs)
+                cam_idx = int(_qp.get("camera", ["0"])[0])
+                frame = None
+                if isinstance(pipeline, MultiPipeline):
+                    if 0 <= cam_idx < len(pipeline.pipelines):
+                        with pipeline.pipelines[cam_idx].lock:
+                            frame = pipeline.pipelines[cam_idx].current_frame
+                else:
+                    with pipeline.lock:
+                        frame = pipeline.current_frame
                 if frame is None:
                     self.send_response(503)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(b'{"error": "no frame yet"}')
                     return
-                data = _jpeg(pipeline.annotate(frame))
+                data = _jpeg(frame)
                 if not data:
                     self.send_response(500)
                     self.end_headers()
@@ -935,6 +1251,35 @@ def serve(pipeline: Pipeline, port: int) -> None:
                 self._json({"error": "not found"}, 404)
 
         def _stream_mjpeg(self):
+            # Support per-camera MJPEG: /preview?camera=N streams that camera's
+            # annotated feed. Works for both single Pipeline and MultiPipeline
+            # (the old code accessed pipeline.current_frame/annotate, which only
+            # exist on single Pipeline — /preview was broken in multi-camera mode).
+            import urllib.parse as _up
+            _qp = _up.parse_qs(_up.urlparse(self.path).query)
+            cam_idx: int | None = None
+            if "camera" in _qp:
+                try:
+                    cam_idx = int(_qp["camera"][0])
+                except (ValueError, IndexError):
+                    cam_idx = None
+
+            def _get_frame_and_annotator():
+                if isinstance(pipeline, MultiPipeline):
+                    if not pipeline.pipelines:
+                        return None, None
+                    if cam_idx is not None:
+                        if not (0 <= cam_idx < len(pipeline.pipelines)):
+                            return None, None
+                        p = pipeline.pipelines[cam_idx]
+                    else:
+                        # No camera specified: first pipeline that has a frame
+                        p = next((pp for pp in pipeline.pipelines if pp.current_frame is not None), pipeline.pipelines[0])
+                    with p.lock:
+                        return p.current_frame, p
+                with pipeline.lock:
+                    return pipeline.current_frame, pipeline
+
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -943,10 +1288,9 @@ def serve(pipeline: Pipeline, port: int) -> None:
             self.end_headers()
             try:
                 while True:
-                    with pipeline.lock:
-                        frame = pipeline.current_frame
-                    if frame is not None:
-                        data = _jpeg(pipeline.annotate(frame))
+                    frame, annotator = _get_frame_and_annotator()
+                    if frame is not None and annotator is not None:
+                        data = _jpeg(annotator.annotate(frame))
                         if data:
                             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
                             self.wfile.write(data)
@@ -955,6 +1299,29 @@ def serve(pipeline: Pipeline, port: int) -> None:
                     time.sleep(0.1)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+
+    # Refuse to start if another LIVE instance already serves this port.
+    # ThreadingHTTPServer sets SO_REUSEADDR, which on Windows PERMITS a second
+    # bind of an in-use port — two servers then share it and requests are
+    # answered by whichever won the race (observed: a stale instance serving
+    # black frames from a camera that is no longer configured).
+    import socket as _socket
+    _probe = _socket.socket()
+    _probe.settimeout(0.7)
+    _port_taken = False
+    try:
+        _probe.connect(("127.0.0.1", port))
+        _port_taken = True
+    except OSError:
+        pass
+    finally:
+        try:
+            _probe.close()
+        except Exception:
+            pass
+    if _port_taken:
+        print(f"FATAL: port {port} is already served by another ANPR instance — not starting a duplicate.", flush=True)
+        sys.exit(1)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"ANPR service listening on http://127.0.0.1:{port}")
@@ -1017,6 +1384,127 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+class MultiPipeline:
+    """Wraps multiple Pipeline instances for multi-camera support.
+
+    Each camera source gets its own Pipeline with its own capture thread,
+    SORT tracker, and readings.  Sightings from all cameras are merged
+    into a single list and /latest returns the most recent from any camera.
+    """
+
+    def __init__(self, ocr: OcrBackend, port: int):
+        self.ocr = ocr
+        self.port = port
+        self.pipelines: list[Pipeline] = []
+        self.lock = threading.Lock()
+        self.running = False
+        self.start_time = time.time()
+
+    def add_source(self, source: str, source_type: str) -> None:
+        """Add a camera source and start its capture thread."""
+        if not source or not source.strip():
+            return
+        p = Pipeline(source, source_type, self.ocr, self.port)
+        self.pipelines.append(p)
+        t = threading.Thread(target=p.capture_frames, daemon=True)
+        t.start()
+        print(f"[ANPR] Camera added: {source} ({source_type})")
+
+    def stop(self) -> None:
+        """Stop all pipelines."""
+        self.running = False
+        for p in self.pipelines:
+            p.running = False
+
+    # -- Merged status / sightings ----------------------------------------
+
+    @property
+    def sightings(self) -> list[dict]:
+        """Merged sightings from all cameras, sorted by timestamp."""
+        all_s = []
+        for p in self.pipelines:
+            with p.lock:
+                all_s.extend(p.sightings)
+        all_s.sort(key=lambda s: s.get("timestamp", ""))
+        return all_s
+
+    def latest_payload(self) -> dict | None:
+        """Return the most recent sighting from any camera."""
+        best = None
+        best_ts = ""
+        for p in self.pipelines:
+            payload = p.latest_payload()
+            if payload and payload.get("timestamp", "") > best_ts:
+                best = payload
+                best_ts = payload.get("timestamp", "")
+        return best
+
+    def status(self) -> dict:
+        """Aggregated status from all cameras."""
+        total_frames = 0
+        total_plates = 0
+        any_running = False
+        any_frame = False
+        cameras = []
+        for i, p in enumerate(self.pipelines):
+            st = p.status()
+            total_frames += st["frames_processed"]
+            total_plates += st["plates_detected"]
+            if st["running"]:
+                any_running = True
+            if st["camera_connected"]:
+                any_frame = True
+            cameras.append({
+                "index": i,
+                "source": st["source_url"],
+                "source_type": st["source_type"],
+                "running": st["running"],
+                "connected": st["camera_connected"],
+                "frames": st["frames_processed"],
+                "fps": st["fps"],
+            })
+        uptime = int(time.time() - self.start_time)
+        fps = total_frames / max(1.0, uptime)
+        return {
+            "running": any_running,
+            "source_type": "multi" if len(self.pipelines) > 1 else (self.pipelines[0].source_type if self.pipelines else ""),
+            "source_url": f"{len(self.pipelines)} cameras",
+            "models_loaded": self.ocr.name != "mock",
+            "plates_detected": total_plates,
+            "frames_processed": total_frames,
+            "fps": round(fps, 1),
+            "last_plate_time": None,
+            "uptime_seconds": uptime,
+            "ocr_engine": self.ocr.name,
+            "camera_connected": any_frame,
+            "cameras": cameras,
+        }
+
+    def latest_payload_dedup(self) -> dict | None:
+        """Return the latest payload exactly once (dedup across cameras)."""
+        best = None
+        best_ts = ""
+        for p in self.pipelines:
+            with p.lock:
+                if p.last_emitted is not p.latest and p.latest:
+                    ts = p.latest.get("timestamp", "")
+                    if ts > best_ts:
+                        best = p.latest
+                        best_ts = ts
+                        p.last_emitted = p.latest
+        return best
+
+    def annotate(self, frame):
+        """No-op for multi pipeline (each sub-pipeline annotates its own)."""
+        return frame
+
+    def _classify(self, plate: str) -> str:
+        """Classify across all cameras' sightings."""
+        with self.lock:
+            open_plates = {s["plate"] for s in self.sightings if s.get("entry_exit") == "entry"}
+        return "exit" if plate in open_plates else "entry"
+
+
 def main() -> None:
     import signal
 
@@ -1049,21 +1537,58 @@ def main() -> None:
         print("[OCR] Local-only mode (cloud not preferred)")
 
     ocr = OcrBackend(prefer_cloud=prefer_cloud, cloud_api_url=cloud_api_url, cloud_api_key=cloud_api_key)
-    pipeline = Pipeline(source or "", source_type or "", ocr, args.port)
+
+    # OCR plate mode — 'universal' (any plate) or 'kenyan' (3 letters + 3 digits + 1 letter)
+    ocr_plate_mode = cfg.get('ocr_plate_mode', 'universal')
+    set_ocr_plate_mode(ocr_plate_mode)
+
+    # --- Multi-camera: read "sources" array from config.json --------------
+    sources_list = cfg.get("sources", [])
+    if args.source:
+        # CLI --source overrides everything
+        sources_list = [{"source": args.source, "source_type": source_type}]
+
+    if len(sources_list) > 1:
+        # Multi-camera mode: one Pipeline per source, merged sightings
+        multi = MultiPipeline(ocr, args.port)
+        for s in sources_list:
+            s_src = s.get("source", "")
+            s_type = s.get("source_type", "") or infer_type(s_src) if s_src else ""
+            multi.add_source(s_src, s_type)
+        multi.running = True
+        pipeline = multi
+        has_any = any(p.source for p in multi.pipelines)
+        print(f"[ANPR] Multi-camera mode: {len(multi.pipelines)} source(s)")
+    else:
+        # Single-camera mode (backward compat)
+        if sources_list:
+            source = sources_list[0].get("source", source)
+            source_type = sources_list[0].get("source_type", source_type) or infer_type(source) if source else source_type
+        has_source = bool(source and source.strip())
+        pipeline = Pipeline(source or "", source_type or "", ocr, args.port)
+        has_any = has_source
+        if has_source:
+            print(f"Camera source: {source} ({source_type})")
 
     # Graceful shutdown on SIGTERM/SIGINT (Windows and Unix)
     def _shutdown(signum, frame):
         print("[ANPR] Shutdown signal received")
         _shutdown_event.set()
         pipeline.running = False
+        if isinstance(pipeline, MultiPipeline):
+            pipeline.stop()
         threading.Thread(target=lambda: os._exit(0), daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    if has_source:
-        capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
-        capture_thread.start()
+    if has_any:
+        if isinstance(pipeline, MultiPipeline):
+            # Capture threads already started in add_source()
+            pass
+        else:
+            capture_thread = threading.Thread(target=pipeline.capture_frames, daemon=True)
+            capture_thread.start()
     else:
         print("[ANPR] No source — capture thread not started")
     serve(pipeline, args.port)

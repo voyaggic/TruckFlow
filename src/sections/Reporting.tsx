@@ -90,14 +90,17 @@ export default function Reporting({ user }: { user: SessionUser }) {
       setCompanies(cos);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setLoading(false);
     }
   }, [user.id, filters]);
 
+  const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
+
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    refreshBg();
+  }, [refreshBg]);
 
   const pickPreset = (p: PresetKey) => {
     setPreset(p);
@@ -115,6 +118,7 @@ export default function Reporting({ user }: { user: SessionUser }) {
       setDrill({ rows, frames: {} });
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -145,6 +149,7 @@ export default function Reporting({ user }: { user: SessionUser }) {
       setTimeout(() => setFlash(null), 5000);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 
@@ -162,6 +167,7 @@ export default function Reporting({ user }: { user: SessionUser }) {
       setTimeout(() => setFlash(null), 5000);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 

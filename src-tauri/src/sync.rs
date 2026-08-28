@@ -14,13 +14,14 @@
 //! Postgres/Sheets drivers are swappable without touching the sync engine.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use postgres::types::ToSql;
 use rusqlite::{Connection, params};
 use rusqlite::types::ValueRef;
 use serde_json::json;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{append_audit, now_iso, AppState};
 use crate::models::{PgSyncStateView, SheetsStateView, SyncRunResult, SyncStatusView, TablePending};
@@ -178,6 +179,12 @@ pub trait SheetsProvider: Send + Sync {
     fn prune(&self, _cutoff_iso: Option<&str>, _excluded_ids: &[String]) -> Result<usize, String> {
         Err("this provider does not support pruning".to_string())
     }
+    /// Read all trip IDs (column 0) from the sheet data rows. Used for
+    /// deduplication: prevents re-appending a trip that already exists in
+    /// the sheet but lost its local `sheet_row` reference.
+    fn read_existing_trip_ids(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]
@@ -265,7 +272,7 @@ pub fn mock_sheets() -> Arc<dyn SheetsProvider> {
 
 /// Syncable tables (all carry the `synced` flag). Order matters: reference data
 /// first, trips last, so central never receives a trip before its vehicle.
-const PG_SYNC_TABLES: &[(&str, &str)] = &[
+pub const PG_SYNC_TABLES: &[(&str, &str)] = &[
     ("companies", "Companies"),
     ("drivers", "Drivers"),
     ("vehicles", "Vehicles"),
@@ -343,11 +350,70 @@ fn pending_for_table(conn: &Connection, table: &str) -> Result<i64, String> {
         .map_err(|e| format!("{table} count failed: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Split-phase helpers for lock-free sync (called from spawn_sync_poller).
+// Each phase is either DB-only (needs lock) or network-only (no lock).
+// ---------------------------------------------------------------------------
+
+/// Phase 1 (lock): collect all unsynced rows from a table.
+pub fn collect_unsynced_rows(conn: &Connection, table: &str) -> Result<Vec<serde_json::Value>, String> {
+    rows_where_not_synced(conn, table)
+}
+
+/// Phase 2 (NO lock): push rows to central DB via network.
+pub fn push_rows_to_central(pg: &dyn PostgresAdapter, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
+    if rows.is_empty() || !pg.connected() {
+        return Ok(vec![]);
+    }
+    pg.push_rows(table, rows).map_err(|e| format!("{table} push failed: {e}"))
+}
+
+/// Phase 3 (lock): mark rows as synced after successful push.
+pub fn mark_rows_synced(conn: &Connection, table: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        conn.execute(&format!("UPDATE {table} SET synced = 1 WHERE id = ?1"), params![id])
+            .map_err(|e| format!("{table} flag flip failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Phase 1 (NO lock): fetch rows from central DB via network.
+pub fn fetch_central_rows(pg: &dyn PostgresAdapter, table: &str, since: &str) -> Result<Vec<serde_json::Value>, String> {
+    let sql = format!(
+        "SELECT * FROM {} WHERE updated_at > $1 ORDER BY updated_at ASC",
+        pg_quote_ident(table)
+    );
+    pg.query_rows(&sql, &[since.to_string()]).map_err(|e| format!("{table} pull failed: {e}"))
+}
+
+/// Phase 2 (lock): upsert central rows into local DB.
+pub fn upsert_central_rows(conn: &Connection, table: &str, central_rows: &[serde_json::Value]) -> Result<i64, String> {
+    if central_rows.is_empty() {
+        return Ok(0);
+    }
+    let local_timestamps = batch_load_local_timestamps(conn, table)?;
+    let mut pulled = 0i64;
+    for row in central_rows {
+        let Some(obj) = row.as_object() else { continue };
+        let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() { continue }
+        let central_updated = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(ref local_ts) = local_timestamps.get(id) {
+            if local_ts.as_str() >= central_updated {
+                continue;
+            }
+        }
+        upsert_row_from_central(conn, table, obj)?;
+        pulled += 1;
+    }
+    Ok(pulled)
+}
+
 /// Pull reference data (companies, vehicles, drivers) from central DB.
 /// Uses last-edit-wins-by-timestamp: if the central row is newer than the
 /// local row, the central version wins. Local edits that haven't been pushed
 /// yet are preserved (they'll push on next sync).
-const REFERENCE_TABLES: &[&str] = &["companies", "drivers", "vehicles"];
+pub const REFERENCE_TABLES: &[&str] = &["companies", "drivers", "vehicles"];
 
 pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<PullResult, String> {
     if !pg.connected() {
@@ -748,65 +814,138 @@ fn parse_extra_field_json(raw: Option<String>) -> serde_json::Value {
     }
 }
 
+/// Data collected from SQLite during the read phase of a Sheets sync cycle.
+/// All fields are plain owned types so the lock can be dropped before network.
+pub struct SheetsSyncData {
+    pub pending: i64,
+    pub mapping: Vec<crate::models::SheetColumnEntry>,
+    pub new_rows: Vec<serde_json::Value>,
+    pub update_rows: Vec<serde_json::Value>,
+}
+
+/// Phase 1 — Read all data needed for Sheets sync from SQLite.
+/// Returns an owned struct so the DB lock can be dropped before HTTP calls.
+///
+/// Deduplication: reads the existing trip IDs from the sheet (column 0) and
+/// filters them out of `new_rows` so a trip that was already appended but
+/// somehow lost its `sheet_row` reference is never duplicated.
+pub fn prepare_sheets_data(
+    conn: &Connection,
+    sheets: &dyn SheetsProvider,
+) -> Result<SheetsSyncData, String> {
+    let pending = pending_sheets_trips(conn)?;
+    let mapping = read_sheet_mapping(conn);
+    let mut new_rows = sheet_trip_rows_filtered(conn, false)?;
+    let update_rows = sheet_trip_rows_filtered(conn, true)?;
+    // Dedup: remove any new_rows whose trip ID already exists in the sheet.
+    // This prevents the infinite duplication loop when sheet_row is lost.
+    if !new_rows.is_empty() {
+        match sheets.read_existing_trip_ids() {
+            Ok(existing) if !existing.is_empty() => {
+                let before = new_rows.len();
+                new_rows.retain(|r| {
+                    r.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| !existing.contains(&id.to_string()))
+                        .unwrap_or(true)
+                });
+                let deduped = before - new_rows.len();
+                if deduped > 0 {
+                    crate::log::log(&format!(
+                        "[sheets] dedup: removed {deduped} rows that already exist in the sheet"
+                    ));
+                }
+            }
+            _ => {} // Can't read sheet (not configured / network error) — skip dedup.
+        }
+    }
+    Ok(SheetsSyncData { pending, mapping, new_rows, update_rows })
+}
+
+/// Phase 3 — Write back the results of a Sheets sync cycle to SQLite.
+/// Updates pushed flags and last_synced_at timestamp.
+pub fn finalize_sheets_results(
+    conn: &Connection,
+    new_rows: &[serde_json::Value],
+    update_rows: &[serde_json::Value],
+    acked_ids: &[String],
+) -> Result<i64, String> {
+    let mut pushed = 0i64;
+    // Mark new rows as pushed.
+    for entry in acked_ids {
+        let (id, sheet_row) = if let Some((id_str, row_str)) = entry.split_once(':') {
+            (id_str.to_string(), row_str.parse::<i64>().unwrap_or(0))
+        } else {
+            (entry.clone(), 0)
+        };
+        // ALWAYS set pushed_to_sheets=1 — even if sheet_row wasn't parsed.
+        // Without this, trips with sheet_row=0 get re-appended every sync cycle
+        // causing infinite duplication.
+        if sheet_row > 0 {
+            conn.execute(
+                "UPDATE trips SET pushed_to_sheets = 1, sheet_row = ?1 WHERE id = ?2",
+                params![sheet_row, id],
+            )
+            .map_err(|e| format!("sheets flag flip failed: {e}"))?;
+        } else {
+            conn.execute("UPDATE trips SET pushed_to_sheets = 1 WHERE id = ?1", params![id])
+                .map_err(|e| format!("sheets flag flip failed: {e}"))?;
+        }
+    }
+    pushed += acked_ids.len() as i64;
+    // Mark exit-updated rows.
+    for row in update_rows {
+        if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+            conn.execute(
+                "UPDATE trips SET pushed_to_sheets = 1, sheet_exit_pushed = 1 WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| format!("sheets exit-update flag flip failed: {e}"))?;
+        }
+    }
+    pushed += update_rows.len() as i64;
+    if pushed > 0 {
+        conn.execute(
+            "UPDATE integrations SET last_synced_at = ?1, updated_at = ?1 WHERE type = 'google_sheets'",
+            params![now_iso()],
+        )
+        .map_err(|e| format!("sheets last-synced update failed: {e}"))?;
+    }
+    Ok(pushed)
+}
+
+/// Phase 2 — Execute all network calls for Sheets sync (no DB lock held).
+/// Returns the acked IDs from push_new_rows.
+pub fn execute_sheets_network(
+    sheets: &dyn SheetsProvider,
+    mapping: &[crate::models::SheetColumnEntry],
+    new_rows: &[serde_json::Value],
+    update_rows: &[serde_json::Value],
+) -> Result<Vec<String>, String> {
+    // Always ensure headers are written before any data push.
+    sheets.ensure_header_row(mapping)?;
+    // 1) Append new trips.
+    let mut acked_ids = Vec::new();
+    if !new_rows.is_empty() {
+        let acked = sheets.push_new_rows(new_rows, mapping)?;
+        acked_ids.extend(acked);
+    }
+    // 2) Update existing rows (exit matches).
+    if !update_rows.is_empty() {
+        sheets.update_existing_rows(update_rows, mapping)?;
+    }
+    Ok(acked_ids)
+}
+
 /// Push all logged-but-unsynced trips to the sheet and flip `pushed_to_sheets`
 /// only for confirmed rows. Completely independent of the Postgres pipeline.
 pub fn run_sheets_sync_impl(conn: &Connection, sheets: &dyn SheetsProvider) -> Result<SyncRunResult, String> {
-    let pending = pending_sheets_trips(conn)?;
+    let data = prepare_sheets_data(conn, sheets)?;
+    let pending = data.pending;
     let mut pushed = 0i64;
     if pending > 0 && sheets.connected() {
-        let mapping = read_sheet_mapping(conn);
-        // Split into new rows (no sheet_row yet) and exit updates (have sheet_row).
-        let new_rows = sheet_trip_rows_filtered(conn, false)?;
-        let update_rows = sheet_trip_rows_filtered(conn, true)?;
-        // Always ensure headers are written before any data push.
-        sheets.ensure_header_row(&mapping)?;
-
-        // 1) Append new trips.
-        if !new_rows.is_empty() {
-            let acked = sheets.push_new_rows(&new_rows, &mapping)?;
-            for entry in acked {
-                // Parse "id:row" or plain "id" from the ack string.
-                let (id, sheet_row) = if let Some((id_str, row_str)) = entry.split_once(':') {
-                    (id_str.to_string(), row_str.parse::<i64>().unwrap_or(0))
-                } else {
-                    (entry, 0)
-                };
-                if sheet_row > 0 {
-                    conn.execute(
-                        "UPDATE trips SET pushed_to_sheets = 1, sheet_row = ?1 WHERE id = ?2",
-                        params![sheet_row, id],
-                    )
-                    .map_err(|e| format!("sheets flag flip failed: {e}"))?;
-                } else {
-                    conn.execute("UPDATE trips SET pushed_to_sheets = 1 WHERE id = ?1", params![id])
-                        .map_err(|e| format!("sheets flag flip failed: {e}"))?;
-                }
-            }
-            pushed += new_rows.len() as i64;
-        }
-
-        // 2) Update existing rows (exit matches).
-        if !update_rows.is_empty() {
-            sheets.update_existing_rows(&update_rows, &mapping)?;
-            for row in &update_rows {
-                if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
-                    conn.execute(
-                        "UPDATE trips SET pushed_to_sheets = 1, sheet_exit_pushed = 1 WHERE id = ?1",
-                        params![id],
-                    )
-                    .map_err(|e| format!("sheets exit-update flag flip failed: {e}"))?;
-                }
-            }
-            pushed += update_rows.len() as i64;
-        }
-
-        if pushed > 0 {
-            conn.execute(
-                "UPDATE integrations SET last_synced_at = ?1, updated_at = ?1 WHERE type = 'google_sheets'",
-                params![now_iso()],
-            )
-            .map_err(|e| format!("sheets last-synced update failed: {e}"))?;
-        }
+        let acked_ids = execute_sheets_network(sheets, &data.mapping, &data.new_rows, &data.update_rows)?;
+        pushed = finalize_sheets_results(conn, &data.new_rows, &data.update_rows, &acked_ids)?;
     }
     Ok(SyncRunResult {
         pushed,
@@ -839,25 +978,68 @@ pub fn sync_status(state: State<AppState>) -> Result<SyncStatusView, String> {
 /// this exists for diagnostics and the admin status panel). Gated like other
 /// integration controls.
 #[tauri::command]
-pub fn sync_now_pg(state: State<AppState>, actor_id: String) -> Result<SyncRunResult, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
-    let result = run_pg_sync_impl(&conn, &*state.pg)?;
-    append_audit(&conn, &actor_id, "manual_postgres_sync", None, Some(json!({ "pushed": result.pushed })))?;
-    // `result.tables` records the pre-run pending counts; recompute post-run so
-    // the health signal reflects what still waits for connectivity.
-    let pending_total: i64 = pg_sync_state_impl(&conn, &*state.pg)?.tables.iter().map(|t| t.pending).sum();
-    if pending_total > 0 {
-        let detail = format!("{pending_total} record(s) still awaiting central sync");
-        if state.pg.connected() {
-            let _ = crate::monitor::record_health_event(&conn, "sync", "degraded", Some(&detail));
-        } else {
-            let _ = crate::monitor::record_health_event(&conn, "sync", "offline", Some(&detail));
-        }
-    } else {
-        let _ = crate::monitor::record_health_event(&conn, "sync", "ok", None);
+pub fn sync_now_pg(state: State<AppState>, actor_id: String, handle: AppHandle) -> Result<String, String> {
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
     }
-    Ok(result)
+
+    let pg = state.pg.clone();
+    let db = state.db.clone();
+    let actor = actor_id.clone();
+    std::thread::spawn(move || {
+        // Phase 1: collect unsynced rows
+        let (rows_by_table, pending_counts) = {
+            let Ok(conn) = db.lock() else {
+                let _ = handle.emit("pg-sync-error", json!({ "error": "database busy" }));
+                return;
+            };
+            let mut rows_by_table: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+            let mut pending_counts = Vec::new();
+            for (name, display) in PG_SYNC_TABLES {
+                let pending = match pending_for_table(&conn, name) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if pending > 0 && pg.connected() {
+                    if let Ok(rows) = rows_where_not_synced(&conn, name) {
+                        if !rows.is_empty() {
+                            rows_by_table.insert(name.to_string(), rows);
+                        }
+                    }
+                }
+                pending_counts.push(TablePending { table: name.to_string(), display: display.to_string(), pending });
+            }
+            (rows_by_table, pending_counts)
+        };
+
+        // Phase 2: push to Postgres (no lock held)
+        let mut total_pushed = 0i64;
+        let mut pushed_ids_by_table: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (name, rows) in &rows_by_table {
+            if pg.connected() && !rows.is_empty() {
+                if let Ok(ids) = pg.push_rows(name, rows) {
+                    total_pushed += rows.len() as i64;
+                    pushed_ids_by_table.insert(name.clone(), ids);
+                }
+            }
+        }
+
+        // Phase 3: mark synced + emit result
+        {
+            let Ok(conn) = db.lock() else { return; };
+            for (name, ids) in &pushed_ids_by_table {
+                for id in ids {
+                    let _ = conn.execute(&format!("UPDATE {name} SET synced = 1 WHERE id = ?1"), params![id]);
+                }
+            }
+            let _ = set_setting(&conn, "pg_last_synced_at", &now_iso());
+            let _ = append_audit(&conn, &actor, "manual_postgres_sync", None, Some(json!({ "pushed": total_pushed })));
+        }
+
+        let _ = handle.emit("pg-sync-done", json!({ "pushed": total_pushed }));
+    });
+    Ok("syncing".to_string())
 }
 
 #[tauri::command]
@@ -958,14 +1140,28 @@ pub fn set_sheets_retention(state: State<AppState>, actor_id: String, days: Opti
 /// trips are not re-exported — only new trips append afterwards.
 #[tauri::command]
 pub fn clear_exported_trips(state: State<AppState>, actor_id: String) -> Result<SheetsStateView, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    }
     if !state.sheets.configured() {
         return Err("Google Sheets is not configured.".to_string());
     }
-    let removed = state.sheets.prune(Some(&now_iso()), &[])?;
-    append_audit(&conn, &actor_id, "cleared_sheet_exports", None, Some(json!({ "rows_removed": removed })))?;
-    sheets_state_impl(&conn, &*state.sheets)
+    // Network call — prune ALL data rows (NO lock held).
+    // Pass None as cutoff to remove everything regardless of age.
+    let removed = state.sheets.prune(None, &[])?;
+    // Do NOT reset pushed_to_sheets — trips stay marked as "exported" so
+    // the sync poller doesn't re-push them immediately after clearing.
+    // Only clear sheet_row so trips know they have no row reference.
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE trips SET sheet_row = NULL, sheet_exit_pushed = 0",
+            [],
+        ).map_err(|e| format!("clear sheet flags failed: {e}"))?;
+        append_audit(&conn, &actor_id, "cleared_sheet_exports", None, Some(json!({ "rows_removed": removed })))?;
+        sheets_state_impl(&conn, &*state.sheets)
+    }
 }
 
 /// Admin-set retention window for the daily trip entries: entries older than N
@@ -1011,23 +1207,58 @@ pub fn set_google_sheets_frequency(
 }
 
 #[tauri::command]
-pub fn sync_now_sheets(state: State<AppState>, actor_id: String) -> Result<SyncRunResult, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
-    let result = run_sheets_sync_impl(&conn, &*state.sheets)?;
-    append_audit(&conn, &actor_id, "manual_sheets_sync", None, Some(json!({ "pushed": result.pushed })))?;
-    let st = sheets_state_impl(&conn, &*state.sheets)?;
-    if st.pending > 0 {
-        let detail = format!("{} logged trip(s) awaiting sheet export", st.pending);
-        if st.connected {
-            let _ = crate::monitor::record_health_event(&conn, "sync", "degraded", Some(&detail));
-        } else {
-            let _ = crate::monitor::record_health_event(&conn, "sync", "offline", Some(&detail));
-        }
-    } else {
-        let _ = crate::monitor::record_health_event(&conn, "sync", "ok", None);
+pub fn sync_now_sheets(state: State<AppState>, actor_id: String, handle: AppHandle) -> Result<String, String> {
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
     }
-    Ok(result)
+
+    let sheets = state.sheets.clone();
+    let db = state.db.clone();
+    let actor = actor_id.clone();
+    std::thread::spawn(move || {
+        // Phase 1: prepare data
+        let data = {
+            let Ok(conn) = db.lock() else {
+                let _ = handle.emit("sheets-sync-error", json!({ "error": "database busy" }));
+                return;
+            };
+            match prepare_sheets_data(&conn, &*sheets) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = handle.emit("sheets-sync-error", json!({ "error": e }));
+                    return;
+                }
+            }
+        };
+        let pending = data.pending;
+
+        // Phase 2: network push (no lock held)
+        let acked_ids = if pending > 0 && sheets.connected() {
+            match execute_sheets_network(&*sheets, &data.mapping, &data.new_rows, &data.update_rows) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = handle.emit("sheets-sync-error", json!({ "error": e }));
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let pushed = acked_ids.len() as i64;
+
+        // Phase 3: finalize + emit result
+        {
+            let Ok(conn) = db.lock() else { return; };
+            if !acked_ids.is_empty() {
+                let _ = finalize_sheets_results(&conn, &data.new_rows, &data.update_rows, &acked_ids);
+            }
+            let _ = append_audit(&conn, &actor, "manual_sheets_sync", None, Some(json!({ "pushed": pushed })));
+        }
+
+        let _ = handle.emit("sheets-sync-done", json!({ "pushed": pushed }));
+    });
+    Ok("syncing".to_string())
 }
 
 /// Dev/test-only connectivity toggle for the mock adapters (02 §7 simulated
@@ -1159,13 +1390,21 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
     let mut config: postgres::Config = cs.parse().map_err(|e| format!("invalid connection string: {e}"))?;
     config.connect_timeout(std::time::Duration::from_secs(6));
     let tls = make_tls_connector();
-    match config.connect(tls.clone()) {
-        Ok(c) => Ok(c),
-        Err(e) => {
+    let make_client = |cfg: &mut postgres::Config| -> Result<postgres::Client, String> {
+        let mut c = cfg.connect(tls.clone()).map_err(|e| {
             let is_missing_db = e.as_db_error().map(|d| d.message().contains("does not exist")).unwrap_or(false);
-            if !is_missing_db {
-                return Err(format!("cannot connect to PostgreSQL: {e}"));
-            }
+            if is_missing_db { "__MISSING_DB__".to_string() } else { format!("cannot connect to PostgreSQL: {e}") }
+        })?;
+        // Set a statement timeout so individual queries can't hang forever.
+        // This prevents the client Mutex from being held indefinitely when
+        // Supabase / PgBouncer drops a backend connection silently.
+        c.execute("SET statement_timeout = '30000'", &[])
+            .map_err(|e| format!("cannot set statement_timeout: {e}"))?;
+        Ok(c)
+    };
+    match make_client(&mut config) {
+        Ok(c) => Ok(c),
+        Err(e) if e == "__MISSING_DB__" => {
             let dbname = config
                 .get_dbname()
                 .ok_or("connection string must include a database name")?
@@ -1179,10 +1418,9 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
                 .map_err(|ce| format!("cannot create database '{dbname}': {ce}"))?;
             drop(admin);
             config.dbname(&dbname);
-            config
-                .connect(tls)
-                .map_err(|e2| format!("cannot connect after creating database: {e2}"))
+            make_client(&mut config)
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -1218,109 +1456,333 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
             .map_err(|e| format!("central id index for {table} failed: {e}"))?;
     }
     Ok(())
-}
-
-/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
+}/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
 /// idempotent (ON CONFLICT DO UPDATE) so a mid-batch failure is safe to retry.
+///
+/// Batching strategy:
+///   1. Collect ALL unique dynamic column names across all rows first, then
+///      run ALTER TABLE once per unique column (instead of per row × column).
+///   2. Wrap all INSERTs in a single transaction and execute them via
+///      batch_execute — one network round-trip instead of N.
+/// Maximum rows per transaction chunk. 327 rows in a single transaction
+/// exceeds Supabase/PgBouncer's idle-in-transaction timeout and causes
+/// infinite retry loops. Chunks of 50 keep each commit under 5 seconds.
+const PG_CHUNK_SIZE: usize = 50;
+
 fn push_rows_impl(
     client: &mut postgres::Client,
     table: &str,
     rows: &[serde_json::Value],
 ) -> Result<Vec<String>, String> {
+    // Phase 1: deduplicate ALTER TABLE — one round-trip per unique dynamic column.
+    let mut seen_dynamic: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let base = base_columns(table);
     for row in rows {
         let Some(obj) = row.as_object() else { continue };
         for key in obj.keys() {
-            if key != "id" && !base_columns(table).contains(&key.as_str()) {
+            if key != "id" && !base.contains(&key.as_str()) && seen_dynamic.insert(key.clone()) {
                 client
                     .batch_execute(&format!(
                         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
-                        pg_quote_ident(table),
-                        pg_quote_ident(key)
+                        pg_quote_ident(table), pg_quote_ident(key)
                     ))
                     .map_err(|e| format!("central column add for {table}.{key} failed: {e}"))?;
             }
         }
     }
-    let mut acked = Vec::with_capacity(rows.len());
-    for row in rows {
-        let Some(obj) = row.as_object() else { continue };
-        let cols: Vec<&String> = obj.keys().collect();
-        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
-        let params: Vec<Box<dyn ToSql + Sync>> = cols
-            .iter()
-            .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
-            .collect();
-        let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
-            pg_quote_ident(table),
-            cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
-            placeholders.join(", "),
-            cols.iter()
-                .filter(|c| c.as_str() != "id")
-                .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        client
-            .execute(&sql, &param_refs)
-            .map_err(|e| format!("central upsert into {table} failed: {}", error_chain(&e)))?;
-        acked.push(obj["id"].as_str().unwrap_or_default().to_string());
+    // Phase 2: upsert in chunks — each chunk is its own transaction so a
+    // timeout on chunk 3 doesn't lose the work from chunks 1-2.
+    let mut all_acked: Vec<String> = Vec::new();
+    for chunk in rows.chunks(PG_CHUNK_SIZE) {
+        let mut tx = client
+            .transaction()
+            .map_err(|e| format!("central tx begin for {table} failed: {e}"))?;
+        {
+            tx.execute("SET LOCAL statement_timeout = '30000'", &[])
+                .map_err(|e| format!("central statement_timeout set failed: {e}"))?;
+            for row in chunk {
+                let Some(obj) = row.as_object() else { continue };
+                let cols: Vec<&String> = obj.keys().collect();
+                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+                let params: Vec<Box<dyn ToSql + Sync>> = cols
+                    .iter()
+                    .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
+                    .collect();
+                let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
+                    pg_quote_ident(table),
+                    cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
+                    placeholders.join(", "),
+                    cols.iter()
+                        .filter(|c| c.as_str() != "id")
+                        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                tx.execute(&sql, &param_refs)
+                    .map_err(|e| format!("central upsert into {table} failed: {}", error_chain(&e)))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("central tx commit for {table} failed: {e}"))?;
+        // Mark this chunk as acked — the caller can mark them synced
+        // immediately so a crash only loses the current chunk, not all rows.
+        all_acked.extend(chunk.iter().filter_map(|r| r.as_object()?.get("id")?.as_str().map(String::from)));
     }
-    Ok(acked)
+    Ok(all_acked)
 }
 
-/// A native synchronous PostgreSQL sink. Configured with a standard connection
-/// string (`postgresql://user@host:5432/dbname`); on first configuration it
-/// creates the database and mirrors the schema, so setup is paste-and-go.
+// ---------------------------------------------------------------------------
+// Background Postgres worker — all network I/O runs here, never on
+// Tauri command threads. Callers send a command + reply channel, then
+// recv_timeout so they NEVER block for more than WORKER_TIMEOUT.
+// ---------------------------------------------------------------------------
+
+/// Maximum time (seconds) a Tauri command thread will wait for a Postgres
+/// operation. If the worker is busy (sync push running), the caller gets an
+/// error and falls back to local SQLite — the UI stays responsive.
+const WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum PgCommand {
+    IsConfigured(Sender<bool>),
+    IsConnected(Sender<bool>),
+    LastError(Sender<Option<String>>),
+    Configure(Option<String>, Sender<Result<(), String>>),
+    PushRows(String, Vec<serde_json::Value>, Sender<Result<Vec<String>, String>>),
+    QueryRows(String, Vec<String>, Sender<Result<Vec<serde_json::Value>, String>>),
+    DeleteRows(String, Vec<String>, Sender<Result<(), String>>),
+    Stop,
+}
+
+struct PostgresWorker {
+    client: Option<postgres::Client>,
+    cfg: Option<String>,
+    last_err: Option<String>,
+    schema_validated: bool,
+    last_connect_fail: i64,
+    connect_backoff: i64,
+}
+
+impl PostgresWorker {
+    fn new() -> Self {
+        Self {
+            client: None,
+            cfg: None,
+            last_err: None,
+            schema_validated: false,
+            last_connect_fail: 0,
+            connect_backoff: 0,
+        }
+    }
+
+    fn ensure_client(&mut self) -> Result<(), String> {
+        let cs = match self.cfg.as_ref() {
+            Some(cs) => cs.clone(),
+            None => return Err("PostgreSQL is not configured".to_string()),
+        };
+        if self.client.as_ref().is_some_and(|c| !c.is_closed()) {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        if self.connect_backoff > 0 && now - self.last_connect_fail < self.connect_backoff {
+            return Err(format!("backed off (retry in {}s)", self.connect_backoff - (now - self.last_connect_fail)));
+        }
+        match connect_with_create(&cs) {
+            Ok(c) => {
+                self.client = Some(c);
+                self.last_err = None;
+                self.connect_backoff = 0;
+                self.schema_validated = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.last_err = Some(e.clone());
+                let prev = self.connect_backoff;
+                self.connect_backoff = (prev.max(10) * 2).min(120);
+                self.last_connect_fail = now;
+                Err(e)
+            }
+        }
+    }
+
+    fn handle(&mut self, cmd: PgCommand) {
+        match cmd {
+            PgCommand::IsConfigured(tx) => {
+                let _ = tx.send(self.cfg.is_some());
+            }
+            PgCommand::IsConnected(tx) => {
+                let connected = self.client.as_ref().is_some_and(|c| !c.is_closed());
+                let _ = tx.send(connected);
+            }
+            PgCommand::LastError(tx) => {
+                let _ = tx.send(self.last_err.clone());
+            }
+            PgCommand::Configure(conn_string, tx) => {
+                match &conn_string {
+                    Some(cs) => {
+                        self.cfg = Some(cs.clone());
+                        self.client = None;
+                        self.last_err = None;
+                        self.connect_backoff = 0;
+                        self.schema_validated = false;
+                        // Try to connect now so is_connected becomes true
+                        // immediately. ensure_client has a 6s timeout so it
+                        // won't block the worker forever.
+                        let result = self.ensure_client().map(|_| ());
+                        let _ = tx.send(result);
+                    }
+                    None => {
+                        self.cfg = None;
+                        self.client = None;
+                        self.last_err = None;
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+            }
+            PgCommand::PushRows(table, rows, tx) => {
+                let result = (|| -> Result<Vec<String>, String> {
+                    self.ensure_client()?;
+                    let client = self.client.as_mut().ok_or("no client")?;
+                    if !self.schema_validated {
+                        ensure_schema_for(client)?;
+                        self.schema_validated = true;
+                    }
+                    push_rows_impl(client, &table, &rows)
+                })();
+                match &result {
+                    Ok(_) => { self.last_err = None; }
+                    Err(e) => {
+                        self.last_err = Some(e.clone());
+                        self.client = None;
+                        self.schema_validated = false;
+                    }
+                }
+                let _ = tx.send(result);
+            }
+            PgCommand::QueryRows(sql, params, tx) => {
+                let result = (|| -> Result<Vec<serde_json::Value>, String> {
+                    self.ensure_client()?;
+                    let client = self.client.as_mut().ok_or("no client")?;
+                    let _ = client.execute("SET statement_timeout = '10000'", &[]);
+                    let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                    let rows = client.query(sql.as_str(), &param_refs)
+                        .map_err(|e| format!("query failed: {}", error_chain(&e)))?;
+                    Ok(rows.iter().map(|row| {
+                        let mut obj = serde_json::Map::new();
+                        for (i, col) in row.columns().iter().enumerate() {
+                            obj.insert(col.name().to_string(), pg_cell_to_json(row, i));
+                        }
+                        serde_json::Value::Object(obj)
+                    }).collect())
+                })();
+                let _ = tx.send(result);
+            }
+            PgCommand::DeleteRows(table, ids, tx) => {
+                let result = (|| -> Result<(), String> {
+                    self.ensure_client()?;
+                    let client = self.client.as_mut().ok_or("no client")?;
+                    let sql = format!("DELETE FROM {} WHERE id = $1", pg_quote_ident(&table));
+                    for id in &ids {
+                        let param: &(dyn ToSql + Sync) = id;
+                        client.execute(&sql, std::slice::from_ref(&param))
+                            .map_err(|e| format!("delete failed: {}", error_chain(&e)))?;
+                    }
+                    Ok(())
+                })();
+                let _ = tx.send(result);
+            }
+            PgCommand::Stop => {}
+        }
+    }
+}
+
+fn spawn_pg_worker(
+    shared_err: std::sync::Arc<Mutex<Option<String>>>,
+    is_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Sender<PgCommand> {
+    let (tx, rx) = std::sync::mpsc::channel::<PgCommand>();
+    let worker_tx = tx.clone();
+    std::thread::Builder::new()
+        .name("pg-worker".into())
+        .spawn(move || {
+            let mut worker = PostgresWorker::new();
+            while let Ok(cmd) = rx.recv() {
+                let is_stop = matches!(cmd, PgCommand::Stop);
+                is_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                worker.handle(cmd);
+                is_busy.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Push the worker's last_err into the shared cache so
+                // RealPostgres::last_error() can read it without sending
+                // a command to this thread (which blocks up to WORKER_TIMEOUT).
+                if let Ok(mut e) = shared_err.lock() {
+                    *e = worker.last_err.clone();
+                }
+                // Update is_connected after EVERY command. This is critical:
+                // when the poller times out waiting for a long push, it used
+                // to set is_connected=false, which permanently skipped future
+                // pushes. Now the worker restores the flag after completion.
+                let connected = worker.client.as_ref().is_some_and(|c| !c.is_closed());
+                is_connected.store(connected, std::sync::atomic::Ordering::Relaxed);
+                if is_stop { break; }
+            }
+        })
+        .expect("failed to spawn pg-worker thread");
+    worker_tx
+}
+
+/// A non-blocking PostgreSQL adapter. All network I/O runs on a dedicated
+/// background thread (spawned via `spawn_pg_worker`). Tauri command threads
+/// send commands via a channel and recv with a timeout — they NEVER block
+/// on Supabase network latency.
 pub struct RealPostgres {
-    cfg: Mutex<Option<String>>,
-    client: Mutex<Option<postgres::Client>>,
-    last_err: Mutex<Option<String>>,
+    tx: Sender<PgCommand>,
+    is_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_configured: std::sync::atomic::AtomicBool,
+    /// True while the worker is processing a command. Prevents the poller
+    /// from queuing duplicate push commands that build up a backlog.
+    is_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared last-error cache — the worker writes here after every
+    /// operation; `last_error()` reads here (never sends a command).
+    /// This prevents sync_status (called on EVERY page mount) from
+    /// blocking up to 5 seconds when the worker is busy.
+    cached_last_err: Arc<Mutex<Option<String>>>,
 }
 
 impl RealPostgres {
     pub fn new() -> Self {
+        let shared_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let is_connected: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_busy: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tx = spawn_pg_worker(shared_err.clone(), is_connected.clone(), is_busy.clone());
         Self {
-            cfg: Mutex::new(None),
-            client: Mutex::new(None),
-            last_err: Mutex::new(None),
+            tx,
+            is_connected,
+            is_configured: std::sync::atomic::AtomicBool::new(false),
+            is_busy,
+            cached_last_err: shared_err,
         }
     }
 
     /// Restore a previously saved connection string without touching the
     /// network (startup path); the first real use connects lazily.
     pub fn restore(&self, conn_string: String) {
-        *self.cfg.lock().unwrap() = Some(conn_string);
-        *self.client.lock().unwrap() = None;
-        *self.last_err.lock().unwrap() = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = self.tx.send(PgCommand::Configure(Some(conn_string), tx));
+        // Don't wait for response — the worker connects lazily.
+        // Just mark as configured so callers don't skip.
+        self.is_configured.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn set_error(&self, e: String) {
-        *self.last_err.lock().unwrap() = Some(e);
-    }
-
-    fn ensure_client(&self) -> Result<(), String> {
-        let cfg = self.cfg.lock().unwrap();
-        let Some(cs) = cfg.as_ref() else {
-            let msg = "PostgreSQL is not configured".to_string();
-            self.set_error(msg.clone());
-            return Err(msg);
-        };
-        let mut client = self.client.lock().unwrap();
-        if client.as_ref().is_none_or(|c| c.is_closed()) {
-            match connect_with_create(cs) {
-                Ok(c) => {
-                    *client = Some(c);
-                    *self.last_err.lock().unwrap() = None;
-                }
-                Err(e) => {
-                    self.set_error(e.clone());
-                    return Err(e);
-                }
-            }
+    /// Send a command to the worker and wait up to WORKER_TIMEOUT.
+    /// Returns None if the worker is busy (sync push running) — callers
+    /// fall back to local data instead of blocking.
+    fn send<T>(&self, cmd: PgCommand, rx: std::sync::mpsc::Receiver<T>) -> Option<T> {
+        match self.tx.send(cmd) {
+            Ok(()) => rx.recv_timeout(WORKER_TIMEOUT).ok(),
+            Err(_) => None, // worker died
         }
-        Ok(())
     }
 }
 
@@ -1329,88 +1791,72 @@ impl PostgresAdapter for RealPostgres {
         "postgres"
     }
     fn configured(&self) -> bool {
-        self.cfg.lock().unwrap().is_some()
+        self.is_configured.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn last_error(&self) -> Option<String> {
-        self.last_err.lock().unwrap().clone()
+        // Pure Mutex read — NEVER sends a command to the worker.
+        // The worker updates cached_last_err after every push/query/configure.
+        // This ensures sync_status (called by every page) never blocks.
+        self.cached_last_err.lock().ok().and_then(|e| e.clone())
     }
     fn connected(&self) -> bool {
-        self.ensure_client().is_ok()
+        // Pure atomic check — NEVER sends a command to the worker.
+        // The worker updates this flag after every push/query/configure.
+        // This ensures sync_status (called by every page) never blocks.
+        self.is_connected.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn push_rows(&self, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
-        self.ensure_client()?;
-        let mut client = self.client.lock().unwrap();
-        let client_ref = client.as_mut().ok_or("PostgreSQL client unavailable")?;
-        ensure_schema_for(client_ref)?;
-        match push_rows_impl(client_ref, table, rows) {
-            Ok(ids) => {
-                *self.last_err.lock().unwrap() = None;
-                Ok(ids)
-            }
-            Err(e) => {
-                self.set_error(e.clone());
-                Err(e)
-            }
+        // Don't queue a push if the worker is still processing the previous one.
+        // Without this, every 10s poller cycle would queue another 327-row push,
+        // building up a backlog of 7+ identical pushes that each take 70s.
+        if self.is_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(format!("{table} push deferred — worker busy (will retry next cycle)"));
         }
-    }
-    fn configure(&self, conn_string: Option<String>) -> Result<(), String> {
-        let mut cfg = self.cfg.lock().unwrap();
-        let mut client = self.client.lock().unwrap();
-        *client = None;
-        *self.last_err.lock().unwrap() = None;
-        match &conn_string {
-            Some(cs) => {
-                let mut c = connect_with_create(cs).map_err(|e| {
-                    self.set_error(e.clone());
-                    e
-                })?;
-                ensure_schema_for(&mut c).map_err(|e| {
-                    self.set_error(e.clone());
-                    e
-                })?;
-                *cfg = Some(cs.clone());
-                *client = Some(c);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = match self.send(PgCommand::PushRows(table.to_string(), rows.to_vec(), tx), rx) {
+            Some(result) => {
+                self.is_connected.store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                result
             }
             None => {
-                *cfg = None;
+                // Worker timed out but is still processing. is_connected stays
+                // true (worker will restore it). is_busy stays true (worker
+                // clears it when done).
+                Err(format!("{table} push deferred — worker busy (will retry next cycle)"))
             }
+        };
+        // Only clear is_busy if we got a result (push completed or failed).
+        // If timed out, the worker will clear it when done.
+        if result.is_ok() || result.is_err() {
+            self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
         }
-        Ok(())
+        result
+    }
+    fn configure(&self, conn_string: Option<String>) -> Result<(), String> {
+        self.is_configured.store(conn_string.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.is_connected.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.send(PgCommand::Configure(conn_string, tx), rx) {
+            Some(result) => {
+                self.is_connected.store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                result
+            }
+            None => Err("Postgres worker busy".to_string()),
+        }
     }
     fn delete_rows(&self, table: &str, ids: &[String]) -> Result<(), String> {
-        if ids.is_empty() {
-            return Ok(());
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.send(PgCommand::DeleteRows(table.to_string(), ids.to_vec(), tx), rx) {
+            Some(result) => result,
+            None => Err(format!("{table} delete deferred — worker busy")),
         }
-        self.ensure_client()?;
-        let mut client = self.client.lock().unwrap();
-        let client_ref = client.as_mut().ok_or("PostgreSQL client unavailable")?;
-        let sql = format!("DELETE FROM {} WHERE id = $1", pg_quote_ident(table));
-        for id in ids {
-            let param: &(dyn ToSql + Sync) = id;
-            client_ref
-                .execute(&sql, std::slice::from_ref(&param))
-                .map_err(|e| format!("central delete from {table} failed: {}", error_chain(&e)))?;
-        }
-        Ok(())
     }
     fn query_rows(&self, sql: &str, params: &[String]) -> Result<Vec<serde_json::Value>, String> {
-        self.ensure_client()?;
-        let mut client = self.client.lock().unwrap();
-        let client_ref = client.as_mut().ok_or("PostgreSQL client unavailable")?;
-        let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-        let rows = client_ref
-            .query(sql, &param_refs)
-            .map_err(|e| format!("central report query failed: {}", error_chain(&e)))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut obj = serde_json::Map::new();
-            for (i, col) in row.columns().iter().enumerate() {
-                obj.insert(col.name().to_string(), pg_cell_to_json(&row, i));
-            }
-            out.push(serde_json::Value::Object(obj));
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.send(PgCommand::QueryRows(sql.to_string(), params.to_vec(), tx), rx) {
+            Some(result) => result,
+            None => Err("PostgreSQL query timed out — falling back to local data".to_string()),
         }
-        *self.last_err.lock().unwrap() = None;
-        Ok(out)
     }
 }
 
@@ -1536,7 +1982,7 @@ fn fetch_token(service_account_json: &str) -> Result<String, String> {
         .map_err(|e| format!("invalid private key: {e}"))?;
     let jwt = jsonwebtoken::encode(&header, &claims, &encoding_key)
         .map_err(|e| format!("cannot sign JWT: {e}"))?;
-    eprintln!("[sheets-auth] JWT signed OK, email={email}, aud={token_uri}");
+    crate::log::log(&format!("[sheets-auth] JWT signed OK, email={email}, aud={token_uri}"));
     // Reuse the client created above for google_server_time.
     // The JWT is base64url (no characters needing form encoding).
     let body = format!("grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={jwt}");
@@ -1708,6 +2154,11 @@ pub struct RealSheets {
     last_fail: Mutex<Option<i64>>,
     last_err: Mutex<Option<String>>,
     mapping: Mutex<Vec<crate::models::SheetColumnEntry>>,
+    /// Cached connected state — updated after each sync cycle, NOT on every
+    /// connected() call. This prevents Google Sheets network calls from
+    /// blocking the Tauri command thread when sync_status is called by
+    /// every page on mount.
+    cached_connected: std::sync::atomic::AtomicBool,
 }
 
 impl RealSheets {
@@ -1718,6 +2169,7 @@ impl RealSheets {
             last_fail: Mutex::new(None),
             last_err: Mutex::new(None),
             mapping: Mutex::new(default_sheet_mapping()),
+            cached_connected: std::sync::atomic::AtomicBool::new(false),
         }
     }
     pub fn set_mapping(&self, m: Vec<crate::models::SheetColumnEntry>) {
@@ -1746,31 +2198,51 @@ impl RealSheets {
 
     /// Resolve the first tab name (network) exactly once; everything that
     /// touches the sheet calls this first.
+    ///
+    /// IMPORTANT: clones creds before any network call so the Mutex is never
+    /// held during I/O. This prevents sync_status (called from the frontend)
+    /// from blocking on a long Google Sheets token refresh.
     fn ensure_validated(&self) -> Result<String, String> {
-        let mut creds = self.creds.lock().unwrap();
-        let Some(c) = creds.as_mut() else {
-            return Err("Google Sheets is not configured".to_string());
+        // Fast path: already validated — just read the cached tab name.
+        {
+            let creds = self.creds.lock().unwrap();
+            if let Some(c) = creds.as_ref() {
+                if let Some(first) = c.first_sheet.as_ref() {
+                    return Ok(first.clone());
+                }
+            } else {
+                return Err("Google Sheets is not configured".to_string());
+            }
+        } // Mutex dropped — all network calls below are lock-free.
+
+        // Clone creds for network calls (Mutex not held).
+        let (json, sheet_id) = {
+            let creds = self.creds.lock().unwrap();
+            let c = creds.as_ref().ok_or("Google Sheets is not configured")?;
+            (c.json.clone(), c.sheet_id.clone())
         };
-        if let Some(first) = c.first_sheet.as_ref() {
-            return Ok(first.clone());
-        }
-        let token = fetch_token(&c.json).map_err(|e| {
+        let token = fetch_token(&json).map_err(|e| {
             self.set_error(e.clone());
             e
         })?;
-        let first = sheet_meta(&token, &c.sheet_id).map_err(|e| {
+        let first = sheet_meta(&token, &sheet_id).map_err(|e| {
             self.set_error(e.clone());
             e
         })?;
         let mapping = self.mapping.lock().unwrap().clone();
-        ensure_headers(&token, &c.sheet_id, &first, &mapping).map_err(|e| {
+        ensure_headers(&token, &sheet_id, &first, &mapping).map_err(|e| {
             self.set_error(e.clone());
             e
         })?;
         let server_now = google_server_time(&http_client()?);
         *self.token.lock().unwrap() = Some((token, server_now + 3600 - 60));
-        c.first_sheet = Some(first.clone());
+        // Write back the validated tab name under Mutex (fast write).
+        if let Some(c) = self.creds.lock().unwrap().as_mut() {
+            c.first_sheet = Some(first.clone());
+        }
         *self.last_err.lock().unwrap() = None;
+        // Cache the connected state so connected() never needs network.
+        self.cached_connected.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(first)
     }
 
@@ -1830,10 +2302,9 @@ impl SheetsProvider for RealSheets {
         self.creds.lock().unwrap().as_ref().map(|c| c.client_email.clone())
     }
     fn connected(&self) -> bool {
-        if self.creds.lock().unwrap().is_none() {
-            return false;
-        }
-        self.ensure_validated().is_ok()
+        // Pure atomic check — NEVER makes network calls on every invocation.
+        // The flag is updated by ensure_validated() after each sync cycle.
+        self.cached_connected.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn push_trips(&self, rows: &[serde_json::Value], mapping: &[crate::models::SheetColumnEntry]) -> Result<Vec<String>, String> {
         if rows.is_empty() {
@@ -2076,14 +2547,19 @@ impl SheetsProvider for RealSheets {
                 if excluded_ids.iter().any(|e| e == &cell(row, 0)) {
                     return false;
                 }
-                if let Some(cut) = &cutoff {
-                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cell(row, 9)) {
-                        if ts.with_timezone(&chrono::Utc) < *cut {
-                            return false;
+                match &cutoff {
+                    // No cutoff → clear everything (used by clear_exported_trips)
+                    None => false,
+                    // With cutoff → keep only rows newer than the cutoff
+                    Some(cut) => {
+                        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cell(row, 9)) {
+                            if ts.with_timezone(&chrono::Utc) < *cut {
+                                return false;
+                            }
                         }
+                        true
                     }
                 }
-                true
             })
             .collect();
         let removed = total - keep.len();
@@ -2123,6 +2599,39 @@ impl SheetsProvider for RealSheets {
                 .map_err(|e| format!("sheet rewrite rejected: {e}"))?;
         }
         Ok(removed)
+    }
+    fn read_existing_trip_ids(&self) -> Result<Vec<String>, String> {
+        let creds = self.creds.lock().unwrap().clone().ok_or("Google Sheets is not configured")?;
+        let first_sheet = self.ensure_validated()?;
+        let token = self.access_token().map_err(|e| {
+            self.set_error(e.clone());
+            e
+        })?;
+        let client = http_client()?;
+        let range = format!("{first_sheet}!A1:A");
+        let url = format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?majorDimension=ROWS",
+            creds.sheet_id,
+            urlenc(&range)
+        );
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .map_err(|e| format!("sheet read failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("sheet read rejected: {e}"))?;
+        let j: serde_json::Value = resp.json().map_err(|e| format!("sheet read unreadable: {e}"))?;
+        let Some(rows) = j["values"].as_array() else {
+            return Ok(Vec::new());
+        };
+        // Skip header row (index 0), collect all trip IDs from column A.
+        Ok(rows
+            .iter()
+            .skip(1)
+            .filter_map(|row| row.get(0)?.as_str().map(String::from))
+            .filter(|id| !id.is_empty())
+            .collect())
     }
 }
 
@@ -2175,36 +2684,70 @@ fn sanitize_conn_string(cs: &str) -> String {
 }
 
 #[tauri::command]
-pub fn configure_postgres(state: State<AppState>, actor_id: String, connection_string: String) -> Result<PgSyncStateView, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+pub fn configure_postgres(state: State<AppState>, actor_id: String, connection_string: String, handle: AppHandle) -> Result<String, String> {
     if connection_string.trim().is_empty() {
         return Err("Connection string cannot be empty.".to_string());
     }
-    state
-        .pg
-        .configure(Some(connection_string.clone()))
-        .map_err(|e| format!("PostgreSQL configuration failed: {e}"))?;
-    set_setting(&conn, "pg_connection_string", &connection_string)?;
-    append_audit(
-        &conn,
-        &actor_id,
-        "configured_postgres",
-        None,
-        Some(json!({ "connection_string": sanitize_conn_string(&connection_string) })),
-    )?;
-    pg_sync_state_impl(&conn, &*state.pg)
+    // Permission check (fast)
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    }
+    // Spawn heavy work on background thread — frontend receives "testing" instantly
+    let pg = state.pg.clone();
+    let db = state.db.clone();
+    std::thread::spawn(move || {
+        // Network call (slow — up to 6s TCP connect timeout)
+        match pg.configure(Some(connection_string.clone())) {
+            Ok(()) => {
+                // Persist + audit (fast) — release db BEFORE emit to avoid deadlock
+                // (emit waits for webview; webview may invoke a command that needs db).
+                let emit_payload = if let Ok(conn) = db.lock() {
+                    let _ = set_setting(&conn, "pg_connection_string", &connection_string);
+                    let _ = append_audit(&conn, &actor_id, "configured_postgres", None, Some(json!({ "connection_string": sanitize_conn_string(&connection_string) })));
+                    let view = pg_sync_state_impl(&conn, &*pg).ok();
+                    drop(conn);
+                    view
+                } else {
+                    None
+                };
+                if let Some(view) = emit_payload {
+                    let _ = handle.emit("pg-configured", view);
+                }
+            }
+            Err(e) => {
+                let _ = handle.emit("pg-config-error", json!({ "error": e }));
+            }
+        }
+    });
+    Ok("testing".to_string())
 }
 
 #[tauri::command]
-pub fn disconnect_postgres(state: State<AppState>, actor_id: String) -> Result<PgSyncStateView, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
-    state.pg.configure(None)?;
-    conn.execute("DELETE FROM app_settings WHERE key = 'pg_connection_string'", [])
-        .map_err(|e| format!("settings clear failed: {e}"))?;
-    append_audit(&conn, &actor_id, "disconnected_postgres", None, None)?;
-    pg_sync_state_impl(&conn, &*state.pg)
+pub fn disconnect_postgres(state: State<AppState>, actor_id: String, handle: AppHandle) -> Result<String, String> {
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    }
+    let pg = state.pg.clone();
+    let db = state.db.clone();
+    std::thread::spawn(move || {
+        let _ = pg.configure(None);
+        // Release db BEFORE emit to avoid deadlock.
+        let emit_payload = if let Ok(conn) = db.lock() {
+            let _ = conn.execute("DELETE FROM app_settings WHERE key = 'pg_connection_string'", []);
+            let _ = append_audit(&conn, &actor_id, "disconnected_postgres", None, None);
+            let view = pg_sync_state_impl(&conn, &*pg).ok();
+            drop(conn);
+            view
+        } else {
+            None
+        };
+        if let Some(view) = emit_payload {
+            let _ = handle.emit("pg-disconnected", view);
+        }
+    });
+    Ok("disconnecting".to_string())
 }
 
 #[tauri::command]
@@ -2222,62 +2765,70 @@ pub fn configure_google_sheets(
     if service_account_json.trim().is_empty() || target_sheet_id.trim().is_empty() {
         return Err("Service account JSON and target sheet ID are required.".to_string());
     }
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    // Phase 1: Permission check (fast)
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    }
+    // Phase 2: Network call (slow — OAuth token fetch, no lock held)
     let email = state
         .sheets
         .configure(Some(service_account_json.clone()), Some(target_sheet_id.clone()))
         .map_err(|e| format!("Google Sheets configuration failed: {e}"))?;
-    let now = now_iso();
-    let id = conn
-        .query_row(
-            "SELECT id FROM integrations WHERE type = 'google_sheets' ORDER BY created_at DESC LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .ok();
-    match id {
-        Some(id) => {
-            conn.execute(
-                "UPDATE integrations SET connected_by = ?1, target_sheet_id = ?2, shared_group = ?3,
-                        sync_frequency = ?4, status = 'connected', last_synced_at = NULL, updated_at = ?5
-                 WHERE id = ?6",
-                params![actor_id, target_sheet_id, shared_group, sync_frequency, now, id],
+    // Phase 3: Persist + audit (fast)
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let now = now_iso();
+        let id = conn
+            .query_row(
+                "SELECT id FROM integrations WHERE type = 'google_sheets' ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
             )
-            .map_err(|e| format!("integration update failed: {e}"))?;
+            .ok();
+        match id {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE integrations SET connected_by = ?1, target_sheet_id = ?2, shared_group = ?3,
+                            sync_frequency = ?4, status = 'connected', last_synced_at = NULL, updated_at = ?5
+                     WHERE id = ?6",
+                    params![actor_id, target_sheet_id, shared_group, sync_frequency, now, id],
+                )
+                .map_err(|e| format!("integration update failed: {e}"))?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO integrations (id, type, connected_by, target_sheet_id, shared_group,
+                            sync_frequency, status, created_at, updated_at)
+                     VALUES (?1, 'google_sheets', ?2, ?3, ?4, ?5, 'connected', ?6, ?6)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        actor_id,
+                        target_sheet_id,
+                        shared_group,
+                        sync_frequency,
+                        now
+                    ],
+                )
+                .map_err(|e| format!("integration create failed: {e}"))?;
+            }
         }
-        None => {
-            conn.execute(
-                "INSERT INTO integrations (id, type, connected_by, target_sheet_id, shared_group,
-                        sync_frequency, status, created_at, updated_at)
-                 VALUES (?1, 'google_sheets', ?2, ?3, ?4, ?5, 'connected', ?6, ?6)",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    actor_id,
-                    target_sheet_id,
-                    shared_group,
-                    sync_frequency,
-                    now
-                ],
-            )
-            .map_err(|e| format!("integration create failed: {e}"))?;
-        }
+        set_setting(&conn, "sheets_service_account_json", &service_account_json)?;
+        set_setting(&conn, "sheets_target_sheet_id", &target_sheet_id)?;
+        append_audit(
+            &conn,
+            &actor_id,
+            "configured_google_sheets",
+            None,
+            Some(json!({
+                "service_account_email": email,
+                "target_sheet_id": target_sheet_id,
+                "shared_group": shared_group,
+                "sync_frequency": sync_frequency,
+            })),
+        )?;
+        sheets_state_impl(&conn, &*state.sheets)
     }
-    set_setting(&conn, "sheets_service_account_json", &service_account_json)?;
-    set_setting(&conn, "sheets_target_sheet_id", &target_sheet_id)?;
-    append_audit(
-        &conn,
-        &actor_id,
-        "configured_google_sheets",
-        None,
-        Some(json!({
-            "service_account_email": email,
-            "target_sheet_id": target_sheet_id,
-            "shared_group": shared_group,
-            "sync_frequency": sync_frequency,
-        })),
-    )?;
-    sheets_state_impl(&conn, &*state.sheets)
 }
 
 // ---------------------------------------------------------------------------

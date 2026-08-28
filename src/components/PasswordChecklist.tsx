@@ -6,13 +6,16 @@ export default function PasswordChecklist({ password }: { password: string }) {
   const [strength, setStrength] = useState<PasswordStrength | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    api.validatePasswordStrength(password).then((s) => {
-      if (!cancelled) setStrength(s);
-    });
-    return () => {
-      cancelled = true;
-    };
+    const timer = setTimeout(() => {
+      let cancelled = false;
+      api.validatePasswordStrength(password).then((s) => {
+        if (!cancelled) setStrength(s);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, 300);
+    return () => clearTimeout(timer);
   }, [password]);
 
   if (!strength) return null;

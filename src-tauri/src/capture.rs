@@ -4,7 +4,7 @@
 //! (02-architecture.md §4). The ANPR source only reports "what it saw".
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -132,9 +132,14 @@ impl HttpSource {
 
 /// Minimal dependency-free HTTP GET to 127.0.0.1. Returns None on any error so
 /// an unreachable ANPR service degrades gracefully (resilience, 02 §5).
+/// Uses a 2-second connect timeout so the ANPR poller thread never blocks
+/// for the full OS TCP timeout (21s on Windows) when the service is down.
 fn fetch_http(url: &str) -> Option<String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
     let (host, port, path) = split_url(url)?;
-    let mut stream = std::net::TcpStream::connect((host, port)).ok()?;
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     use std::io::{Read, Write};
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
@@ -1233,22 +1238,43 @@ pub fn set_capture_settings(
 
 #[tauri::command]
 pub fn anpr_status(state: State<AppState>) -> Result<AnprStatus, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let source = anpr_source(&conn);
-    let last = state.anpr_last.lock().map_err(|e| e.to_string())?;
-    let (last_at, last_plate) = last.as_ref().map(|(a, p)| (Some(a.clone()), Some(p.clone()))).unwrap_or((None, None));
-    let pending = if source == "simulator" {
-        state.simulator.pending()
-    } else {
-        0
+    // Phase 1: read db fields (fast), then release db before acquiring anpr_last.
+    let (enabled, source, pending) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let source = anpr_source(&conn);
+        let enabled = anpr_enabled(&conn);
+        let pending = if source == "simulator" {
+            state.simulator.pending()
+        } else {
+            0
+        };
+        (enabled, source, pending)
+    };
+    // Phase 2: acquire anpr_last separately — never hold db and anpr_last together.
+    let (last_at, last_plate) = match state.anpr_last.try_lock() {
+        Ok(last) => last.as_ref().map(|(a, p)| (Some(a.clone()), Some(p.clone()))).unwrap_or((None, None)),
+        Err(_) => (None, None),
     };
     Ok(AnprStatus {
-        enabled: anpr_enabled(&conn),
+        enabled,
         source,
         last_read_at: last_at,
         last_plate,
         pending_reads: pending,
     })
+}
+
+/// Query the ANPR service /status endpoint to get detailed diagnostics.
+/// Returns the raw JSON from the service so the frontend can display it.
+#[tauri::command]
+pub fn anpr_service_status(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let svc_url = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        anpr_service_url(&conn)
+    };
+    let status_url = format!("{}/status", svc_url.trim_end_matches('/'));
+    let body = fetch_http(&status_url).ok_or_else(|| format!("ANPR service not reachable at {svc_url}"))?;
+    serde_json::from_str(&body).map_err(|e| format!("Invalid status response: {e}"))
 }
 
 /// Feed scripted reads into the simulator queue (dev/testing only).
@@ -1723,9 +1749,39 @@ pub fn emit_capture_update(app: &AppHandle) {
 use std::fs;
 use std::process::{Command as StdCommand, Stdio};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+/// Windows creation flag to prevent a console window from flashing
+/// when spawning subprocesses from a GUI application.
+#[cfg(target_os = "windows")]
+pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Same as CREATE_NO_WINDOW but also sets BELOW_NORMAL_PRIORITY_CLASS so the
+/// ANPR Python process (which loads heavy ML models) doesn't starve the
+/// Tauri WebView of CPU/GPU and cause the app to become unresponsive.
+/// 0x08000000 | 0x00004000
+#[cfg(target_os = "windows")]
+const ANPR_PROCESS_FLAGS: u32 = 0x08004000;
+
+/// Cached Python path — probed once, reused for all subsequent calls.
+/// This avoids spawning ~9 subprocesses every time `find_python()` is called.
+static CACHED_PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Find a working Python executable by trying common names.
 /// Returns the first one that resolves to an actual file.
+/// Result is cached after the first successful probe.
 pub fn find_python() -> String {
+    if let Some(cached) = CACHED_PYTHON.get() {
+        return cached.clone();
+    }
+
+    let found = find_python_inner();
+    let _ = CACHED_PYTHON.set(found.clone());
+    found
+}
+
+fn find_python_inner() -> String {
     // Probe known Python paths directly — no dependency on `where`/`which`
     // or the system PATH, which may differ in the Tauri app context.
     #[cfg(target_os = "windows")]
@@ -1748,10 +1804,13 @@ pub fn find_python() -> String {
             "py.exe".into(),
         ];
         for path in &probe {
-            if let Ok(out) = StdCommand::new(path).arg("--version").output() {
+            let mut cmd = StdCommand::new(path);
+            cmd.arg("--version");
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            if let Ok(out) = cmd.output() {
                 if out.status.success() {
                     let ver = String::from_utf8_lossy(&out.stdout);
-                    eprintln!("[ANPR] Found Python: {path} ({ver})");
+                    crate::log::log(&format!("[ANPR] Found Python: {path} ({ver})"));
                     return path.clone();
                 }
             }
@@ -1763,13 +1822,13 @@ pub fn find_python() -> String {
         for name in &probe {
             if let Ok(out) = StdCommand::new(name).arg("--version").output() {
                 if out.status.success() {
-                    eprintln!("[ANPR] Found Python: {name}");
+                    crate::log::log(&format!("[ANPR] Found Python: {name}"));
                     return name.to_string();
                 }
             }
         }
     }
-    eprintln!("[ANPR] WARNING: No Python found!");
+    crate::log::log(&format!("[ANPR] WARNING: No Python found!"));
     "python".to_string()
 }
 
@@ -1839,21 +1898,233 @@ pub fn write_anpr_config(
     Ok(path_str)
 }
 
-/// Start the ANPR service process. Returns the PID.
+/// Emit an `anpr-setup-progress` event to the frontend for real-time UI updates.
+fn emit_anpr_progress(handle: Option<&AppHandle>, step: &str, message: &str, extra: Option<serde_json::Value>) {
+    if let Some(h) = handle {
+        let mut payload = serde_json::json!({
+            "step": step,
+            "message": message,
+        });
+        if let Some(e) = extra {
+            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), e.as_object()) {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let _ = h.emit("anpr-setup-progress", payload);
+    }
+}
+
+/// Auto-setup: ensure Python + pip deps are available for the ANPR service.
+///
+/// This is the FALLBACK path — it only runs when no compiled PyInstaller exe
+/// is found. With a properly built release (build_anpr.py has been run), this
+/// code path should never be triggered on end-user machines.
+///
+/// When it does run, it:
+///   - Logs every step to eprintln! (visible in Tauri dev console and system logs).
+///   - Emits `anpr-setup-progress` Tauri events so the UI can show real progress.
+///   - Enforces a 15-minute total timeout — never hangs silently forever.
+pub fn ensure_anpr_deps(anpr_dir: &std::path::Path, handle: Option<&AppHandle>) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+
+    let check_timeout = |step: &str| -> Result<(), String> {
+        if std::time::Instant::now() > deadline {
+            Err(format!("[ANPR] Timeout exceeded during '{step}' — aborting dep setup after 15 minutes"))
+        } else {
+            Ok(())
+        }
+    };
+
+    // 1. If compiled exe exists, no Python needed at all.
+    if let Some(exe) = crate::find_anpr_exe() {
+        crate::log::log(&format!("[ANPR] Compiled exe found at {} — skipping dep setup", exe.display()));
+        emit_anpr_progress(handle, "complete", "ANPR engine found — ready to use", None);
+        return Ok(exe.to_string_lossy().to_string());
+    }
+
+    crate::log::log(&format!("[ANPR] *** FALLBACK PATH: No compiled exe found — setting up Python environment ***"));
+
+    // 2. If Python is already available, just install deps.
+    let python = find_python();
+    crate::log::log(&format!("[ANPR] [1/4] Checking for Python at: {python}"));
+    emit_anpr_progress(handle, "checking", "Checking for Python...", None);
+    let python_works = std::process::Command::new(&python)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if python_works {
+        crate::log::log(&format!("[ANPR] [1/4] Python found — installing pip dependencies..."));
+        emit_anpr_progress(handle, "python_found", &format!("Python found at {python}"), None);
+        check_timeout("install pip deps (system Python)")?;
+        emit_anpr_progress(handle, "installing_deps", "Installing ANPR packages...", None);
+        install_pip_deps(anpr_dir, &python)?;
+        crate::log::log(&format!("[ANPR] [4/4] Done — using system Python: {python}"));
+        emit_anpr_progress(handle, "complete", "ANPR environment ready!", None);
+        return Ok(python);
+    }
+
+    // 3. No Python found — download Python embeddable package.
+    crate::log::log(&format!("[ANPR] [1/4] Python not found — downloading Python embeddable package..."));
+    emit_anpr_progress(handle, "downloading_python", "Python not found — downloading Python 3.12.7...", None);
+    let py_ver = "3.12.7";
+    let py_dir = anpr_dir.join("python-embed");
+    let py_exe = py_dir.join("python.exe");
+
+    if !py_exe.exists() {
+        check_timeout("download Python")?;
+        let zip_url = format!(
+            "https://www.python.org/ftp/python/{}/python-{}-embed-amd64.zip",
+            py_ver, py_ver
+        );
+        let zip_path = anpr_dir.join("python-embed.zip");
+
+        crate::log::log(&format!("[ANPR] [1/4] Downloading Python {py_ver} from python.org..."));
+        let dl_msg = format!("Downloading Python {py_ver}...");
+        emit_anpr_progress(handle, "downloading_python", &dl_msg, None);
+        download_file(&zip_url, &zip_path)?;
+        crate::log::log(&format!("[ANPR] [1/4] Python download complete."));
+        emit_anpr_progress(handle, "python_downloaded", "Python downloaded — extracting...", None);
+
+        check_timeout("extract Python")?;
+        crate::log::log(&format!("[ANPR] [2/4] Extracting Python embeddable package..."));
+        emit_anpr_progress(handle, "extracting_python", "Extracting Python...", None);
+        extract_zip(&zip_path, &py_dir)?;
+        let _ = std::fs::remove_file(&zip_path);
+
+        // Enable pip: append "import site" to the ._pth file so Python can find site-packages.
+        let pth_files: Vec<_> = std::fs::read_dir(&py_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter(|e| {
+                e.path().extension().map(|s| s == "pth").unwrap_or(false)
+                    && e.path().file_name().unwrap_or_default().to_string_lossy().contains('_')
+            })
+            .collect();
+        for pth in pth_files {
+            let mut content = std::fs::read_to_string(pth.path()).unwrap_or_default();
+            if !content.contains("import site") {
+                content.push_str("\nimport site\n");
+                let _ = std::fs::write(pth.path(), content);
+            }
+        }
+
+        check_timeout("install pip")?;
+        crate::log::log(&format!("[ANPR] [2/4] Installing pip into embeddable Python..."));
+        emit_anpr_progress(handle, "installing_pip", "Installing pip...", None);
+        let get_pip_url = "https://bootstrap.pypa.io/get-pip.py";
+        let get_pip_path = py_dir.join("get-pip.py");
+        download_file(get_pip_url, &get_pip_path)?;
+
+        let mut pip_install = StdCommand::new(&py_exe);
+        pip_install.arg(&get_pip_path);
+        pip_install.current_dir(&py_dir);
+        pip_install.stdout(Stdio::null());
+        pip_install.stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        pip_install.creation_flags(CREATE_NO_WINDOW);
+        let pip_out = pip_install.output().map_err(|e| format!("pip bootstrap failed: {e}"))?;
+        if !pip_out.status.success() {
+            let err = String::from_utf8_lossy(&pip_out.stderr);
+            crate::log::log(&format!("[ANPR] pip bootstrap stderr: {err}"));
+        }
+        let _ = std::fs::remove_file(&get_pip_path);
+        crate::log::log(&format!("[ANPR] [2/4] pip installed."));
+        emit_anpr_progress(handle, "pip_installed", "pip installed successfully", None);
+    } else {
+        crate::log::log(&format!("[ANPR] [1/4] Python embeddable package already exists — skipping download."));
+        emit_anpr_progress(handle, "python_found", "Embedded Python already installed", None);
+    }
+
+    // 4. Install pip dependencies (numpy, opencv-python, paddleocr, etc.)
+    check_timeout("install pip deps")?;
+    crate::log::log(&format!("[ANPR] [3/4] Installing pip dependencies (paddleocr + opencv may take 5-15 minutes)..."));
+    emit_anpr_progress(handle, "installing_deps", "Installing ANPR packages (numpy, opencv, paddleocr)...", None);
+    let python_str = py_exe.to_string_lossy().to_string();
+    install_pip_deps(anpr_dir, &python_str)?;
+
+    crate::log::log(&format!("[ANPR] [4/4] ANPR Python environment ready at {}", py_dir.display()));
+    emit_anpr_progress(handle, "complete", "ANPR environment ready!", None);
+
+    // Update the cached Python path.
+    let _ = CACHED_PYTHON.set(python_str.clone());
+    Ok(python_str)
+}
+
+
+fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let resp = client.get(url).send().map_err(|e| format!("Download {url} failed: {e}"))?;
+    let bytes = resp.bytes().map_err(|e| format!("Download read failed: {e}"))?;
+    std::fs::write(dest, &bytes).map_err(|e| format!("Write {} failed: {e}", dest.display()))?;
+    Ok(())
+}
+
+fn extract_zip(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    // Use PowerShell to extract (no external zip library needed)
+    let mut cmd = StdCommand::new("powershell");
+    cmd.args([
+        "-NoProfile", "-NonInteractive", "-Command",
+        &format!("Expand-Archive -Path '{}' -DestinationPath '{}' -Force", zip_path.display(), dest.display()),
+    ]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.output().map_err(|e| format!("Extract failed: {e}"))?;
+    Ok(())
+}
+
+fn install_pip_deps(anpr_dir: &std::path::Path, python_path: &str) -> Result<(), String> {
+    let req_file = anpr_dir.join("requirements.txt");
+    if !req_file.exists() {
+        return Ok(());
+    }
+    crate::log::log(&format!("[ANPR] Installing pip dependencies from {}...", req_file.display()));
+    let mut cmd = StdCommand::new(python_path);
+    cmd.args(["-m", "pip", "install", "-r", &req_file.to_string_lossy(), "--quiet", "--disable-pip-version-check"]);
+    cmd.current_dir(anpr_dir);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output().map_err(|e| format!("pip install failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pip install failed (exit {}): {}", output.status.code().unwrap_or(-1), stderr));
+    }
+    crate::log::log(&format!("[ANPR] pip dependencies installed successfully"));
+    Ok(())
+}
+
+/// Start the ANPR service process. Returns immediately — heavy work runs in background.
 #[tauri::command]
 pub fn start_anpr_service(
     state: State<AppState>,
     actor_id: String,
-) -> Result<u32, String> {
-    // Kill any existing process first
-    let _ = stop_anpr_service_inner(&state);
+    handle: AppHandle,
+) -> Result<String, String> {
+    crate::log::log(&format!("[ANPR] start_anpr_service called by actor={actor_id}"));
 
     let anpr_dir = crate::find_anpr_dir();
+    crate::log::log(&format!("[ANPR] anpr_dir={:?}, exists={}", anpr_dir, anpr_dir.exists()));
     if !anpr_dir.exists() {
         return Err(format!("ANPR service directory not found: {}", anpr_dir.display()));
     }
 
-    // Write config.json from DB settings before starting the service
+    // Check if ANPR is ready (Python + deps installed). If not, tell the
+    // frontend to show the setup wizard instead of failing silently.
+    let setup_status = check_anpr_ready(State::clone(&state))?;
+    if !setup_status.ready {
+        return Err("anpr_not_ready".to_string());
+    }
+
+    // Read DB settings + write config.json (brief lock hold)
     {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let config = crate::anpr::read_anpr_config(&conn)?;
@@ -1863,60 +2134,296 @@ pub fn start_anpr_service(
         let cloud_api_key: String = conn
             .query_row("SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1", [], |r| r.get(0))
             .unwrap_or_default();
-        // Read current source from DB (may be empty = idle mode)
-        let source: String = conn
-            .query_row("SELECT COALESCE(connection_string, '') FROM camera_sources WHERE status = 'active' LIMIT 1", [], |r| r.get(0))
-            .unwrap_or_default();
-        let source_type: String = conn
-            .query_row("SELECT COALESCE(source_type, '') FROM camera_sources WHERE status = 'active' LIMIT 1", [], |r| r.get(0))
-            .unwrap_or_default();
+        // Read ALL active + tracked camera sources for multi-camera support.
+        // USB indices are re-resolved against THIS machine's device order —
+        // stored "usb:N" indices are machine-specific and may differ here.
+        let mut sources: Vec<serde_json::Value> = resolve_camera_sources(&conn);
+        // Fallback: if no active sources, use empty defaults
+        if sources.is_empty() {
+            sources.push(serde_json::json!({
+                "source": "",
+                "source_type": "",
+            }));
+        }
+        // Re-enable ANPR — start_anpr_service is the user's explicit intent.
+        // stop_anpr_service sets this to false to prevent poller restart.
+        let _ = set_setting(&conn, "anpr_enabled", "true");
         drop(conn);
-
         let config_path = anpr_dir.join("config.json");
         let cfg = serde_json::json!({
-            "source": source,
-            "source_type": source_type,
+            // Primary source (first active) for backward compat with single-source mode
+            "source": sources[0].get("source"),
+            "source_type": sources[0].get("source_type"),
+            // All sources for multi-camera mode
+            "sources": sources,
             "prefer_cloud": config.prefer_cloud,
             "cloud_api_url": cloud_api_url,
             "cloud_api_key": cloud_api_key,
         });
-        std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
-            .map_err(|e| format!("Failed to write config.json: {e}"))?;
+        if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string())) {
+            crate::log::log(&format!("[ANPR] Failed to write config.json: {e}"));
+        }
+        crate::log::log(&format!("[ANPR] Config written: {} camera source(s)", sources.len()));
     }
 
-    // Find Python executable — try known paths, fall back to PATH
-    let python_cmd = find_python();
-    let main_py = anpr_dir.join("main.py");
-    eprintln!("[ANPR] python={python_cmd} main={} dir={}", main_py.display(), anpr_dir.display());
+    // Set the starting guard so the ANPR poller won't auto-restart during
+    // this window — prevents the race where the poller kills our fresh process.
+    state.anpr_starting.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    eprintln!("[ANPR] python={} main={} dir={}", python_cmd, main_py.display(), anpr_dir.display());
+    // Run stop → start in a SINGLE background thread so the stop always
+    // completes before the start.  The old code spawned them as two
+    // independent threads which raced on the anpr_processes Mutex —
+    // the stop thread could drain and kill the freshly spawned child.
+    let db = state.db.clone();
+    let procs = state.anpr_processes.clone();
+    let anpr_dir_clone = anpr_dir.clone();
+    let anpr_starting_flag = state.anpr_starting.clone();
+    spawn_anpr_restart_thread(db, procs, anpr_dir_clone, anpr_starting_flag, handle);
 
-    // Launch Python with Stdio::null() to avoid the Windows os error 3
-    // that occurs when Stdio::from(File) tries to pass non-inheritable
-    // handles from a GUI/Tauri parent process. The ANPR service writes
-    // its own internal logs; we don't need Rust-side stdout/stderr capture.
-    let mut cmd = StdCommand::new(&python_cmd);
-    cmd.arg("-u").arg(&main_py).arg("--port").arg("9800");
-    cmd.current_dir(&anpr_dir);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    Ok("starting".to_string())
+}
 
-    let child = cmd.spawn().map_err(|e| {
-        let msg = format!("Failed to start ANPR: {e} (python: {}, dir: {})", python_cmd, anpr_dir.display());
-        eprintln!("[ANPR] {msg}");
-        msg
-    })?;
-    let pid = child.id();
+/// Spawn the stop → start worker thread (shared by the Start command and the
+/// auto-restart-on-config-change path).
+fn spawn_anpr_restart_thread(
+    db: Arc<Mutex<Connection>>,
+    procs: Arc<Mutex<Vec<std::process::Child>>>,
+    anpr_dir: std::path::PathBuf,
+    anpr_starting_flag: Arc<std::sync::atomic::AtomicBool>,
+    handle: AppHandle,
+) {
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // --- Phase 1: Stop old process (synchronous, must finish first) ---
+            let _ = stop_anpr_service_inner_parts(&db, &procs);
 
-    // Store the child handle
+            // --- Phase 2: Start new process ---
+            let main_py = anpr_dir.join("main.py");
+            let python = find_python();
+            let mut cmd = StdCommand::new(&python);
+            cmd.arg("-u").arg(&main_py).arg("--port").arg("9800");
+            cmd.current_dir(&anpr_dir);
+            // Pipe stdout/stderr to log files
+            let log_file = anpr_dir.join("anpr-service.log");
+            let err_file = anpr_dir.join("anpr-service.err");
+            if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+                cmd.stdout(Stdio::from(f));
+            }
+            if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&err_file) {
+                cmd.stderr(Stdio::from(f));
+            }
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(ANPR_PROCESS_FLAGS);
+
+            match cmd.spawn() {
+                Ok(child) => {
+                    let pid = child.id();
+                    crate::log::log(&format!("[ANPR] Spawned PID={pid}"));
+                    if let Ok(mut p) = procs.lock() {
+                        p.push(child);
+                    }
+                    let _ = handle.emit("anpr-started", serde_json::json!({"pid": pid}));
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[ANPR] Spawn failed: {e}"));
+                    let _ = handle.emit("anpr-start-error", serde_json::json!({"error": e.to_string()}));
+                }
+            }
+        }));
+        // Clear the starting guard so the poller can resume monitoring.
+        anpr_starting_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// If the ANPR service is currently running, restart it in the background so
+/// it picks up the new camera-source configuration. Called after every camera
+/// source mutation (add/update/delete/activate/pause/tracked). Without this,
+/// a running service keeps its OLD pipeline set — observed: a removed black
+/// EOS camera stayed on pipeline 0 while a newly added video file never got a
+/// pipeline at all (its tile stayed black).
+pub fn restart_anpr_if_running(state: &crate::AppState, handle: &AppHandle) {
+    // Probe the service port — a live listener means the service is running.
+    // (Cheap TCP connect; never touches the DB lock.)
+    let port = {
+        let Ok(conn) = state.db.lock() else { return };
+        let url = anpr_service_url(&conn);
+        url.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(9800)
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let running = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok();
+    if !running {
+        return; // service stopped — new config is picked up on next Start
+    }
+    let anpr_dir = crate::find_anpr_dir();
+    if !anpr_dir.exists() {
+        return;
+    }
+    // Rewrite config.json from the CURRENT db state, then stop → start.
     {
-        let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
-        procs.push(child);
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = write_anpr_config_file(&conn, &anpr_dir) {
+            crate::log::log(&format!("[ANPR] config rewrite for auto-restart failed: {e}"));
+        }
+    }
+    state.anpr_starting.store(true, std::sync::atomic::Ordering::SeqCst);
+    spawn_anpr_restart_thread(
+        state.db.clone(),
+        state.anpr_processes.clone(),
+        anpr_dir,
+        state.anpr_starting.clone(),
+        handle.clone(),
+    );
+}
+
+/// Read active+tracked camera sources and re-resolve USB indices against the
+/// CURRENT machine's DirectShow device order.
+///
+/// Why: sources are stored as "usb:N" where N is a DirectShow index — which is
+/// MACHINE-SPECIFIC and can even change on one machine when virtual camera
+/// drivers (vMix/OBS) are installed/removed. On a different PC, usb:0 may be
+/// a different device or nothing at all. So for each USB source we match its
+/// stored device name (extra_fields.device_name, falling back to the label)
+/// against the live device list and use the CURRENT index. Non-USB sources
+/// (rtsp/http URLs, file paths) pass through unchanged.
+fn resolve_camera_sources(conn: &Connection) -> Vec<serde_json::Value> {
+    let mut rows: Vec<(String, String, String, Option<String>)> = Vec::new();
+    {
+        let mut stmt = match conn.prepare(
+            "SELECT connection_string, source_type, COALESCE(label, ''), extra_fields \
+             FROM camera_sources WHERE status = 'active' AND COALESCE(tracked, 1) = 1 \
+             ORDER BY created_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log::log(&format!("[ANPR] camera query failed: {e}"));
+                return Vec::new();
+            }
+        };
+        let mapped = match stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                crate::log::log(&format!("[ANPR] camera query failed: {e}"));
+                return Vec::new();
+            }
+        };
+        for row in mapped.flatten() {
+            rows.push(row);
+        }
     }
 
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    append_audit(&conn, &actor_id, "started_anpr_service", None, Some(serde_json::json!({"pid": pid})))?;
-    Ok(pid)
+    // Does any USB source need index resolution?
+    let has_usb = rows.iter().any(|(_, t, _, _)| t == "usb");
+    let mut name_to_index: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut max_index: i64 = -1;
+    if has_usb {
+        let python = find_python();
+        if let Some(script) = crate::find_anpr_dir().join("_enum_cameras.py").to_str() {
+            let mut cmd = std::process::Command::new(&python);
+            cmd.arg(script).arg("--fast");
+            #[cfg(target_os = "windows")]
+            {
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            if let Ok(out) = cmd.output() {
+                if out.status.success() {
+                    if let Ok(list) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&out.stdout)) {
+                        if let Some(arr) = list.as_array() {
+                            for cam in arr {
+                                let idx = cam.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                                if let Some(n) = cam.get("name").and_then(|v| v.as_str()) {
+                                    name_to_index.insert(n.to_string(), idx);
+                                }
+                                max_index = max_index.max(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if name_to_index.is_empty() {
+            crate::log::log("[ANPR] USB source present but device enumeration unavailable — using stored indices as-is");
+        }
+    }
+
+    let mut sources: Vec<serde_json::Value> = Vec::new();
+    for (conn_str, src_type, label, extra) in rows {
+        if src_type == "usb" && !name_to_index.is_empty() {
+            // Stored device name: extra_fields {"device_name": ...} set at add
+            // time; fall back to the label for legacy rows.
+            let dev_name = extra
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("device_name").and_then(|d| d.as_str()).map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| label.clone());
+
+            if let Some(&current_idx) = name_to_index.get(dev_name.as_str()) {
+                let stored_idx: i64 = conn_str.strip_prefix("usb:").and_then(|s| s.parse().ok()).unwrap_or(-1);
+                if current_idx != stored_idx {
+                    crate::log::log(&format!(
+                        "[ANPR] USB remap: '{}' moved from index {} to {} on this machine",
+                        dev_name, stored_idx, current_idx
+                    ));
+                }
+                sources.push(serde_json::json!({ "source": format!("usb:{}", current_idx), "source_type": "usb" }));
+                continue;
+            }
+            // Name not found on this machine: keep the stored index only if it
+            // is within range; otherwise skip the source entirely with an
+            // honest log instead of silently capturing the WRONG camera.
+            let stored_idx: i64 = conn_str.strip_prefix("usb:").and_then(|s| s.parse().ok()).unwrap_or(-1);
+            if stored_idx >= 0 && stored_idx <= max_index {
+                crate::log::log(&format!(
+                    "[ANPR] USB source '{}' (device_name '{}') not matched by name — keeping stored index {}",
+                    conn_str, dev_name, stored_idx
+                ));
+                sources.push(serde_json::json!({ "source": conn_str, "source_type": "usb" }));
+            } else {
+                crate::log::log(&format!(
+                    "[ANPR] Skipping USB source '{}' — device '{}' does not exist on this machine",
+                    conn_str, dev_name
+                ));
+            }
+            continue;
+        }
+        sources.push(serde_json::json!({ "source": conn_str, "source_type": src_type }));
+    }
+    sources
+}
+
+/// Write config.json from the current camera_sources table.
+pub(crate) fn write_anpr_config_file(conn: &Connection, anpr_dir: &std::path::Path) -> Result<(), String> {
+    let config = crate::anpr::read_anpr_config(conn)?;
+    let cloud_api_url: String = conn
+        .query_row("SELECT value FROM key_value_ref WHERE key = 'cloud_anpr_api_url'", [], |r| r.get(0))
+        .unwrap_or_default();
+    let cloud_api_key: String = conn
+        .query_row("SELECT encrypted_value FROM anpr_credentials WHERE key_name = 'cloud_anpr_api_key' LIMIT 1", [], |r| r.get(0))
+        .unwrap_or_default();
+    let mut sources: Vec<serde_json::Value> = resolve_camera_sources(conn);
+    if sources.is_empty() {
+        sources.push(serde_json::json!({ "source": "", "source_type": "" }));
+    }
+    let ocr_plate_mode: String = conn
+        .query_row("SELECT value FROM app_settings WHERE key = 'ocr_plate_mode'", [], |r| r.get(0))
+        .unwrap_or_else(|_| "universal".to_string());
+    let cfg = serde_json::json!({
+        "source": sources[0].get("source"),
+        "source_type": sources[0].get("source_type"),
+        "sources": sources,
+        "prefer_cloud": config.prefer_cloud,
+        "cloud_api_url": cloud_api_url,
+        "cloud_api_key": cloud_api_key,
+        "ocr_plate_mode": ocr_plate_mode,
+    });
+    let config_path = anpr_dir.join("config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string()))
+        .map_err(|e| format!("write config.json failed: {e}"))
 }
 
 /// Stop all ANPR service processes.
@@ -1926,58 +2433,216 @@ pub fn stop_anpr_service(
     actor_id: String,
 ) -> Result<String, String> {
     let count = stop_anpr_service_inner(&state)?;
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    append_audit(&conn, &actor_id, "stopped_anpr_service", None, None)?;
+    // Disable ANPR so the auto-restart poller does NOT bring it back.
+    // The user explicitly stopped it — respect that decision.
+    // start_anpr_service / auto_start_anpr will re-enable when called.
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        set_setting(&conn, "anpr_enabled", "false")?;
+        let _ = append_audit(&conn, &actor_id, "stopped_anpr_service", None, None);
+    }
     Ok(format!("Stopped {count} ANPR process(es)."))
 }
 
-fn stop_anpr_service_inner(state: &State<AppState>) -> Result<usize, String> {
-    // First try graceful shutdown via HTTP endpoint
+// ---------------------------------------------------------------------------
+// ANPR setup check + on-demand installer
+// ---------------------------------------------------------------------------
+
+/// Status of the ANPR environment — returned by `check_anpr_ready`.
+#[derive(serde::Serialize)]
+pub struct AnprSetupStatus {
+    pub ready: bool,
+    pub has_python: bool,
+    pub has_deps: bool,
+    pub has_main_py: bool,
+    pub has_exe: bool,
+    pub anpr_dir: String,
+}
+
+/// Check whether the ANPR service is ready to start.
+///
+/// Returns a structured status so the frontend can decide whether to show
+/// the setup wizard or start the service directly.
+#[tauri::command]
+pub fn check_anpr_ready(_state: State<AppState>) -> Result<AnprSetupStatus, String> {
+    let anpr_dir = crate::find_anpr_dir();
+    let has_main_py = anpr_dir.join("main.py").is_file();
+    let has_exe = crate::find_anpr_exe().is_some();
+
+    let python = find_python();
+    let has_python = !python.is_empty() && std::process::Command::new(&python)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let deps_installed = if has_python {
+        check_pip_deps_installed(&python, &anpr_dir)
+    } else {
+        false
+    };
+
+    Ok(AnprSetupStatus {
+        ready: has_exe || (has_main_py && has_python && deps_installed),
+        has_python,
+        has_deps: deps_installed,
+        has_main_py,
+        has_exe,
+        anpr_dir: anpr_dir.to_string_lossy().to_string(),
+    })
+}
+
+/// Check if pip dependencies from requirements.txt are installed.
+fn check_pip_deps_installed(python_path: &str, anpr_dir: &std::path::Path) -> bool {
+    let req_file = anpr_dir.join("requirements.txt");
+    if !req_file.exists() {
+        return false;
+    }
+    // Quick check: try importing the key packages
+    let test_imports = ["numpy", "cv2", "paddleocr"];
+    for pkg in &test_imports {
+        let out = std::process::Command::new(python_path)
+            .args(["-c", &format!("import {pkg}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if !out.map(|o| o.status.success()).unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Trigger ANPR environment setup (Python + pip deps) with progress events.
+///
+/// Runs on a background thread. Progress is emitted via `anpr-setup-progress`
+/// Tauri events. Completion emits `anpr-setup-done`, failure emits `anpr-setup-error`.
+#[tauri::command]
+pub fn ensure_anpr_setup(
+    _state: State<AppState>,
+    handle: AppHandle,
+) -> Result<String, String> {
+    let anpr_dir = crate::find_anpr_dir();
+
+    std::thread::spawn(move || {
+        let result = ensure_anpr_deps(&anpr_dir, Some(&handle));
+        match result {
+            Ok(python_path) => {
+                let _ = handle.emit("anpr-setup-done", serde_json::json!({
+                    "python": python_path,
+                }));
+            }
+            Err(e) => {
+                let _ = handle.emit("anpr-setup-error", serde_json::json!({
+                    "error": e,
+                }));
+            }
+        }
+    });
+
+    Ok("setup_started".to_string())
+}
+
+/// Variant of stop_anpr_service_inner that takes cloned Arc<Mutex<…>> directly,
+/// so it can be called from a background thread without needing a &State borrow.
+fn stop_anpr_service_inner_parts(
+    db: &Arc<Mutex<Connection>>,
+    anpr_processes: &Arc<Mutex<Vec<std::process::Child>>>,
+) -> Result<usize, String> {
+    // Get the service URL under a brief lock
     let service_url = {
-        let Ok(conn) = state.db.lock() else {
+        let Ok(conn) = db.lock() else {
             return Err("Cannot lock DB".to_string());
         };
         anpr_service_url(&conn)
     };
-    // Try graceful shutdown via HTTP endpoint
+    let host_port = service_url
+        .strip_prefix("http://")
+        .or_else(|| service_url.strip_prefix("https://"))
+        .unwrap_or(&service_url)
+        .split('/')
+        .next()
+        .unwrap_or("127.0.0.1:9800")
+        .to_string();
+    // Try graceful shutdown via HTTP endpoint (with 1s timeout so we never hang)
     {
-        // Parse the service URL to extract host:port for TCP connect
-        let host_port = service_url
-            .strip_prefix("http://")
-            .or_else(|| service_url.strip_prefix("https://"))
-            .unwrap_or(&service_url)
-            .split('/')
-            .next()
-            .unwrap_or("127.0.0.1:9800");
-        if let Ok(mut stream) = std::net::TcpStream::connect(host_port) {
+        if let Ok(mut stream) = std::net::TcpStream::connect(&host_port) {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
             let host = host_port.split(':').next().unwrap_or("127.0.0.1");
             let req = format!("GET /shutdown HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
             let _ = std::io::Write::write_all(&mut stream, req.as_bytes());
-            std::thread::sleep(std::time::Duration::from_millis(800));
         }
     }
-
-    // Then force-kill any remaining processes
-    let mut procs = state.anpr_processes.lock().map_err(|e| e.to_string())?;
+    // Kill any remaining processes — use child.kill() (graceful) then
+    // taskkill /F /PID (without /T) to avoid killing the entire process tree,
+    // which can destroy the WebView if the PID was reused by a renderer.
+    let mut procs = anpr_processes.lock().map_err(|e| e.to_string())?;
     let mut count = 0;
     for mut child in procs.drain(..) {
         let pid = child.id();
-        // On Windows, use taskkill to kill the entire process tree
-        // (Python may have spawned child processes that kill() won't reach)
+        // Try graceful kill first
+        let _ = child.kill();
+        let _ = child.try_wait();
+        // Force-kill if still alive (no /T — don't kill the process tree)
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+            let _ = {
+                let mut cmd = std::process::Command::new("taskkill");
+                cmd.args(["/F", "/PID", &pid.to_string()]);
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                cmd.output()
+            };
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
         count += 1;
     }
+    drop(procs);
+    // Kill ORPHANED listeners: processes still bound to the service port that
+    // are NOT tracked children (e.g. left over from a previous app session
+    // before a rebuild/restart). Without this, a stale instance keeps serving
+    // the OLD camera config — and because Python's ThreadingHTTPServer sets
+    // SO_REUSEADDR, a freshly spawned instance can double-bind the same port,
+    // after which requests are answered by whichever process won the race
+    // (observed: the stale one serving black frames from a removed camera).
+    #[cfg(target_os = "windows")]
+    {
+        let port = host_port.rsplit(':').next().unwrap_or("9800").to_string();
+        let port_pat = format!(":{port}");
+        if let Ok(out) = {
+            let mut cmd = std::process::Command::new("netstat");
+            cmd.args(["-ano", "-p", "TCP"]);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.output()
+        } {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            let self_pid = std::process::id().to_string();
+            let mut killed: Vec<String> = Vec::new();
+            for line in txt.lines() {
+                if line.contains(&port_pat) && line.contains("LISTENING") {
+                    if let Some(pid_str) = line.split_whitespace().last() {
+                        if pid_str != &self_pid
+                            && pid_str.parse::<u32>().map(|p| p > 0).unwrap_or(false)
+                            && !killed.contains(&pid_str.to_string())
+                        {
+                            let mut cmd = std::process::Command::new("taskkill");
+                            cmd.args(["/F", "/PID", pid_str]);
+                            cmd.creation_flags(CREATE_NO_WINDOW);
+                            let _ = cmd.output();
+                            killed.push(pid_str.to_string());
+                        }
+                    }
+                }
+            }
+            if !killed.is_empty() {
+                crate::log::log(&format!("[ANPR] Killed orphaned port-{port} listener(s): {:?}", killed));
+            }
+        }
+    }
     Ok(count)
+}
+
+fn stop_anpr_service_inner(state: &State<AppState>) -> Result<usize, String> {
+    stop_anpr_service_inner_parts(&state.db, &state.anpr_processes)
 }
 
 /// List recent detection images from the frames directory.

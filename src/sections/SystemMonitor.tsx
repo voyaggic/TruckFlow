@@ -81,9 +81,10 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
       setSelected([]);
       setFlash(`${selected.length} record${selected.length === 1 ? "" : "s"} deleted.`);
       setTimeout(() => setFlash(null), 3000);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     } finally {
       setDeleting(false);
     }
@@ -100,14 +101,17 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
       setError(null);
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   }, [user.id]);
 
+  const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
+
   useEffect(() => {
-    refresh();
-    const t = setInterval(refresh, 15000);
+    refreshBg();
+    const t = setInterval(refreshBg, 15000);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [refreshBg]);
 
   const acknowledge = async (id: string) => {
     setError(null);
@@ -115,9 +119,10 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
       await api.acknowledgeHealthEvent(user.id, id);
       setFlash("Alert acknowledged — it will not appear in the open alert list.");
       setTimeout(() => setFlash(null), 3000);
-      await refresh();
+      refreshBg();
     } catch (e) {
       setError(String(e));
+      setTimeout(() => setError(null), 6000);
     }
   };
 

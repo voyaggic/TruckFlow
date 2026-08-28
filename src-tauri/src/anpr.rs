@@ -235,7 +235,7 @@ pub fn list_camera_sources(state: State<AppState>) -> Result<Vec<CameraSourceVie
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, label, source_type, connection_string, status,
+            "SELECT id, label, source_type, connection_string, status, tracked,
                     last_connection_check_at, last_connection_check_result
              FROM camera_sources ORDER BY created_at ASC",
         )
@@ -248,8 +248,9 @@ pub fn list_camera_sources(state: State<AppState>) -> Result<Vec<CameraSourceVie
                 source_type: r.get(2)?,
                 connection_string: r.get(3)?,
                 status: r.get(4)?,
-                last_connection_check_at: r.get(5)?,
-                last_connection_check_result: r.get(6)?,
+                tracked: r.get::<_, Option<i64>>(5)?.unwrap_or(1) != 0,
+                last_connection_check_at: r.get(6)?,
+                last_connection_check_result: r.get(7)?,
             })
         })
         .map_err(|e| format!("camera source list failed: {e}"))?;
@@ -260,10 +261,12 @@ pub fn list_camera_sources(state: State<AppState>) -> Result<Vec<CameraSourceVie
 #[tauri::command]
 pub fn add_camera_source(
     state: State<AppState>,
+    handle: tauri::AppHandle,
     actor_id: String,
     label: String,
     source_type: String,
     connection_string: String,
+    device_name: Option<String>,
 ) -> Result<CameraSourceView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
@@ -278,19 +281,36 @@ pub fn add_camera_source(
     }
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
+    // For USB sources, persist the REAL device name so the service can
+    // re-resolve its DirectShow index on any machine (indices are
+    // machine-specific; names are stable).
+    let extra_fields: Option<String> = if source_type == "usb" {
+        device_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|dn| json!({ "device_name": dn }).to_string())
+    } else {
+        None
+    };
     conn.execute(
-        "INSERT INTO camera_sources (id, label, source_type, connection_string, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
-        params![id, label.trim(), source_type, connection_string.trim(), now],
+        "INSERT INTO camera_sources (id, label, source_type, connection_string, status, extra_fields, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6)",
+        params![id, label.trim(), source_type, connection_string.trim(), extra_fields, now],
     )
     .map_err(|e| format!("camera source create failed: {e}"))?;
     append_audit(&conn, &actor_id, "added_camera_source", Some(&id), Some(json!({ "label": label.trim(), "source_type": source_type })))?;
-    camera_source_by_id(&conn, &id)
+    let result = camera_source_by_id(&conn, &id);
+    drop(conn);
+    // Running service must pick up the new pipeline set immediately.
+    crate::capture::restart_anpr_if_running(&state, &handle);
+    result
 }
 
 #[tauri::command]
 pub fn update_camera_source(
     state: State<AppState>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
     label: Option<String>,
@@ -329,13 +349,17 @@ pub fn update_camera_source(
     )
     .map_err(|e| format!("camera source update failed: {e}"))?;
     append_audit(&conn, &actor_id, "updated_camera_source", Some(&source_id), None)?;
-    camera_source_by_id(&conn, &source_id)
+    let result = camera_source_by_id(&conn, &source_id);
+    drop(conn);
+    crate::capture::restart_anpr_if_running(&state, &handle);
+    result
 }
 
 /// Camera sources are deactivated, never hard-deleted (01-database-schema.md).
 #[tauri::command]
 pub fn set_camera_source_status(
     state: State<AppState>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
     status: String,
@@ -351,13 +375,41 @@ pub fn set_camera_source_status(
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
     append_audit(&conn, &actor_id, "set_camera_source_status", Some(&source_id), Some(json!({ "status": status })))?;
-    camera_source_by_id(&conn, &source_id)
+    let result = camera_source_by_id(&conn, &source_id);
+    drop(conn);
+    crate::capture::restart_anpr_if_running(&state, &handle);
+    result
+}
+
+/// Toggle whether a source is included in ANPR processing when the service
+/// starts. Active + tracked sources are the ones the service captures from.
+#[tauri::command]
+pub fn set_camera_source_tracked(
+    state: State<AppState>,
+    handle: tauri::AppHandle,
+    actor_id: String,
+    source_id: String,
+    tracked: bool,
+) -> Result<CameraSourceView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    conn.execute(
+        "UPDATE camera_sources SET tracked = ?1, updated_at = ?2 WHERE id = ?3",
+        params![if tracked { 1 } else { 0 }, now_iso(), source_id],
+    )
+    .map_err(|e| format!("camera source tracked update failed: {e}"))?;
+    append_audit(&conn, &actor_id, "set_camera_source_tracked", Some(&source_id), Some(json!({ "tracked": tracked })))?;
+    let result = camera_source_by_id(&conn, &source_id);
+    drop(conn);
+    crate::capture::restart_anpr_if_running(&state, &handle);
+    result
 }
 
 /// Camera sources can be deleted (permanent removal).
 #[tauri::command]
 pub fn delete_camera_source(
     state: State<AppState>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
 ) -> Result<(), String> {
@@ -384,9 +436,11 @@ pub fn delete_camera_source(
         )
         .unwrap_or(0);
     if archived > 0 {
-        println!("[ANPR] Archived {archived} queued trips after deleting camera source '{label}'");
+        crate::log::log(&format!("[ANPR] Archived {archived} queued trips after deleting camera source '{label}'"));
     }
     append_audit(&conn, &actor_id, "deleted_camera_source", Some(&source_id), Some(json!({ "label": label, "archived_trips": archived })))?;
+    drop(conn);
+    crate::capture::restart_anpr_if_running(&state, &handle);
     Ok(())
 }
 
@@ -398,25 +452,30 @@ pub fn test_camera_connection(
     actor_id: String,
     source_id: String,
 ) -> Result<CameraSourceView, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
-    let (source_type, connection_string): (String, String) = conn
-        .query_row(
+    // Phase 1: read config + permission under lock, then RELEASE the lock
+    // before running the capture test — the test can take up to 20s and must
+    // NEVER hold the db lock (that pattern caused the UI lag).
+    let (source_type, connection_string): (String, String) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+        conn.query_row(
             "SELECT source_type, connection_string FROM camera_sources WHERE id = ?1",
             params![source_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(|_| "Camera source not found.".to_string())?;
+        .map_err(|_| "Camera source not found.".to_string())?
+    }; // db lock released HERE
 
-    let now = now_iso();
-    let svc_url = anpr_service_url(&conn);
-    let result = test_reachable(&source_type, &connection_string, &svc_url);
+    let result = test_reachable(&source_type, &connection_string, "");
     let status = if result.is_ok() { "active" } else { "inactive" };
+    let now = now_iso();
     let result_str = match &result {
         Ok(msg) => msg.clone(),
         Err(e) => e.clone(),
     };
 
+    // Phase 2: re-acquire the lock only to persist the (fast) DB update
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE camera_sources SET status = ?1, last_connection_check_at = ?2,
                 last_connection_check_result = ?3, updated_at = ?2
@@ -425,6 +484,138 @@ pub fn test_camera_connection(
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
     camera_source_by_id(&conn, &source_id)
+}
+
+/// Detected camera device information.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct DetectedCamera {
+    pub index: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub backend: String,
+    pub status: String, // "ok" = live, "static" = frozen/test pattern, "black" = connected but delivering pure black, "error"
+    #[serde(default)]
+    pub is_live: bool,
+    #[serde(default)]
+    pub device_type: String,
+    #[serde(default)]
+    pub avg_frame_diff: f64,
+    #[serde(default)]
+    pub brightness: f64,
+}
+
+/// Detect all available USB/webcam devices on the system.
+/// Spawns a short Python script to enumerate OpenCV camera indices.
+#[tauri::command]
+pub fn enumerate_cameras() -> Result<Vec<DetectedCamera>, String> {
+    let anpr_dir = crate::find_anpr_dir();
+    let python = crate::capture::find_python();
+    if python.is_empty() {
+        return Err("Python not found".to_string());
+    }
+    // Use the bundled enumeration script that probes camera indices 0-9
+    let script = anpr_dir.join("_enum_cameras.py");
+    if !script.exists() {
+        return Err(format!("Camera enumeration script not found: {}", script.display()));
+    }
+
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::capture::CREATE_NO_WINDOW);
+    }
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run camera enumeration: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Camera enumeration failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cameras: Vec<DetectedCamera> = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Failed to parse camera list: {e}"))?;
+    Ok(cameras)
+}
+
+// ---------------------------------------------------------------------------
+// ONVIF network camera discovery (CCTV)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnvifDevice {
+    pub ip: String,
+    pub port: u32,
+    pub device_url: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub manufacturer: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub hardware: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OnvifScriptOutput {
+    ok: bool,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn run_onvif_script(args: &[&str]) -> Result<serde_json::Value, String> {
+    let anpr_dir = crate::find_anpr_dir();
+    let python = crate::capture::find_python();
+    if python.is_empty() {
+        return Err("Python not found".to_string());
+    }
+    let script = anpr_dir.join("_discover_onvif.py");
+    if !script.exists() {
+        return Err(format!("ONVIF discovery script not found: {}", script.display()));
+    }
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script).args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::capture::CREATE_NO_WINDOW);
+    }
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run ONVIF discovery: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: OnvifScriptOutput = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Failed to parse ONVIF output: {e}"))?;
+    if !parsed.ok {
+        return Err(parsed.error.unwrap_or_else(|| "ONVIF discovery failed".to_string()));
+    }
+    Ok(parsed.result.unwrap_or(serde_json::Value::Null))
+}
+
+/// Discover ONVIF CCTV cameras on the LAN (WS-Discovery broadcast, ~5s).
+/// No credentials needed — devices advertise themselves.
+#[tauri::command]
+pub fn discover_onvif_cameras() -> Result<Vec<OnvifDevice>, String> {
+    let result = run_onvif_script(&["discover"])?;
+    let devices: Vec<OnvifDevice> = serde_json::from_value(result)
+        .map_err(|e| format!("Failed to parse device list: {e}"))?;
+    Ok(devices)
+}
+
+/// Get the RTSP stream URI from an ONVIF device (needs the camera's login).
+#[tauri::command]
+pub fn onvif_stream_uri(
+    device_url: String,
+    username: String,
+    password: String,
+) -> Result<serde_json::Value, String> {
+    run_onvif_script(&["stream", &device_url, &username, &password])
 }
 
 /// Parse a URL string to extract (host, port) regardless of scheme.
@@ -449,7 +640,71 @@ fn parse_host_port(url: &str) -> (String, u16) {
     (host, port)
 }
 
-fn test_reachable(source_type: &str, connection_string: &str, service_url: &str) -> Result<String, String> {
+/// Run the real capture test: open the source with OpenCV (same backends as
+/// the runtime pipeline) and grab an actual frame via `_test_source.py`.
+/// Returns the human-readable success message or an error describing exactly
+/// why the source cannot deliver video.
+fn run_capture_test(source: &str, source_type: &str) -> Result<String, String> {
+    let anpr_dir = crate::find_anpr_dir();
+    let script = anpr_dir.join("_test_source.py");
+    if !script.exists() {
+        return Err(format!("Capture test script not found: {}", script.display()));
+    }
+    let python = crate::capture::find_python();
+    if python.is_empty() {
+        return Err("Python not found — cannot run capture test".to_string());
+    }
+
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script).arg(source).arg(source_type).arg("12");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::capture::CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start capture test: {e}"))?;
+
+    // Poll with a hard 20s cap so a hung RTSP open can never block forever.
+    let mut waited_ms = 0u32;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if waited_ms >= 20_000 {
+                    let _ = child.kill();
+                    return Err("Test timed out after 20s — source never delivered a frame".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                waited_ms += 100;
+            }
+            Err(e) => return Err(format!("Capture test failed: {e}")),
+        }
+    }
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut stdout);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TestResult {
+        ok: bool,
+        message: String,
+    }
+    let parsed: TestResult = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Unexpected test output ({e}): {}", stdout.trim().chars().take(120).collect::<String>()))?;
+    if parsed.ok {
+        Ok(parsed.message)
+    } else {
+        Err(parsed.message)
+    }
+}
+
+fn test_reachable(source_type: &str, connection_string: &str, _service_url: &str) -> Result<String, String> {
+    // Fast pre-checks first — fail in milliseconds instead of seconds where possible.
     match source_type {
         "rtsp" => {
             let (host, port) = parse_host_port(connection_string);
@@ -457,61 +712,28 @@ fn test_reachable(source_type: &str, connection_string: &str, service_url: &str)
                 .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?
                 .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                 .ok();
-            Ok(format!("TCP connection to {host}:{port} succeeded"))
-        }
-        "usb" => {
-            let device_id: i32 = connection_string.trim().parse().map_err(|_| format!("Invalid device index: {connection_string}"))?;
-            if device_id < 0 {
-                return Err(format!("Device index must be non-negative, got {device_id}"));
-            }
-            Ok(format!("USB device index {device_id} is valid. Start ANPR service to verify camera access."))
+            // TCP reachable — now verify the stream actually delivers video below.
         }
         "video_file" | "nvr_export" => {
             let path = std::path::Path::new(connection_string);
-            if path.exists() && path.is_file() {
-                Ok(format!("File exists: {} ({} bytes)", connection_string, std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)))
-            } else {
-                Err(format!("File not found: {connection_string}"))
+            if !path.exists() || !path.is_file() {
+                return Err(format!("File not found: {connection_string}"));
             }
         }
-        "live_test" => {
-            // Extract host:port from the configured service URL
-            let addr_str = service_url
-                .strip_prefix("http://").or_else(|| service_url.strip_prefix("https://"))
-                .unwrap_or(service_url)
-                .split('/').next().unwrap_or("127.0.0.1:9800");
-            std::net::TcpStream::connect(addr_str)
-                .map_err(|_| format!("ANPR service not reachable at {addr_str}"))?;
-            Ok(format!("ANPR service reachable at {connection_string}"))
-        }
-        _ => {
-            // Unknown type — try to parse as URL and do an HTTP HEAD or TCP probe
-            let (host, port) = parse_host_port(connection_string);
-            if connection_string.starts_with("http://") || connection_string.starts_with("https://") {
-                // HTTP/HTTPS stream — try an HTTP HEAD request
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-                let resp = client.head(connection_string).send()
-                    .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?;
-                Ok(format!("HTTP {} — {}", resp.status(), connection_string))
-            } else {
-                // TCP probe
-                std::net::TcpStream::connect((host.as_str(), port))
-                    .map_err(|e| format!("Cannot reach {host}:{port} — {e}"))?
-                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                    .ok();
-                Ok(format!("TCP connection to {host}:{port} succeeded"))
-            }
-        }
+        _ => {}
     }
+
+    // Real test for ALL types: open the source with the same OpenCV backends
+    // the runtime pipeline uses and grab an actual frame. This is the
+    // difference between "port open" and "video actually flows" — wrong RTSP
+    // paths/credentials and busy USB devices fail HERE instead of silently
+    // reconnecting forever once the service starts.
+    run_capture_test(connection_string, source_type)
 }
 
 fn camera_source_by_id(conn: &Connection, id: &str) -> Result<CameraSourceView, String> {
     conn.query_row(
-        "SELECT id, label, source_type, connection_string, status,
+        "SELECT id, label, source_type, connection_string, status, tracked,
                 last_connection_check_at, last_connection_check_result
          FROM camera_sources WHERE id = ?1",
         params![id],
@@ -522,8 +744,9 @@ fn camera_source_by_id(conn: &Connection, id: &str) -> Result<CameraSourceView, 
                 source_type: r.get(2)?,
                 connection_string: r.get(3)?,
                 status: r.get(4)?,
-                last_connection_check_at: r.get(5)?,
-                last_connection_check_result: r.get(6)?,
+                tracked: r.get::<_, Option<i64>>(5)?.unwrap_or(1) != 0,
+                last_connection_check_at: r.get(6)?,
+                last_connection_check_result: r.get(7)?,
             })
         },
     )
@@ -1010,37 +1233,54 @@ fn generate_machine_id() -> MachineInfo {
 /// Get the primary non-loopback MAC address.
 fn get_primary_mac_address() -> String {
     use std::process::Command;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     // Try Windows ipconfig first
-    if let Ok(output) = Command::new("ipconfig").arg("/all").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_mac = String::new();
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("Physical Address") || trimmed.starts_with("适配器") && trimmed.contains("Physical") {
-                // Extract MAC from line like "Physical Address. . . . . . . . . : AA-BB-CC-DD-EE-FF"
-                if let Some(mac_part) = trimmed.split(':').last() {
-                    let mac = mac_part.trim().replace('-', ":");
-                    if mac != "00-00-00-00-00-00" && !mac.contains("00:00:00:00:00:00") && !mac.is_empty() {
-                        current_mac = mac;
+    {
+        let mut cmd = Command::new("ipconfig");
+        cmd.arg("/all");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = cmd.output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut current_mac = String::new();
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Physical Address") || trimmed.starts_with("适配器") && trimmed.contains("Physical") {
+                    // Extract MAC from line like "Physical Address. . . . . . . . . : AA-BB-CC-DD-EE-FF"
+                    if let Some(mac_part) = trimmed.split(':').last() {
+                        let mac = mac_part.trim().replace('-', ":");
+                        if mac != "00-00-00-00-00-00" && !mac.contains("00:00:00:00:00:00") && !mac.is_empty() {
+                            current_mac = mac;
+                        }
                     }
                 }
             }
-        }
-        if !current_mac.is_empty() {
-            return current_mac;
+            if !current_mac.is_empty() {
+                return current_mac;
+            }
         }
     }
 
     // Fallback: try getmac command
-    if let Ok(output) = Command::new("getmac").arg("/fo").arg("csv").arg("/nh").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // CSV format: "AA-BB-CC-DD-EE-FF","Transport Name","..."
-            if let Some(mac_part) = line.split(',').next() {
-                let mac = mac_part.trim().trim_matches('"').replace('-', ":");
-                if !mac.is_empty() && mac != "00:00:00:00:00:00" {
-                    return mac;
+    {
+        let mut cmd = Command::new("getmac");
+        cmd.arg("/fo").arg("csv").arg("/nh");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = cmd.output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // CSV format: "AA-BB-CC-DD-EE-FF","Transport Name","..."
+                if let Some(mac_part) = line.split(',').next() {
+                    let mac = mac_part.trim().trim_matches('"').replace('-', ":");
+                    if !mac.is_empty() && mac != "00:00:00:00:00:00" {
+                        return mac;
+                    }
                 }
             }
         }
@@ -1123,20 +1363,36 @@ pub fn check_machine_match(state: State<AppState>) -> Result<bool, String> {
 /// Whether a program is available on PATH (e.g. ffmpeg). Returns (ok, detail).
 /// Approximate whether Python has OpenCV importable (the ANPR service's OCR
 /// dependency). Best-effort: `python -c "import cv2"`.
+static CACHED_OPENCV: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+
 fn python_opencv_available() -> (bool, String) {
+    if let Some(cached) = CACHED_OPENCV.get() {
+        return cached.clone();
+    }
+
     use std::process::Command;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     for cmd in ["python", "python3"] {
-        if let Ok(out) = Command::new(cmd)
-            .args(["-c", "import cv2; print(cv2.__version__)"])
-            .output()
-        {
+        let mut command = Command::new(cmd);
+        command.args(["-c", "import cv2; print(cv2.__version__)"]);
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(out) = command.output() {
             if out.status.success() {
                 let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                return (true, format!("OpenCV {v} importable via {cmd}"));
+                let result = (true, format!("OpenCV {v} importable via {cmd}"));
+                let _ = CACHED_OPENCV.set(result.clone());
+                return result;
             }
         }
     }
-    (false, "OpenCV (cv2) not importable — install it for the ANPR service: pip install opencv-python".to_string())
+    let result = (false, "OpenCV (cv2) not importable — install it for the ANPR service: pip install opencv-python".to_string());
+    let _ = CACHED_OPENCV.set(result.clone());
+    result
 }
 
 fn dir_size_bytes(path: &std::path::Path) -> i64 {
@@ -1305,11 +1561,63 @@ pub fn set_user_auto_start(
 
 /// Check if ANY user has auto-start enabled for this machine.
 /// Returns the first matching user_id (used by auto_start_anpr).
+/// Tries exact match first (hostname:mac), then falls back to hostname-only
+/// match so that auto-start works even when the NIC / MAC address changes
+/// (e.g. switching between Ethernet, Wi-Fi, or VPN adapters).
 pub fn any_auto_start_for_machine(conn: &Connection, machine_id: &str) -> Option<String> {
-    conn.query_row(
+    // 1. Exact match (hostname:mac)
+    if let Ok(uid) = conn.query_row(
         "SELECT user_id FROM user_anpr_auto_start WHERE machine_id = ?1 AND enabled = 1 LIMIT 1",
         params![machine_id],
         |r| r.get(0),
+    ) {
+        return Some(uid);
+    }
+    // 2. Hostname-only fallback: match any entry whose machine_id starts with
+    //    the same hostname prefix (before the first ':').
+    if let Some(hostname) = machine_id.split(':').next() {
+        if !hostname.is_empty() {
+            let pattern = format!("{}:%", hostname);
+            if let Ok(uid) = conn.query_row(
+                "SELECT user_id FROM user_anpr_auto_start WHERE machine_id LIKE ?1 AND enabled = 1 LIMIT 1",
+                params![pattern],
+                |r| r.get(0),
+            ) {
+                return Some(uid);
+            }
+        }
+    }
+    None
+}
+
+/// Set the OCR plate mode: "universal" (any plate) or "kenyan" (3 letters + 3 digits + 1 letter).
+#[tauri::command]
+pub fn set_ocr_plate_mode(
+    state: State<AppState>,
+    handle: tauri::AppHandle,
+    actor_id: String,
+    mode: String,
+) -> Result<String, String> {
+    if mode != "universal" && mode != "kenyan" {
+        return Err("Mode must be 'universal' or 'kenyan'.".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('ocr_plate_mode', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![mode],
     )
-    .ok()
+    .map_err(|e| format!("Failed to save OCR plate mode: {e}"))?;
+    append_audit(
+        &conn,
+        &actor_id,
+        "set_ocr_plate_mode",
+        None,
+        Some(serde_json::json!({ "mode": mode })),
+    )?;
+    // Restart ANPR service so it picks up the new mode via config.json.
+    drop(conn);
+    crate::capture::restart_anpr_if_running(&state, &handle);
+    Ok(format!("OCR plate mode set to '{mode}'."))
 }

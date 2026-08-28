@@ -1,0 +1,11 @@
+{
+  "version": "0.1.1",
+  "notes": "TruckFlow v0.1.1",
+  "pub_date": "2026-08-28T00:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "PLACEHOLDER",
+      "url": "https://github.com/USERNAME/TruckFlow/releases/download/v0.1.1/TruckFlow_0.1.1_x64-setup.exe"
+    }
+  }
+}
