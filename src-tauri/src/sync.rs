@@ -1474,9 +1474,26 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
 /// table gets a PRIMARY KEY on `id` (and an idempotent unique index, so a
 /// table that already exists without the constraint is still upsert-safe).
 fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
+    // Step 1: Fast check — do all tables already exist?
+    // A SELECT is much lighter than DDL and won't hang on an unstable
+    // connection. If the tables exist (which they almost certainly do
+    // after the first successful sync), we skip DDL entirely.
+    let mut missing: Vec<&str> = Vec::new();
+    for &(table, _) in PG_SYNC_TABLES {
+        let check = format!("SELECT 1 FROM {} LIMIT 0", pg_quote_ident(table));
+        if client.execute(&check, &[]).is_err() {
+            missing.push(table);
+        }
+    }
+    if missing.is_empty() {
+        crate::log::log("[sync] ensure_schema_for: all tables exist — skipping DDL");
+        return Ok(());
+    }
+    // Step 2: Only create tables that are missing.
+    crate::log::log(&format!("[sync] ensure_schema_for: {} tables missing: {:?}", missing.len(), missing));
     let mut errors: Vec<String> = Vec::new();
-    let mut tables_ok = 0u32;
-    for (table, _display) in PG_SYNC_TABLES {
+    let mut created = 0u32;
+    for table in missing {
         let defs: Vec<String> = base_columns(table)
             .iter()
             .map(|c| {
@@ -1487,38 +1504,30 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
                 }
             })
             .collect();
-        // Log but continue on failure — over an unstable connection,
-        // one table's DDL might fail while others succeed. The next
-        // push attempt will retry the remaining tables.
         if let Err(e) = client.batch_execute(&format!(
             "CREATE TABLE IF NOT EXISTS {} ({})",
             pg_quote_ident(table),
             defs.join(", ")
         )) {
-            errors.push(format!("{table} CREATE TABLE: {e}"));
+            errors.push(format!("{table}: {e}"));
             continue;
         }
-        if let Err(e) = client.batch_execute(&format!(
+        let _ = client.batch_execute(&format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\")",
             pg_quote_ident(&format!("{table}_id_key")),
             pg_quote_ident(table)
-        )) {
-            errors.push(format!("{table} CREATE INDEX: {e}"));
-            // Index failure is non-fatal — table exists, rows can still be upserted
-        }
-        tables_ok += 1;
+        ));
+        created += 1;
     }
     if errors.is_empty() {
-        crate::log::log(&format!("[sync] ensure_schema_for: all {tables_ok} tables OK"));
+        crate::log::log(&format!("[sync] ensure_schema_for: created {created} missing tables"));
         Ok(())
-    } else if tables_ok > 0 {
-        // Partial success — some tables created, others failed.
-        // The next push will retry the remaining tables.
-        crate::log::log(&format!("[sync] ensure_schema_for: {tables_ok} tables OK, {} errors: {}",
+    } else if created > 0 {
+        crate::log::log(&format!("[sync] ensure_schema_for: created {created}, {} failed: {}",
             errors.len(), errors.join("; ")));
-        Ok(()) // Don't abort — partial schema is fine
+        Ok(())
     } else {
-        Err(format!("ensure_schema_for failed for all tables: {}", errors.join("; ")))
+        Err(format!("ensure_schema_for failed: {}", errors.join("; ")))
     }
 }/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
 /// idempotent (ON CONFLICT DO UPDATE) so a mid-batch failure is safe to retry.
