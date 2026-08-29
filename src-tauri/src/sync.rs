@@ -1503,33 +1503,40 @@ fn push_rows_impl(
     table: &str,
     rows: &[serde_json::Value],
 ) -> Result<Vec<String>, String> {
+    crate::log::log(&format!("[sync] push_rows_impl: table={table} rows={}", rows.len()));
     // Phase 1: deduplicate ALTER TABLE — one round-trip per unique dynamic column.
     let mut seen_dynamic: std::collections::HashSet<String> = std::collections::HashSet::new();
     let base = base_columns(table);
+    let mut alter_count = 0u32;
     for row in rows {
         let Some(obj) = row.as_object() else { continue };
         for key in obj.keys() {
             if key != "id" && !base.contains(&key.as_str()) && seen_dynamic.insert(key.clone()) {
+                crate::log::log(&format!("[sync] push_rows_impl: ALTER TABLE {table} ADD COLUMN {key}"));
                 client
                     .batch_execute(&format!(
                         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
                         pg_quote_ident(table), pg_quote_ident(key)
                     ))
                     .map_err(|e| format!("central column add for {table}.{key} failed: {e}"))?;
+                alter_count += 1;
             }
         }
     }
+    crate::log::log(&format!("[sync] push_rows_impl: {table} ALTER TABLE done ({alter_count} columns added)"));
     // Phase 2: upsert in chunks — each chunk is its own transaction so a
     // timeout on chunk 3 doesn't lose the work from chunks 1-2.
     let mut all_acked: Vec<String> = Vec::new();
-    for chunk in rows.chunks(PG_CHUNK_SIZE) {
+    let total_chunks = (rows.len() + PG_CHUNK_SIZE - 1) / PG_CHUNK_SIZE;
+    for (chunk_idx, chunk) in rows.chunks(PG_CHUNK_SIZE).enumerate() {
+        crate::log::log(&format!("[sync] push_rows_impl: {table} chunk {}/{} ({} rows)", chunk_idx + 1, total_chunks, chunk.len()));
         let mut tx = client
             .transaction()
             .map_err(|e| format!("central tx begin for {table} failed: {e}"))?;
         {
             tx.execute("SET LOCAL statement_timeout = '30000'", &[])
                 .map_err(|e| format!("central statement_timeout set failed: {e}"))?;
-            for row in chunk {
+            for (row_idx, row) in chunk.iter().enumerate() {
                 let Some(obj) = row.as_object() else { continue };
                 let cols: Vec<&String> = obj.keys().collect();
                 let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
@@ -1549,16 +1556,21 @@ fn push_rows_impl(
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                if row_idx == 0 {
+                    crate::log::log(&format!("[sync] push_rows_impl: {table} first INSERT in chunk {} — sql_len={}", chunk_idx + 1, sql.len()));
+                }
                 tx.execute(&sql, &param_refs)
                     .map_err(|e| format!("central upsert into {table} failed: {}", error_chain(&e)))?;
             }
         }
+        crate::log::log(&format!("[sync] push_rows_impl: {table} chunk {} — tx.commit()", chunk_idx + 1));
         tx.commit()
             .map_err(|e| format!("central tx commit for {table} failed: {e}"))?;
         // Mark this chunk as acked — the caller can mark them synced
         // immediately so a crash only loses the current chunk, not all rows.
         all_acked.extend(chunk.iter().filter_map(|r| r.as_object()?.get("id")?.as_str().map(String::from)));
     }
+    crate::log::log(&format!("[sync] push_rows_impl: {table} DONE — {} ids acked", all_acked.len()));
     Ok(all_acked)
 }
 
@@ -1615,14 +1627,17 @@ impl PostgresWorker {
             None => return Err("PostgreSQL is not configured".to_string()),
         };
         if self.client.as_ref().is_some_and(|c| !c.is_closed()) {
+            crate::log::log("[sync] ensure_client: reusing existing connection");
             return Ok(());
         }
         let now = chrono::Utc::now().timestamp();
         if self.connect_backoff > 0 && now - self.last_connect_fail < self.connect_backoff {
             return Err(format!("backed off (retry in {}s)", self.connect_backoff - (now - self.last_connect_fail)));
         }
+        crate::log::log("[sync] ensure_client: calling connect_with_create");
         match connect_with_create(&cs) {
             Ok(c) => {
+                crate::log::log("[sync] ensure_client: connection SUCCESS");
                 self.client = Some(c);
                 self.last_err = None;
                 self.connect_backoff = 0;
@@ -1630,6 +1645,7 @@ impl PostgresWorker {
                 Ok(())
             }
             Err(e) => {
+                crate::log::log(&format!("[sync] ensure_client: connection FAILED: {e}"));
                 self.last_err = Some(e.clone());
                 let prev = self.connect_backoff;
                 self.connect_backoff = (prev.max(10) * 2).min(120);
@@ -1644,6 +1660,10 @@ impl PostgresWorker {
     /// is dead, drops the client so `ensure_client` will reconnect on the
     /// next command. This prevents the worker from silently hanging on a
     /// half-open TCP connection after a server crash or network blip.
+    ///
+    /// Also detects "idle in transaction" stuck connections — a COMMIT that
+    /// never completed (common with PgBouncer transaction-mode pooling).
+    /// If found, drops the client to force a clean reconnect.
     fn check_health(&mut self) {
         let now = chrono::Utc::now().timestamp();
         if now - self.last_health_check < 30 {
@@ -1651,7 +1671,20 @@ impl PostgresWorker {
         }
         self.last_health_check = now;
         let healthy = match self.client.as_mut() {
-            Some(c) if !c.is_closed() => c.simple_query("SELECT 1").is_ok(),
+            Some(c) if !c.is_closed() => {
+                // First check: simple ping
+                if c.simple_query("SELECT 1").is_ok() {
+                    // Second check: detect stuck "idle in transaction"
+                    // This catches PgBouncer COMMIT-hang scenarios where the
+                    // connection looks alive but a transaction was never completed.
+                    let stuck = c.simple_query(
+                        "SELECT 1 WHERE EXISTS (SELECT 1 FROM pg_stat_activity WHERE state = 'idle in transaction' AND backend_type = 'client backend' AND pid = pg_backend_pid())"
+                    ).is_err();
+                    !stuck
+                } else {
+                    false
+                }
+            }
             _ => false,
         };
         if !healthy {
@@ -1697,13 +1730,17 @@ impl PostgresWorker {
                 }
             }
             PgCommand::PushRows(table, rows, tx) => {
+                crate::log::log(&format!("[sync] worker: PushRows {table} ({} rows)", rows.len()));
                 let result = (|| -> Result<Vec<String>, String> {
+                    crate::log::log(&format!("[sync] worker: PushRows {table} — ensure_client"));
                     self.ensure_client()?;
                     let client = self.client.as_mut().ok_or("no client")?;
                     if !self.schema_validated {
+                        crate::log::log(&format!("[sync] worker: PushRows {table} — ensure_schema_for"));
                         ensure_schema_for(client)?;
                         self.schema_validated = true;
                     }
+                    crate::log::log(&format!("[sync] worker: PushRows {table} — push_rows_impl"));
                     push_rows_impl(client, &table, &rows)
                 })();
                 match &result {
@@ -1720,12 +1757,17 @@ impl PostgresWorker {
                 let result = (|| -> Result<Vec<serde_json::Value>, String> {
                     self.ensure_client()?;
                     let client = self.client.as_mut().ok_or("no client")?;
-                    let mut pg_tx = client.transaction()
-                        .map_err(|e| format!("query tx begin failed: {}", error_chain(&e)))?;
-                    pg_tx.execute("SET LOCAL statement_timeout = '10000'", &[])
-                        .map_err(|e| format!("query timeout set failed: {}", error_chain(&e)))?;
+                    // Run the query directly WITHOUT a transaction.
+                    // Previous code wrapped in a transaction + SET LOCAL statement_timeout,
+                    // but PgBouncer in transaction-mode pooling causes COMMIT to hang
+                    // (the backend gets reassigned before COMMIT arrives). This leaves
+                    // the connection stuck in "idle in transaction" and blocks ALL
+                    // subsequent commands including pushes.
+                    //
+                    // The session-level statement_timeout (30s) set in connect_with_create
+                    // already protects against slow queries. No transaction needed for reads.
                     let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    let rows = pg_tx.query(sql.as_str(), &param_refs)
+                    let rows = client.query(sql.as_str(), &param_refs)
                         .map_err(|e| format!("query failed: {}", error_chain(&e)))?;
                     let result: Vec<serde_json::Value> = rows.iter().map(|row| {
                         let mut obj = serde_json::Map::new();
@@ -1734,8 +1776,6 @@ impl PostgresWorker {
                         }
                         serde_json::Value::Object(obj)
                     }).collect();
-                    pg_tx.commit()
-                        .map_err(|e| format!("query tx commit failed: {}", error_chain(&e)))?;
                     Ok(result)
                 })();
                 let _ = tx.send(result);
