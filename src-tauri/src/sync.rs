@@ -1413,8 +1413,8 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
     // dropped connection (server crash, network outage) causes every push
     // and pull to block indefinitely.
     config.keepalives(true);
-    config.keepalives_idle(std::time::Duration::from_secs(30));
-    config.keepalives_interval(std::time::Duration::from_secs(5));
+    config.keepalives_idle(std::time::Duration::from_secs(10));
+    config.keepalives_interval(std::time::Duration::from_secs(3));
     let tls = make_tls_connector()?;
     let make_client = |cfg: &mut postgres::Config| -> Result<postgres::Client, String> {
         let mut c = cfg.connect(tls.clone()).map_err(|e| {
@@ -1760,6 +1760,7 @@ fn spawn_pg_worker(
     shared_err: std::sync::Arc<Mutex<Option<String>>>,
     is_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    busy_since: std::sync::Arc<Mutex<Option<std::time::Instant>>>,
 ) -> Sender<PgCommand> {
     let (tx, rx) = std::sync::mpsc::channel::<PgCommand>();
     let worker_tx = tx.clone();
@@ -1770,12 +1771,14 @@ fn spawn_pg_worker(
             while let Ok(cmd) = rx.recv() {
                 let is_stop = matches!(cmd, PgCommand::Stop);
                 is_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut bs) = busy_since.lock() { *bs = Some(std::time::Instant::now()); }
                 // Proactively detect dead connections before processing each
                 // command. Without this, a half-open TCP socket causes every
                 // push/pull to block indefinitely.
                 worker.check_health();
                 worker.handle(cmd);
                 is_busy.store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut bs) = busy_since.lock() { *bs = None; }
                 // Push the worker's last_err into the shared cache so
                 // RealPostgres::last_error() can read it without sending
                 // a command to this thread (which blocks up to WORKER_TIMEOUT).
@@ -1811,6 +1814,9 @@ pub struct RealPostgres {
     /// This prevents sync_status (called on EVERY page mount) from
     /// blocking up to 5 seconds when the worker is busy.
     cached_last_err: Arc<Mutex<Option<String>>>,
+    /// Timestamp when the worker started its current command. Used by
+    /// push_rows() to detect a stuck worker (>60s) and force-clear is_busy.
+    busy_since: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl RealPostgres {
@@ -1818,13 +1824,15 @@ impl RealPostgres {
         let shared_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let is_connected: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let is_busy: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tx = spawn_pg_worker(shared_err.clone(), is_connected.clone(), is_busy.clone());
+        let busy_since: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let tx = spawn_pg_worker(shared_err.clone(), is_connected.clone(), is_busy.clone(), busy_since.clone());
         Self {
             tx,
             is_connected,
             is_configured: std::sync::atomic::AtomicBool::new(false),
             is_busy,
             cached_last_err: shared_err,
+            busy_since,
         }
     }
 
@@ -1874,11 +1882,26 @@ impl PostgresAdapter for RealPostgres {
         self.is_connected.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn push_rows(&self, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
-        // Don't queue a push if the worker is still processing the previous one.
-        // Without this, every 10s poller cycle would queue another push,
-        // building up a backlog of identical pushes.
-        if self.is_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Err(format!("{table} push deferred — worker busy (will retry next cycle)"));
+        // If the worker is busy, check if it's been stuck for >60s.
+        // This happens when a QueryRows blocks on a dead connection and
+        // the worker thread never returns. Force-clear is_busy so we can
+        // retry (the stuck worker will eventually fail and reset itself).
+        if self.is_busy.load(std::sync::atomic::Ordering::Relaxed) {
+            let stuck = self.busy_since.lock()
+                .ok()
+                .and_then(|bs| *bs)
+                .map(|t| t.elapsed().as_secs() > 60)
+                .unwrap_or(false);
+            if stuck {
+                crate::log::log(&format!("[sync] {table}: worker stuck >60s, force-clearing is_busy"));
+                self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                return Err(format!("{table} push deferred — worker busy (will retry next cycle)"));
+            }
+        }
+        // Mark as busy now (only if not already set by the force-clear above).
+        if !self.is_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(mut bs) = self.busy_since.lock() { *bs = Some(std::time::Instant::now()); }
         }
         let (tx, rx) = std::sync::mpsc::channel();
         // Give push_rows up to 120 seconds for large batches over remote TLS.
@@ -1893,11 +1916,13 @@ impl PostgresAdapter for RealPostgres {
             None => {
                 // Worker timed out — clear is_busy so next cycle can retry.
                 self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
                 Err(format!("{table} push timed out — retrying next cycle"))
             }
         };
         // Always clear is_busy.
         self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
         result
     }
     fn configure(&self, conn_string: Option<String>) -> Result<(), String> {
@@ -1916,14 +1941,24 @@ impl PostgresAdapter for RealPostgres {
         let (tx, rx) = std::sync::mpsc::channel();
         match self.send_timeout(PgCommand::DeleteRows(table.to_string(), ids.to_vec(), tx), rx, std::time::Duration::from_secs(15)) {
             Some(result) => result,
-            None => Err(format!("{table} delete deferred — worker busy")),
+            None => {
+                // Worker timed out — clear is_busy so the next push can proceed.
+                self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
+                Err(format!("{table} delete deferred — worker busy"))
+            }
         }
     }
     fn query_rows(&self, sql: &str, params: &[String]) -> Result<Vec<serde_json::Value>, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         match self.send_timeout(PgCommand::QueryRows(sql.to_string(), params.to_vec(), tx), rx, std::time::Duration::from_secs(15)) {
             Some(result) => result,
-            None => Err("PostgreSQL query timed out — falling back to local data".to_string()),
+            None => {
+                // Worker timed out — clear is_busy so the next push can proceed.
+                self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
+                Err("PostgreSQL query timed out — falling back to local data".to_string())
+            }
         }
     }
 }

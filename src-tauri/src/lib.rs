@@ -697,7 +697,10 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
             }
 
             // ── Postgres pull (central → local) ──────────────────────────
-            if pg.configured() {
+            // Skip pulls when PG is not connected or the worker is still busy
+            // from a previous stuck query. Pulls are optional (local data works
+            // fine) and a stuck pull blocks ALL pushes indefinitely.
+            if pg.configured() && pg.connected() {
                 for &table in sync::REFERENCE_TABLES {
                     let last_pull = {
                         let Ok(conn) = sync_db.try_lock() else { continue };
