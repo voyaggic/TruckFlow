@@ -1558,26 +1558,13 @@ fn push_rows_impl(
     rows: &[serde_json::Value],
 ) -> Result<Vec<String>, String> {
     crate::log::log(&format!("[sync] push_rows_impl: table={table} rows={}", rows.len()));
-    // Phase 1: deduplicate ALTER TABLE — one round-trip per unique dynamic column.
-    let mut seen_dynamic: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Skip ALTER TABLE phase entirely. Over PgBouncer, DDL statements
+    // hang for 40+ seconds and block all subsequent pushes. Dynamic
+    // columns that dont exist yet will cause the INSERT to fail with
+    // "column does not exist", which is non-fatal - the error is logged
+    // and the next sync cycle retries. Missing columns can be added
+    // manually via Supabase SQL Editor if needed.
     let base = base_columns(table);
-    let mut alter_count = 0u32;
-    for row in rows {
-        let Some(obj) = row.as_object() else { continue };
-        for key in obj.keys() {
-            if key != "id" && !base.contains(&key.as_str()) && seen_dynamic.insert(key.clone()) {
-                crate::log::log(&format!("[sync] push_rows_impl: ALTER TABLE {table} ADD COLUMN {key}"));
-                client
-                    .batch_execute(&format!(
-                        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
-                        pg_quote_ident(table), pg_quote_ident(key)
-                    ))
-                    .map_err(|e| format!("central column add for {table}.{key} failed: {e}"))?;
-                alter_count += 1;
-            }
-        }
-    }
-    crate::log::log(&format!("[sync] push_rows_impl: {table} ALTER TABLE done ({alter_count} columns added)"));
     // Phase 2: batch upsert — multi-row INSERT for speed.
     // Collect the union of ALL column names across all rows, then
     // insert in batches. Each batch is ONE round-trip instead of N.
