@@ -1381,6 +1381,30 @@ fn error_chain(e: &(dyn std::error::Error + Send + Sync)) -> String {
     msg
 }
 
+/// Convert a JSON value to a SQL literal for embedding in simple queries.
+/// This avoids the extended query protocol that PgBouncer may not support.
+fn pg_literal(v: &serde_json::Value, ty: &str) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+        serde_json::Value::Number(n) => {
+            match ty {
+                "INTEGER" => n.as_i64().map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()),
+                "DOUBLE PRECISION" => n.as_f64().map(|x| format!("{x}")).unwrap_or_else(|| "NULL".to_string()),
+                _ => n.as_f64().map(|x| format!("{x}")).unwrap_or_else(|| "NULL".to_string()),
+            }
+        }
+        serde_json::Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("'{escaped}'")
+        }
+        other => {
+            let s = other.to_string().replace('\\', "\\\\").replace('"', "\\\"");
+            format!("'{s}'")
+        }
+    }
+}
+
 fn to_pg_param(v: &serde_json::Value, ty: &str) -> Box<dyn ToSql + Sync> {
     match ty {
         // i32 accepts INT2/INT4; the synced-style flags are 0/1 so the smaller
@@ -1629,13 +1653,32 @@ fn push_rows_impl(
         );
         let param_refs: Vec<&(dyn ToSql + Sync)> = flat_params.iter().map(|b| b.as_ref()).collect();
 
-        // Log SQL shape for first batch (not values — too large).
+        // Use batch_execute (simple query protocol) instead of
+        // execute (extended query protocol). PgBouncer in transaction-mode
+        // may not fully support the extended protocol for DML, causing
+        // the connection to hang and get killed by the server.
+        // Embed values directly as SQL literals.
         if batch_start == 0 {
-            crate::log::log(&format!("[sync] push_rows_impl: {table} batch SQL: {} cols, {} params, {} rows",
-                col_count, param_refs.len(), batch_len));
+            crate::log::log(&format!("[sync] push_rows_impl: {table} batch: {} cols, {} rows, simple protocol",
+                col_count, batch_len));
         }
+        // Build VALUES clause with literal values instead of $N params.
+        let mut value_rows: Vec<String> = Vec::with_capacity(batch_len);
+        for row in batch {
+            let obj = row.as_object();
+            let vals: Vec<String> = all_cols.iter().map(|col_name| {
+                let v = obj.and_then(|o| o.get(col_name.as_str())).unwrap_or(&serde_json::Value::Null);
+                pg_literal(v, pg_column_type(table, col_name))
+            }).collect();
+            value_rows.push(format!("({})", vals.join(", ")));
+        }
+        let simple_sql = format!(
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT (\"id\") DO UPDATE SET {}",
+            pg_quote_ident(table), col_list,
+            value_rows.join(", "), update_set
+        );
 
-        match client.execute(&sql, &param_refs) {
+        match client.batch_execute(&simple_sql) {
             Ok(_) => {
                 for row in batch {
                     if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
@@ -1648,28 +1691,29 @@ fn push_rows_impl(
                 let batch_info = format!("rows {}-{}", batch_start, batch_end - 1);
                 if error_count <= 3 {
                     crate::log::log(&format!("[sync] push_rows_impl: {table} batch {batch_info} failed: {}", error_chain(&e)));
+                    // Log first 200 chars of SQL for debugging.
+                    if simple_sql.len() > 200 {
+                        crate::log::log(&format!("[sync] push_rows_impl: {table} SQL (truncated): {}...", &simple_sql[..200]));
+                    }
                 }
-                // Fallback: try individual INSERTs for this batch so we
-                // can recover as many rows as possible.
-                for (row_idx, row) in batch.iter().enumerate() {
+                // Fallback: try individual INSERTs with simple protocol.
+                for (_row_idx, row) in batch.iter().enumerate() {
                     let Some(obj) = row.as_object() else { continue };
                     let cols: Vec<&String> = obj.keys().collect();
-                    let ph: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
-                    let params: Vec<Box<dyn ToSql + Sync>> = cols
-                        .iter()
-                        .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
-                        .collect();
-                    let pr: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+                    let col_list_f: String = cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    let vals: Vec<String> = cols.iter().map(|c| {
+                        let v = obj.get(*c).unwrap_or(&serde_json::Value::Null);
+                        pg_literal(v, pg_column_type(table, c))
+                    }).collect();
+                    let update_set_f: String = cols.iter().filter(|c| c.as_str() != "id")
+                        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+                        .collect::<Vec<_>>().join(", ");
                     let fallback_sql = format!(
                         "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
-                        pg_quote_ident(table),
-                        cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
-                        ph.join(", "),
-                        cols.iter().filter(|c| c.as_str() != "id")
-                            .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
-                            .collect::<Vec<_>>().join(", ")
+                        pg_quote_ident(table), col_list_f,
+                        vals.join(", "), update_set_f
                     );
-                    if client.execute(&fallback_sql, &pr).is_ok() {
+                    if client.batch_execute(&fallback_sql).is_ok() {
                         if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
                             all_acked.push(id.to_string());
                         }
@@ -1678,6 +1722,7 @@ fn push_rows_impl(
             }
         }
     }
+
     if error_count > 0 {
         crate::log::log(&format!("[sync] push_rows_impl: {table} {}/{} rows succeeded ({} batch errors, retried individually)", all_acked.len(), total_rows, error_count));
     }
