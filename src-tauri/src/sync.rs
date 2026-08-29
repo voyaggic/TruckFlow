@@ -1427,7 +1427,10 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
         // Set a statement timeout so individual queries can't hang forever.
         // This prevents the client Mutex from being held indefinitely when
         // Supabase / PgBouncer drops a backend connection silently.
-        c.execute("SET statement_timeout = '30000'", &[])
+        // 15s timeout: fast enough to detect dead connections, still
+        // allows normal Supabase queries (<2s typical). TCP keepalive
+        // (idle=10s, interval=3s) provides a second detection layer.
+        c.execute("SET statement_timeout = '15000'", &[])
             .map_err(|e| format!("cannot set statement_timeout: {e}"))?;
         Ok(c)
     };
@@ -1488,16 +1491,11 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
 }/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
 /// idempotent (ON CONFLICT DO UPDATE) so a mid-batch failure is safe to retry.
 ///
-/// Batching strategy:
-///   1. Collect ALL unique dynamic column names across all rows first, then
-///      run ALTER TABLE once per unique column (instead of per row × column).
-///   2. Wrap all INSERTs in a single transaction and execute them via
-///      batch_execute — one network round-trip instead of N.
-/// Maximum rows per transaction chunk. 327 rows in a single transaction
-/// exceeds Supabase/PgBouncer's idle-in-transaction timeout and causes
-/// infinite retry loops. Chunks of 50 keep each commit under 5 seconds.
-const PG_CHUNK_SIZE: usize = 50;
-
+/// IMPORTANT: No transactions are used here. PgBouncer in transaction-mode
+/// pooling causes COMMIT to hang when the backend is reassigned between the
+/// INSERT and the COMMIT. Since each INSERT is idempotent (ON CONFLICT DO
+/// UPDATE), a partial failure is safe — the next sync cycle retries the
+/// remaining rows. This eliminates the primary cause of worker hangs.
 fn push_rows_impl(
     client: &mut postgres::Client,
     table: &str,
@@ -1524,53 +1522,52 @@ fn push_rows_impl(
         }
     }
     crate::log::log(&format!("[sync] push_rows_impl: {table} ALTER TABLE done ({alter_count} columns added)"));
-    // Phase 2: upsert in chunks — each chunk is its own transaction so a
-    // timeout on chunk 3 doesn't lose the work from chunks 1-2.
+    // Phase 2: upsert each row individually — no transaction.
+    // Each INSERT is idempotent (ON CONFLICT DO UPDATE) so a partial
+    // failure is safe. The next sync cycle retries unsynced rows.
+    // This avoids the PgBouncer COMMIT-hang that caused the worker
+    // to block forever when using client.transaction().
     let mut all_acked: Vec<String> = Vec::new();
-    let total_chunks = (rows.len() + PG_CHUNK_SIZE - 1) / PG_CHUNK_SIZE;
-    for (chunk_idx, chunk) in rows.chunks(PG_CHUNK_SIZE).enumerate() {
-        crate::log::log(&format!("[sync] push_rows_impl: {table} chunk {}/{} ({} rows)", chunk_idx + 1, total_chunks, chunk.len()));
-        let mut tx = client
-            .transaction()
-            .map_err(|e| format!("central tx begin for {table} failed: {e}"))?;
-        {
-            tx.execute("SET LOCAL statement_timeout = '30000'", &[])
-                .map_err(|e| format!("central statement_timeout set failed: {e}"))?;
-            for (row_idx, row) in chunk.iter().enumerate() {
-                let Some(obj) = row.as_object() else { continue };
-                let cols: Vec<&String> = obj.keys().collect();
-                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
-                let params: Vec<Box<dyn ToSql + Sync>> = cols
-                    .iter()
-                    .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
-                    .collect();
-                let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
-                let sql = format!(
-                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
-                    pg_quote_ident(table),
-                    cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
-                    placeholders.join(", "),
-                    cols.iter()
-                        .filter(|c| c.as_str() != "id")
-                        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if row_idx == 0 {
-                    crate::log::log(&format!("[sync] push_rows_impl: {table} first INSERT in chunk {} — sql_len={}", chunk_idx + 1, sql.len()));
+    let mut error_count = 0u32;
+    for (row_idx, row) in rows.iter().enumerate() {
+        let Some(obj) = row.as_object() else { continue };
+        let cols: Vec<&String> = obj.keys().collect();
+        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+        let params: Vec<Box<dyn ToSql + Sync>> = cols
+            .iter()
+            .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
+            .collect();
+        let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
+            pg_quote_ident(table),
+            cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
+            placeholders.join(", "),
+            cols.iter()
+                .filter(|c| c.as_str() != "id")
+                .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        match client.execute(&sql, &param_refs) {
+            Ok(_) => {
+                if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                    all_acked.push(id.to_string());
                 }
-                tx.execute(&sql, &param_refs)
-                    .map_err(|e| format!("central upsert into {table} failed: {}", error_chain(&e)))?;
+            }
+            Err(e) => {
+                error_count += 1;
+                // Log but continue — other rows may still succeed.
+                if error_count <= 3 {
+                    crate::log::log(&format!("[sync] push_rows_impl: {table} row {row_idx} failed: {}", error_chain(&e)));
+                }
             }
         }
-        crate::log::log(&format!("[sync] push_rows_impl: {table} chunk {} — tx.commit()", chunk_idx + 1));
-        tx.commit()
-            .map_err(|e| format!("central tx commit for {table} failed: {e}"))?;
-        // Mark this chunk as acked — the caller can mark them synced
-        // immediately so a crash only loses the current chunk, not all rows.
-        all_acked.extend(chunk.iter().filter_map(|r| r.as_object()?.get("id")?.as_str().map(String::from)));
     }
-    crate::log::log(&format!("[sync] push_rows_impl: {table} DONE — {} ids acked", all_acked.len()));
+    if error_count > 0 {
+        crate::log::log(&format!("[sync] push_rows_impl: {table} {}/{} rows succeeded, {} failed", all_acked.len(), rows.len(), error_count));
+    }
+    crate::log::log(&format!("[sync] push_rows_impl: {table} DONE — {} ids acked ({} errors)", all_acked.len(), error_count));
     Ok(all_acked)
 }
 
@@ -1665,30 +1662,17 @@ impl PostgresWorker {
     /// never completed (common with PgBouncer transaction-mode pooling).
     /// If found, drops the client to force a clean reconnect.
     fn check_health(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        if now - self.last_health_check < 30 {
-            return; // rate-limited
-        }
-        self.last_health_check = now;
-        let healthy = match self.client.as_mut() {
-            Some(c) if !c.is_closed() => {
-                // First check: simple ping
-                if c.simple_query("SELECT 1").is_ok() {
-                    // Second check: detect stuck "idle in transaction"
-                    // This catches PgBouncer COMMIT-hang scenarios where the
-                    // connection looks alive but a transaction was never completed.
-                    let stuck = c.simple_query(
-                        "SELECT 1 WHERE EXISTS (SELECT 1 FROM pg_stat_activity WHERE state = 'idle in transaction' AND backend_type = 'client backend' AND pid = pg_backend_pid())"
-                    ).is_err();
-                    !stuck
-                } else {
-                    false
-                }
-            }
+        // Non-blocking check: just test if the OS has flagged the connection
+        // as dead. TCP keepalive (idle=10s, interval=3s) handles dead-connection
+        // detection at the OS level. This method does NOT do a network ping
+        // (simple_query can hang on a half-open socket, making the health
+        // check itself a source of worker hangs).
+        let healthy = match self.client.as_ref() {
+            Some(c) if !c.is_closed() => true,
             _ => false,
         };
-        if !healthy {
-            crate::log::log("[sync] pg health check failed — dropping connection, will reconnect");
+        if !healthy && self.client.is_some() {
+            crate::log::log("[sync] pg health check: connection dead — dropping, will reconnect");
             self.client = None;
             self.schema_validated = false;
             self.last_err = Some("connection lost, reconnecting".to_string());
@@ -1815,11 +1799,15 @@ fn spawn_pg_worker(
                 let is_stop = matches!(cmd, PgCommand::Stop);
                 is_busy.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut bs) = busy_since.lock() { *bs = Some(std::time::Instant::now()); }
-                // Proactively detect dead connections before processing each
-                // command. Without this, a half-open TCP socket causes every
-                // push/pull to block indefinitely.
                 worker.check_health();
+                let cmd_start = std::time::Instant::now();
                 worker.handle(cmd);
+                let elapsed = cmd_start.elapsed().as_secs();
+                if elapsed > 20 {
+                    crate::log::log(&format!("[sync] worker: command took {elapsed}s — possible hang, resetting connection"));
+                    worker.client = None;
+                    worker.schema_validated = false;
+                }
                 is_busy.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut bs) = busy_since.lock() { *bs = None; }
                 // Push the worker's last_err into the shared cache so
