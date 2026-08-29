@@ -1474,6 +1474,8 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
 /// table gets a PRIMARY KEY on `id` (and an idempotent unique index, so a
 /// table that already exists without the constraint is still upsert-safe).
 fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut tables_ok = 0u32;
     for (table, _display) in PG_SYNC_TABLES {
         let defs: Vec<String> = base_columns(table)
             .iter()
@@ -1485,22 +1487,39 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
                 }
             })
             .collect();
-        client
-            .batch_execute(&format!(
-                "CREATE TABLE IF NOT EXISTS {} ({})",
-                pg_quote_ident(table),
-                defs.join(", ")
-            ))
-            .map_err(|e| format!("central schema for {table} failed: {e}"))?;
-        client
-            .batch_execute(&format!(
-                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\")",
-                pg_quote_ident(&format!("{table}_id_key")),
-                pg_quote_ident(table)
-            ))
-            .map_err(|e| format!("central id index for {table} failed: {e}"))?;
+        // Log but continue on failure — over an unstable connection,
+        // one table's DDL might fail while others succeed. The next
+        // push attempt will retry the remaining tables.
+        if let Err(e) = client.batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {} ({})",
+            pg_quote_ident(table),
+            defs.join(", ")
+        )) {
+            errors.push(format!("{table} CREATE TABLE: {e}"));
+            continue;
+        }
+        if let Err(e) = client.batch_execute(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\")",
+            pg_quote_ident(&format!("{table}_id_key")),
+            pg_quote_ident(table)
+        )) {
+            errors.push(format!("{table} CREATE INDEX: {e}"));
+            // Index failure is non-fatal — table exists, rows can still be upserted
+        }
+        tables_ok += 1;
     }
-    Ok(())
+    if errors.is_empty() {
+        crate::log::log(&format!("[sync] ensure_schema_for: all {tables_ok} tables OK"));
+        Ok(())
+    } else if tables_ok > 0 {
+        // Partial success — some tables created, others failed.
+        // The next push will retry the remaining tables.
+        crate::log::log(&format!("[sync] ensure_schema_for: {tables_ok} tables OK, {} errors: {}",
+            errors.len(), errors.join("; ")));
+        Ok(()) // Don't abort — partial schema is fine
+    } else {
+        Err(format!("ensure_schema_for failed for all tables: {}", errors.join("; ")))
+    }
 }/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
 /// idempotent (ON CONFLICT DO UPDATE) so a mid-batch failure is safe to retry.
 ///
@@ -1735,7 +1754,12 @@ impl PostgresWorker {
                 self.client = Some(c);
                 self.last_err = None;
                 self.connect_backoff = 0;
-                self.schema_validated = false;
+                // Do NOT reset schema_validated here. The schema only
+                // needs validation once per configure() call (user changed
+                // connection string). Resetting on every reconnect caused
+                // ensure_schema_for to run on EVERY push attempt — over
+                // an unstable connection, this created an infinite loop
+                // of: connect → schema fail → reconnect → schema fail → …
                 Ok(())
             }
             Err(e) => {
@@ -1946,7 +1970,9 @@ fn spawn_pg_worker(
                 if elapsed > 20 {
                     crate::log::log(&format!("[sync] worker: command took {elapsed}s — possible hang, resetting connection"));
                     worker.client = None;
-                    worker.schema_validated = false;
+                    // Do NOT reset schema_validated — schema only changes
+                    // on explicit configure(). Resetting here causes the
+                    // ensure_schema_for loop that blocks all pushes.
                 }
                 is_busy.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut bs) = busy_since.lock() { *bs = None; }

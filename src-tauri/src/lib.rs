@@ -654,30 +654,15 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                 }
             }
 
-            // ── Auto-reconnect probe ──────────────────────────────────────
-            // When PG is configured but offline (connection dropped, internet
-            // returned after hours/days/months), proactively trigger a
-            // reconnect so sync resumes automatically. The worker's
-            // ensure_client() handles backoff internally — this just ensures
-            // a reconnect attempt happens every poller cycle instead of only
-            // when a push is attempted.
-            if pg.configured() && !pg.connected() {
-                // Non-blocking: configure() sends to the worker and waits up
-                // to 15s. If the worker is busy, it queues behind the current
-                // command. Either way, the worker will attempt ensure_client().
-                let conn_string = {
-                    let conn = match sync_db.lock() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    crate::db::get_setting(&conn, "pg_connection_string")
-                };
-                if let Some(cs) = conn_string {
-                    let _ = pg.configure(Some(cs));
-                }
-            }
-
             // ── Postgres push (local → central) ──────────────────────────
+            // Note: Reconnection happens automatically inside push_rows()
+            // via ensure_client(). No separate reconnect probe needed —
+            // calling configure() from the poller would reset
+            // schema_validated and cause ensure_schema_for to run on
+            // every push attempt, creating an infinite loop over an
+            // unstable connection.
+
+
             let mut any_pushed = false;
             for (table, _display) in sync::PG_SYNC_TABLES {
                 // Read unsynced rows from dedicated sync connection.
