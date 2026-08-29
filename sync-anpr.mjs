@@ -29,6 +29,7 @@ const SYNC清单 = [
   "_enum_cameras.py",
   "requirements.txt",
   "config.json",
+  "_test_source.py",
 ];
 
 // Directory to sync recursively

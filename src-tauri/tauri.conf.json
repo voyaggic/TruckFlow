@@ -38,7 +38,8 @@
       "anpr-service/sort.py",
       "anpr-service/_enum_cameras.py",
       "anpr-service/requirements.txt",
-      "anpr-service/config.json"
+      "anpr-service/config.json",
+      "anpr-service/_test_source.py"
     ],
     "windows": {
       "webviewInstallMode": {

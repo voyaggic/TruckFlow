@@ -39,6 +39,10 @@ pub struct AppState {
     pub sheets: Arc<dyn SheetsProvider>,
     /// ANPR service child processes (managed by start/stop commands).
     pub anpr_processes: Arc<Mutex<Vec<std::process::Child>>>,
+    /// Queued mark-synced operations: (table, ids) that were pushed to PG
+    /// but couldn't be marked locally because sync_db was contended.
+    /// Drained at the start of each poller cycle before pushing.
+    pub pending_sync_marks: Arc<Mutex<Vec<(String, Vec<String>)>>>,
 }
 
 pub fn now_iso() -> String {
@@ -64,6 +68,10 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
     let conn = open_db(&db_path)?;
     let sync_conn = open_db(&db_path)?;
     let anpr_conn = open_db(&db_path)?;
+    // Set WAL auto-checkpoint threshold and run initial checkpoint
+    for conn in [&conn, &sync_conn, &anpr_conn] {
+        let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 1000");
+    }
     // Check if user has set a custom frames directory
     let frames_dir = get_setting(&conn, "frames_dir")
         .map(std::path::PathBuf::from)
@@ -84,6 +92,7 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
         sheets,
         anpr_processes: Arc::new(Mutex::new(Vec::new())),
         anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
     })
 }
 
@@ -1062,21 +1071,18 @@ pub const PERMISSION_CATALOG: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
-    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles", "edit_trip"]),
+    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles", "edit_trip", "register_new_vehicle"]),
     (
         "preset-admin",
         "Admin",
         &[
-            "register_new_vehicle",
-            "resolve_queue",
-            "manage_users",
             "manage_reference_database",
+            "manage_users",
             "view_audit_log",
             "manage_integrations",
             "manage_anpr_config",
             "view_reporting_dashboard",
             "view_system_health",
-            "view_gate_entries",
             "acknowledge_health_alerts",
         ],
     ),

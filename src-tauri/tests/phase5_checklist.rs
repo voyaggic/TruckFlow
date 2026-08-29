@@ -1226,6 +1226,7 @@ fn deleting_driver_with_trip_history_does_not_fail_foreign_key() {
         &admin.id,
         "KDH100X",
         &ctx.frames_dir(),
+        None,
     )
     .expect("manual entry matches vehicle")
     .trip

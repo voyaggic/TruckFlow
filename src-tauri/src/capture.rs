@@ -849,9 +849,12 @@ pub fn manual_entry(
     state: State<AppState>,
     plate: String,
     officer_id: String,
+    is_discharge: Option<bool>,
 ) -> Result<IngestResult, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let result = manual_entry_impl(&conn, &officer_id, &plate, &state.frames_dir)?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "edit_trip")
+        .map_err(|_| "Only gate officers with trip editing permissions can create manual entries.".to_string())?;
+    let result = manual_entry_impl(&conn, &officer_id, &plate, &state.frames_dir, is_discharge)?;
     drop(conn);
     emit_capture_update(&app);
     Ok(result)
@@ -865,6 +868,7 @@ pub fn manual_entry_impl(
     officer_id: &str,
     plate: &str,
     frames_dir: &std::path::Path,
+    is_discharge: Option<bool>,
 ) -> Result<IngestResult, String> {
     let frames: Vec<crate::models::AnprFrame> = vec![];
     let read = AnprRead {
@@ -875,7 +879,20 @@ pub fn manual_entry_impl(
         model_version: None,
         ocr_engine: Some("manual".to_string()),
     };
-    ingest_read(conn, Some(officer_id.to_string()), &read, "manual_entry", frames_dir)
+    let mut result = ingest_read(conn, Some(officer_id.to_string()), &read, "manual_entry", frames_dir)?;
+    // If caller provided a discharge classification, set it immediately on
+    // the newly created trip so the user doesn't need a separate classify step.
+    if let Some(is_dis) = is_discharge {
+        if let Some(ref trip) = result.trip {
+            conn.execute(
+                "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2 WHERE id = ?3",
+                params![if is_dis { 1 } else { 0 }, now_iso(), trip.id],
+            )
+            .map_err(|e| format!("discharge classification failed: {e}"))?;
+            result.trip = Some(trip_by_id(conn, &trip.id)?);
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -886,6 +903,8 @@ pub fn approve_trip(
     officer_id: String,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can approve trips.".to_string())?;
     let trip = approve_trip_impl(&conn, &trip_id, &officer_id)?;
     drop(conn);
     emit_capture_update(&app);
@@ -1378,6 +1397,8 @@ pub fn resolve_queued_existing(
     receipt_no: Option<String>,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can resolve queued trips.".to_string())?;
     let trip = resolve_queued_existing_impl(
         &conn,
         &trip_id,
@@ -1441,6 +1462,8 @@ pub fn resolve_queued_new(
     extra_fields: Option<String>,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can resolve queued trips.".to_string())?;
     let trip = resolve_queued_new_impl(
         &conn,
         &trip_id,
@@ -1696,6 +1719,8 @@ pub fn classify_discharge(
     is_discharge: bool,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "edit_trip")
+        .map_err(|_| "Only gate officers with trip editing permissions can classify discharge.".to_string())?;
     let trip = classify_discharge_impl(&conn, &trip_id, &officer_id, is_discharge)?;
     drop(conn);
     emit_capture_update(&app);

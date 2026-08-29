@@ -275,13 +275,16 @@ function ColumnMappingPanel({
   const [editHeader, setEditHeader] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    let cancelled = false;
     api.getSheetColumnMapping().then((m) => {
+      if (cancelled) return;
       setMapping(m);
       const h: Record<string, string> = {};
       m.forEach((e) => (h[e.field_key] = e.header));
       setEditHeader(h);
       setLoading(false);
     });
+    return () => { cancelled = true; };
   }, []);
 
   const save = () => {

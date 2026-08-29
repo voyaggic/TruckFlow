@@ -46,6 +46,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
   const [resolving, setResolving] = useState<TripView | null>(null);
   const [declineTarget, setDeclineTarget] = useState<TripView | null>(null);
   const [dischargePrompt, setDischargePrompt] = useState<TripView | null>(null);
+  const [pendingManualEntry, setPendingManualEntry] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
   const mountedAt = useRef(Date.now());
 
@@ -85,7 +86,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     setError(null);
     try {
       const logged = await api.approveTrip(trip.id, user.id);
-      if (settings?.discharge_confirmation_required && logged.is_discharge_trip == null) {
+      if (canEditTrip && settings?.discharge_confirmation_required && logged.is_discharge_trip == null) {
         setDischargePrompt(logged);
       } else {
         setFlash(`Trip ${trip.plate_number} approved`);
@@ -134,18 +135,19 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     setError(null);
     const plate = manualPlate.trim();
     if (!plate) return;
+    // Two-phase: if the officer can edit trips and discharge classification
+    // is required, ask FIRST — the trip is created with the answer baked in,
+    // so no separate classify step is needed afterward.
+    if (canEditTrip && settings?.discharge_confirmation_required) {
+      setPendingManualEntry(plate);
+      return;
+    }
     try {
       const res = await api.manualEntry(plate, user.id);
       setFlash(res.message);
       setTimeout(() => setFlash(null), 2500);
       setManualPlate("");
-      // Manual entries always require discharge Yes/No + Confirm before they
-      // are eligible to reach Google Sheets; unclassified trips stay local.
-      if (res.trip && res.trip.status === "logged" && res.trip.is_discharge_trip == null) {
-        setDischargePrompt(res.trip);
-      } else {
-        refreshBg();
-      }
+      refreshBg();
     } catch (e) {
       setError(String(e));
       setTimeout(() => setError(null), 6000);
@@ -319,9 +321,15 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
               settings?.discharge_confirmation_required && (
                 <div className="row" style={{ marginTop: 14, gap: 8 }}>
                   <span className="muted small">Was this a discharge trip?</span>
-                  <button className="primary" onClick={() => setDischargePrompt(current)}>
-                    Classify now
-                  </button>
+                  {canEditTrip ? (
+                    <button className="primary" onClick={() => setDischargePrompt(current)}>
+                      Classify now
+                    </button>
+                  ) : (
+                    <button className="primary" disabled title="Only gate officers can classify discharge">
+                      Classify now
+                    </button>
+                  )}
                 </div>
               )}
           </div>
@@ -522,9 +530,13 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
                   <td>{statusLabel(t.status)}</td>
                   <td>
                     {t.status === "logged" && t.is_discharge_trip == null && settings?.discharge_confirmation_required ? (
-                      <button className="ghost" onClick={() => setDischargePrompt(t)}>
-                        Classify
-                      </button>
+                      canEditTrip ? (
+                        <button className="ghost" onClick={() => setDischargePrompt(t)}>
+                          Classify
+                        </button>
+                      ) : (
+                        <span className="badge">Pending</span>
+                      )
                     ) : t.is_discharge_trip == null ? (
                       "—"
                     ) : t.is_discharge_trip ? (
@@ -605,6 +617,56 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
             setDischargePrompt(null);
             refresh().catch((e) => setError(String(e)));
           }}
+          canEditTrip={canEditTrip}
+        />
+      )}
+
+      {pendingManualEntry && (
+        <DischargeStep
+          trip={{
+            id: "",
+            plate_number: pendingManualEntry,
+            entry_time: new Date().toISOString(),
+            time_in: new Date().toISOString(),
+            trip_status: "open",
+            status: "logged",
+            capture_method: "manual_entry",
+            company_id: null,
+            company_name: null,
+            driver_id: null,
+            driver_name: null,
+            capacity_at_trip: null,
+            capacity_unit: "litres",
+            receipt_no: null,
+            officer_id: user.id,
+            officer_name: user.name,
+            confidence_score: null,
+            entry_photo_count: 0,
+            exit_photo_count: 0,
+            photo_count: 0,
+            reason: null,
+            candidates: [],
+            is_discharge_trip: null,
+            model_version: null,
+            ocr_engine: "manual",
+            exit_time: null,
+            vehicle_id: null,
+          } as TripView}
+          onConfirm={async (isDischarge) => {
+            try {
+              const res = await api.manualEntry(pendingManualEntry, user.id, isDischarge);
+              setFlash(res.message);
+              setTimeout(() => setFlash(null), 2500);
+              setManualPlate("");
+              setPendingManualEntry(null);
+              refreshBg();
+            } catch (e) {
+              setError(String(e));
+              setTimeout(() => setError(null), 6000);
+            }
+          }}
+          onClose={() => setPendingManualEntry(null)}
+          canEditTrip={canEditTrip}
         />
       )}
     </div>
@@ -1135,17 +1197,19 @@ function DischargeStep({
   trip,
   onConfirm,
   onClose,
+  canEditTrip,
 }: {
   trip: TripView;
   onConfirm: (isDischarge: boolean) => Promise<void>;
   onClose: () => void;
+  canEditTrip: boolean;
 }) {
   const [pick, setPick] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const run = async () => {
-    if (pick == null) return;
+    if (pick == null || !canEditTrip) return;
     setBusy(true);
     setError(null);
     try {
@@ -1165,16 +1229,18 @@ function DischargeStep({
           Plate <b className="plate-font">{trip.plate_number}</b> · entry {fmtDateTime(trip.entry_time)}{trip.exit_time ? ` · exit ${fmtDateTime(trip.exit_time)}` : ""} · <span className={`badge ${trip.trip_status === 'complete' ? 'active' : trip.trip_status === 'missed_exit' ? 'disabled' : 'pin'}`}>{trip.trip_status}</span>
         </p>
         <p className="muted small">
-          Discharge classification is a judgment call only the officer on site can make. Nothing is committed until you
-          confirm.
+          Discharge classification is a judgment call only the officer on site can make.
         </p>
         {pick == null ? (
           <div className="row" style={{ marginTop: 14, gap: 8 }}>
-            <button className="primary" onClick={() => setPick(true)} disabled={busy}>
+            <button className="primary" onClick={() => setPick(true)} disabled={busy || !canEditTrip} title={!canEditTrip ? "Only gate officers can classify discharge" : undefined}>
               Yes — discharge trip
             </button>
-            <button className="ghost" onClick={() => setPick(false)} disabled={busy}>
+            <button className="ghost" onClick={() => setPick(false)} disabled={busy || !canEditTrip} title={!canEditTrip ? "Only gate officers can classify discharge" : undefined}>
               No — non-discharge entry
+            </button>
+            <button className="ghost" onClick={onClose} disabled={busy}>
+              Close
             </button>
           </div>
         ) : (
@@ -1186,11 +1252,14 @@ function DischargeStep({
             </div>
             {error && <div className="error-banner">{error}</div>}
             <div className="row" style={{ marginTop: 14, gap: 8 }}>
-              <button className="primary" onClick={run} disabled={busy}>
+              <button className="primary" onClick={run} disabled={busy || !canEditTrip} title={!canEditTrip ? "Only gate officers can classify discharge" : undefined}>
                 Confirm
               </button>
               <button className="ghost" onClick={() => setPick(null)} disabled={busy}>
-                Cancel
+                Back
+              </button>
+              <button className="ghost" onClick={onClose} disabled={busy}>
+                Close
               </button>
             </div>
           </>

@@ -315,7 +315,7 @@ fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
     ).unwrap();
 
     // Manual entry logs but is UNclassified → must NOT reach the sheet.
-    let manual = manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir())
+    let manual = manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir(), None)
         .unwrap()
         .trip
         .expect("manual exact match logs");
@@ -334,7 +334,7 @@ fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
     assert_eq!(pushed_to_sheets_flag(&conn, &manual.id), 0);
 
     // Another manual entry classified as discharge (Yes) → exported.
-    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir())
+    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir(), None)
         .unwrap()
         .trip
         .expect("manual exact match logs");

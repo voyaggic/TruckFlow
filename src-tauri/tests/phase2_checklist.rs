@@ -340,7 +340,7 @@ fn manual_entry_works_with_anpr_disabled_and_runs_cross_reference() {
     assert!(!settings.anpr_enabled);
 
     // Exact match by typing → logged immediately (manual entries are confirmed by definition).
-    let res = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir()).unwrap();
+    let res = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir(), None).unwrap();
     let trip = res.trip.expect("manual exact match must log");
     assert_eq!(trip.capture_method, "manual_entry");
     assert_eq!(trip.confidence_score, None, "manual entry has no ANPR confidence (04 §8)");
@@ -349,18 +349,18 @@ fn manual_entry_works_with_anpr_disabled_and_runs_cross_reference() {
     assert_eq!(trip.photo_count, 0, "no camera on manual entry — no frames to retain");
 
     // Manual repeat logs normally too — no time-based duplicate blocking (08 §8).
-    let dup = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir()).unwrap();
+    let dup = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir(), None).unwrap();
     let repeat = dup.trip.expect("manual repeat must log like any manual entry");
     assert_eq!(repeat.status, "logged");
     assert_eq!(repeat.plate_number, "A123AB");
 
     // Partial narrowing works identically.
-    let narrowed = manual_entry_impl(&ctx.conn(), &admin.id, "A12*AB", &ctx.frames_dir()).unwrap();
+    let narrowed = manual_entry_impl(&ctx.conn(), &admin.id, "A12*AB", &ctx.frames_dir(), None).unwrap();
     assert_eq!(narrowed.outcome.state, "narrowed");
     assert!(narrowed.trip.is_some());
 
     // Unknown plate queues, never auto-created.
-    let unknown = manual_entry_impl(&ctx.conn(), &admin.id, "X999ZZ", &ctx.frames_dir()).unwrap();
+    let unknown = manual_entry_impl(&ctx.conn(), &admin.id, "X999ZZ", &ctx.frames_dir(), None).unwrap();
     assert_eq!(unknown.queued.expect("unknown manual entry must queue").reason.as_deref(), Some("no_match"));
 
     // Sanity: veh_b is untouched by the above.

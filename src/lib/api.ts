@@ -345,8 +345,8 @@ export const api = {
   simulateRead: (plate: string, confidence: number) =>
     invoke<IngestResult>("simulate_read", { plate, confidence }),
 
-  manualEntry: (plate: string, officerId: string) =>
-    invoke<IngestResult>("manual_entry", { plate, officerId }),
+  manualEntry: (plate: string, officerId: string, isDischarge?: boolean) =>
+    invoke<IngestResult>("manual_entry", { plate, officerId, isDischarge: isDischarge ?? null }),
 
   approveTrip: (tripId: string, officerId: string) =>
     invoke<TripView>("approve_trip", { tripId, officerId }),

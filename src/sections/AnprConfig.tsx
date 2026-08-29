@@ -100,8 +100,26 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
   // stale pipeline mapping, so feeds appeared under the wrong camera name.
   useEffect(() => {
     const unlisten = listen("anpr-started", () => {
-      setTimeout(refreshCore, 2500); // after pipelines connect
-      setTimeout(refreshCore, 7000); // settle pass for slow sources (RTSP)
+      // Poll /health until the service is actually ready
+      let attempts = 0;
+      const pollHealth = async () => {
+        const maxAttempts = 30; // 60 seconds max
+        const interval = setInterval(async () => {
+          attempts++;
+          try {
+            const status = await api.anprDiagnostics();
+            if (status?.service_running) {
+              clearInterval(interval);
+              refreshCore();
+            }
+          } catch {}
+          if (attempts >= maxAttempts) {
+            clearInterval(interval);
+            refreshCore(); // refresh anyway after timeout
+          }
+        }, 2000);
+      };
+      pollHealth();
     });
     return () => { unlisten.then((f) => f()); };
   }, [refreshCore]);

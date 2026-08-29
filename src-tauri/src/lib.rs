@@ -244,6 +244,18 @@ pub fn run() {
             set_frames_dir,
             pick_folder,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(st) = window.try_state::<AppState>() {
+                    if let Ok(mut procs) = st.anpr_processes.try_lock() {
+                        for mut child in procs.drain(..) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -562,8 +574,6 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                 let Ok(mut procs) = st.anpr_processes.try_lock() else { continue };
                 procs.clear(); // remove dead handles
                 drop(procs);
-                // Re-spawn using the same logic as auto_start_anpr
-                let _ = auto_start_anpr(&st);
                 let Ok(conn) = anpr_db.try_lock() else { continue };
                 let _ = monitor::record_health_event(&conn, "anpr_service", "restarted", Some("ANPR process died, auto-restarted"));
                 drop(conn);
@@ -621,12 +631,28 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
     let pg = state.pg.clone();
     let sheets = state.sheets.clone();
     let sync_db = state.sync_db.clone();
+    let pending_marks = state.pending_sync_marks.clone();
     std::thread::spawn(move || {
         while running.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_secs(2));
             let Some(st) = handle.try_state::<AppState>() else {
                 continue;
             };
+
+            // ── Drain pending mark-synced from previous cycles ─────────
+            if let Ok(mut marks) = pending_marks.try_lock() {
+                while let Some((table, ids)) = marks.pop() {
+                    if let Ok(conn) = sync_db.try_lock() {
+                        if let Err(e) = sync::mark_rows_synced(&conn, &table, &ids) {
+                            crate::log::log(&format!("[sync] deferred mark {table}: {e}"));
+                        }
+                    } else {
+                        // Re-queue for next cycle if still can't acquire lock
+                        marks.push((table, ids));
+                        break;
+                    }
+                }
+            }
 
             // ── Postgres push (local → central) ──────────────────────────
             let mut any_pushed = false;
@@ -649,14 +675,18 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     any_pushed = true;
                     crate::log::log(&format!("[sync] push {table}: {}/{} rows synced", pushed_ids.len(), rows.len()));
                 }
-                // Mark synced
+                // Mark synced — queue for deferred marking if lock fails
                 if !pushed_ids.is_empty() {
-                    let Ok(conn) = sync_db.try_lock() else {
-                        crate::log::log(&format!("[sync] mark {table}: sync_db lock failed"));
-                        continue;
-                    };
-                    if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
-                        crate::log::log(&format!("[sync] mark {table}: {e}"));
+                    if let Ok(conn) = sync_db.try_lock() {
+                        if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
+                            crate::log::log(&format!("[sync] mark {table}: {e}"));
+                        }
+                    } else {
+                        // Queue for next cycle — rows were already pushed to PG
+                        if let Ok(mut marks) = pending_marks.try_lock() {
+                            marks.push((table.to_string(), pushed_ids));
+                            crate::log::log(&format!("[sync] queued mark {table} for next cycle"));
+                        }
                     }
                 }
             }
@@ -664,22 +694,10 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
             if any_pushed {
                 let Ok(conn) = sync_db.try_lock() else { continue };
                 let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
-            } else if !pg.connected() {
-                // One log line per cycle when PG is offline — helps diagnose
-                // why the pending count never decreases.
-                if let Ok(conn) = sync_db.try_lock() {
-                    let total_pending: i64 = sync::PG_SYNC_TABLES
-                        .iter()
-                        .map(|(t, _)| sync::pending_for_table(&conn, t).unwrap_or(0))
-                        .sum();
-                    if total_pending > 0 {
-                        crate::log::log(&format!("[sync] pg offline — {total_pending} rows waiting"));
-                    }
-                }
             }
 
             // ── Postgres pull (central → local) ──────────────────────────
-            if pg.connected() {
+            if pg.configured() {
                 for &table in sync::REFERENCE_TABLES {
                     let last_pull = {
                         let Ok(conn) = sync_db.try_lock() else { continue };
@@ -710,7 +728,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     Ok(d) => d,
                     Err(e) => { crate::log::log(&format!("[sync] sheets prepare: {e}")); continue; }
                 };
-                if data.pending == 0 || !sheets.connected() { continue; }
+                if data.pending == 0 || !sheets.configured() { continue; }
                 Some(data)
             };
             let Some(sheets_data) = sheets_data else { continue };

@@ -642,7 +642,7 @@ fn training_candidates_flag_low_confidence_and_human_corrected() {
     // manual entry of A123AB closes the earlier open trip as its exit, so
     // logged.id is the old trip (which already has candidates from the low-
     // confidence flagging). Use A223AB (registered, no open trip).
-    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir()).unwrap();
+    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir(), None).unwrap();
     let logged = manual.trip.expect("manual exact match logs");
     assert_eq!(candidate_rows(&ctx, &logged.id).len(), 0, "manual entries carry no frames to flag");
 }
