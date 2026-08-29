@@ -1424,29 +1424,30 @@ fn make_tls_connector() -> Result<postgres_native_tls::MakeTlsConnector, String>
 fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
     let mut config: postgres::Config = cs.parse().map_err(|e| format!("invalid connection string: {e}"))?;
     config.connect_timeout(std::time::Duration::from_secs(15));
-    // TCP keepalive: detect dead connections at the OS level so the worker
-    // doesn't hang forever on a half-open socket. Without this, a silently
-    // dropped connection (server crash, network outage) causes every push
-    // and pull to block indefinitely.
     config.keepalives(true);
     config.keepalives_idle(std::time::Duration::from_secs(10));
     config.keepalives_interval(std::time::Duration::from_secs(3));
     let tls = make_tls_connector()?;
+
+    /// Connect, verify with SELECT 1, return client.
+    /// IMPORTANT: Do NOT use SET statement_timeout here.
+    /// PgBouncer in transaction-mode strips session settings between
+    /// statements, so the SET is wasted and adds a round-trip that can
+    /// fail. Dead-connection detection is handled by TCP keepalive
+    /// (idle=10s, interval=3s) at the OS level.
     let make_client = |cfg: &mut postgres::Config| -> Result<postgres::Client, String> {
         let mut c = cfg.connect(tls.clone()).map_err(|e| {
             let is_missing_db = e.as_db_error().map(|d| d.message().contains("does not exist")).unwrap_or(false);
             if is_missing_db { "__MISSING_DB__".to_string() } else { format!("cannot connect to PostgreSQL: {e}") }
         })?;
-        // Set a statement timeout so individual queries can't hang forever.
-        // This prevents the client Mutex from being held indefinitely when
-        // Supabase / PgBouncer drops a backend connection silently.
-        // 15s timeout: fast enough to detect dead connections, still
-        // allows normal Supabase queries (<2s typical). TCP keepalive
-        // (idle=10s, interval=3s) provides a second detection layer.
-        c.execute("SET statement_timeout = '15000'", &[])
-            .map_err(|e| format!("cannot set statement_timeout: {e}"))?;
+        // Verify the connection actually works for queries, not just
+        // the TLS handshake. Some PgBouncer setups accept the handshake
+        // but kill the connection on the first real query.
+        c.execute("SELECT 1", &[])
+            .map_err(|e| format!("connection verified but SELECT 1 failed: {e}"))?;
         Ok(c)
     };
+
     match make_client(&mut config) {
         Ok(c) => Ok(c),
         Err(e) if e == "__MISSING_DB__" => {
@@ -1474,26 +1475,13 @@ fn connect_with_create(cs: &str) -> Result<postgres::Client, String> {
 /// table gets a PRIMARY KEY on `id` (and an idempotent unique index, so a
 /// table that already exists without the constraint is still upsert-safe).
 fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
-    // Step 1: Fast check — do all tables already exist?
-    // A SELECT is much lighter than DDL and won't hang on an unstable
-    // connection. If the tables exist (which they almost certainly do
-    // after the first successful sync), we skip DDL entirely.
-    let mut missing: Vec<&str> = Vec::new();
+    // Build ONE big batch_execute with all DDL statements.
+    // PgBouncer in transaction-mode treats batch_execute as a single
+    // protocol message, so all statements run in one round-trip.
+    // This avoids the per-table connection drops that killed the old
+    // approach of running SELECT + CREATE TABLE per table.
+    let mut sql = String::new();
     for &(table, _) in PG_SYNC_TABLES {
-        let check = format!("SELECT 1 FROM {} LIMIT 0", pg_quote_ident(table));
-        if client.execute(&check, &[]).is_err() {
-            missing.push(table);
-        }
-    }
-    if missing.is_empty() {
-        crate::log::log("[sync] ensure_schema_for: all tables exist — skipping DDL");
-        return Ok(());
-    }
-    // Step 2: Only create tables that are missing.
-    crate::log::log(&format!("[sync] ensure_schema_for: {} tables missing: {:?}", missing.len(), missing));
-    let mut errors: Vec<String> = Vec::new();
-    let mut created = 0u32;
-    for table in missing {
         let defs: Vec<String> = base_columns(table)
             .iter()
             .map(|c| {
@@ -1504,30 +1492,30 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
                 }
             })
             .collect();
-        if let Err(e) = client.batch_execute(&format!(
-            "CREATE TABLE IF NOT EXISTS {} ({})",
+        sql.push_str(&format!(
+            "CREATE TABLE IF NOT EXISTS {} ({}); ",
             pg_quote_ident(table),
             defs.join(", ")
-        )) {
-            errors.push(format!("{table}: {e}"));
-            continue;
-        }
-        let _ = client.batch_execute(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\")",
+        ));
+        sql.push_str(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\"); ",
             pg_quote_ident(&format!("{table}_id_key")),
             pg_quote_ident(table)
         ));
-        created += 1;
     }
-    if errors.is_empty() {
-        crate::log::log(&format!("[sync] ensure_schema_for: created {created} missing tables"));
-        Ok(())
-    } else if created > 0 {
-        crate::log::log(&format!("[sync] ensure_schema_for: created {created}, {} failed: {}",
-            errors.len(), errors.join("; ")));
-        Ok(())
-    } else {
-        Err(format!("ensure_schema_for failed: {}", errors.join("; ")))
+    crate::log::log(&format!("[sync] ensure_schema_for: sending {} DDL statements in one batch", PG_SYNC_TABLES.len() * 2));
+    match client.batch_execute(&sql) {
+        Ok(()) => {
+            crate::log::log("[sync] ensure_schema_for: DDL batch OK");
+            Ok(())
+        }
+        Err(e) => {
+            // Even if some DDL failed, the tables that already exist
+            // are fine. Only fail if ALL tables are missing (the push
+            // will fail anyway).
+            crate::log::log(&format!("[sync] ensure_schema_for: DDL batch partial: {e}"));
+            Err(format!("ensure_schema_for: {e}"))
+        }
     }
 }/// Upsert rows by UUID id. Returns the ids confirmed written; every row is
 /// idempotent (ON CONFLICT DO UPDATE) so a mid-batch failure is safe to retry.
@@ -1640,6 +1628,12 @@ fn push_rows_impl(
             pg_quote_ident(table), col_list
         );
         let param_refs: Vec<&(dyn ToSql + Sync)> = flat_params.iter().map(|b| b.as_ref()).collect();
+
+        // Log SQL shape for first batch (not values — too large).
+        if batch_start == 0 {
+            crate::log::log(&format!("[sync] push_rows_impl: {table} batch SQL: {} cols, {} params, {} rows",
+                col_count, param_refs.len(), batch_len));
+        }
 
         match client.execute(&sql, &param_refs) {
             Ok(_) => {
