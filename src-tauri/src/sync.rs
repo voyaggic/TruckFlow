@@ -1395,11 +1395,14 @@ fn pg_literal(v: &serde_json::Value, ty: &str) -> String {
             }
         }
         serde_json::Value::String(s) => {
-            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            // PostgreSQL only requires single-quote escaping (doubling).
+            // Backslashes and double-quotes are literal inside '...' with
+            // standard_conforming_strings=on (the default since PG 9.1).
+            let escaped = s.replace('\'', "''");
             format!("'{escaped}'")
         }
         other => {
-            let s = other.to_string().replace('\\', "\\\\").replace('"', "\\\"");
+            let s = other.to_string().replace('\'', "''");
             format!("'{s}'")
         }
     }
