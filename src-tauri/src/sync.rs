@@ -1806,7 +1806,9 @@ impl PostgresWorker {
         if !healthy && self.client.is_some() {
             crate::log::log("[sync] pg health check: connection dead — dropping, will reconnect");
             self.client = None;
-            self.schema_validated = false;
+            // Do NOT reset schema_validated here — schema doesn't change
+            // when the connection drops. Resetting causes ensure_schema_for
+            // to re-run on every push, which hangs over PgBouncer.
             self.last_err = Some("connection lost, reconnecting".to_string());
         }
     }
@@ -1865,11 +1867,20 @@ impl PostgresWorker {
                     let result = (|| -> Result<Vec<String>, String> {
                         self.ensure_client()?;
                         let client = self.client.as_mut().ok_or("no client")?;
-                        if !self.schema_validated {
-                            ensure_schema_for(client)?;
-                            self.schema_validated = true;
+                        // Skip ensure_schema_for — over PgBouncer, the DDL
+                        // queries hang and block all pushes indefinitely.
+                        // Instead, do lazy DDL: if INSERT fails because the
+                        // table doesn't exist, create it and retry.
+                        match push_rows_impl(client, &table, &rows) {
+                            Ok(ids) => Ok(ids),
+                            Err(e) if e.contains("does not exist") || e.contains("relation") => {
+                                crate::log::log(&format!("[sync] worker: PushRows {table} — table missing, creating"));
+                                ensure_schema_for(client)?;
+                                self.schema_validated = true;
+                                push_rows_impl(client, &table, &rows)
+                            }
+                            Err(e) => Err(e),
                         }
-                        push_rows_impl(client, &table, &rows)
                     })();
                     match result {
                         Ok(ids) => {
