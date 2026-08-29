@@ -990,6 +990,9 @@ pub fn sync_now_pg(state: State<AppState>, actor_id: String, handle: AppHandle) 
     let pg = state.pg.clone();
     let db = state.sync_db.clone();
     let actor = actor_id.clone();
+    crate::log::log(&format!("[sync] manual sync triggered by {actor_id} — pg.configured={} pg.connected={}",
+        pg.configured(), pg.connected(),
+    ));
     std::thread::spawn(move || {
         // Phase 1: collect unsynced rows
         let (rows_by_table, pending_counts) = {
@@ -1896,6 +1899,7 @@ impl PostgresAdapter for RealPostgres {
                 crate::log::log(&format!("[sync] {table}: worker stuck >60s, force-clearing is_busy"));
                 self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
             } else {
+                crate::log::log(&format!("[sync] {table}: push deferred — worker busy"));
                 return Err(format!("{table} push deferred — worker busy (will retry next cycle)"));
             }
         }
@@ -1927,14 +1931,22 @@ impl PostgresAdapter for RealPostgres {
     }
     fn configure(&self, conn_string: Option<String>) -> Result<(), String> {
         self.is_configured.store(conn_string.is_some(), std::sync::atomic::Ordering::Relaxed);
-        self.is_connected.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Do NOT set is_connected=false here — if the worker is busy, the
+        // send_timeout below returns None and is_connected stays stale-false,
+        // causing the UI to show "Offline" even though the worker will
+        // eventually connect. Only update is_connected on a confirmed result.
         let (tx, rx) = std::sync::mpsc::channel();
         match self.send_timeout(PgCommand::Configure(conn_string, tx), rx, std::time::Duration::from_secs(15)) {
             Some(result) => {
                 self.is_connected.store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
                 result
             }
-            None => Err("Postgres worker busy".to_string()),
+            None => {
+                // Worker busy — don't touch is_connected. The worker will
+                // process Configure eventually and update is_connected itself.
+                // The UI's 5s refresh will pick up the correct state.
+                Err("Postgres worker busy — retrying in background".to_string())
+            }
         }
     }
     fn delete_rows(&self, table: &str, ids: &[String]) -> Result<(), String> {
