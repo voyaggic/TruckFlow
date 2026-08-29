@@ -1717,17 +1717,23 @@ impl PostgresWorker {
                 let result = (|| -> Result<Vec<serde_json::Value>, String> {
                     self.ensure_client()?;
                     let client = self.client.as_mut().ok_or("no client")?;
-                    let _ = client.execute("SET statement_timeout = '10000'", &[]);
+                    let mut pg_tx = client.transaction()
+                        .map_err(|e| format!("query tx begin failed: {}", error_chain(&e)))?;
+                    pg_tx.execute("SET LOCAL statement_timeout = '10000'", &[])
+                        .map_err(|e| format!("query timeout set failed: {}", error_chain(&e)))?;
                     let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    let rows = client.query(sql.as_str(), &param_refs)
+                    let rows = pg_tx.query(sql.as_str(), &param_refs)
                         .map_err(|e| format!("query failed: {}", error_chain(&e)))?;
-                    Ok(rows.iter().map(|row| {
+                    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
                         let mut obj = serde_json::Map::new();
                         for (i, col) in row.columns().iter().enumerate() {
                             obj.insert(col.name().to_string(), pg_cell_to_json(row, i));
                         }
                         serde_json::Value::Object(obj)
-                    }).collect())
+                    }).collect();
+                    pg_tx.commit()
+                        .map_err(|e| format!("query tx commit failed: {}", error_chain(&e)))?;
+                    Ok(result)
                 })();
                 let _ = tx.send(result);
             }
