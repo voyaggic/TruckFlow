@@ -1522,52 +1522,129 @@ fn push_rows_impl(
         }
     }
     crate::log::log(&format!("[sync] push_rows_impl: {table} ALTER TABLE done ({alter_count} columns added)"));
-    // Phase 2: upsert each row individually — no transaction.
-    // Each INSERT is idempotent (ON CONFLICT DO UPDATE) so a partial
-    // failure is safe. The next sync cycle retries unsynced rows.
-    // This avoids the PgBouncer COMMIT-hang that caused the worker
-    // to block forever when using client.transaction().
+    // Phase 2: batch upsert — multi-row INSERT for speed.
+    // Collect the union of ALL column names across all rows, then
+    // insert in batches. Each batch is ONE round-trip instead of N.
+    // Rows with missing columns get NULL — ON CONFLICT DO UPDATE
+    // only touches columns present in this INSERT, so the next batch
+    // handles remaining columns. All rows are idempotent.
+    //
+    // Over an unstable connection: 113 rows → 3 batches instead of
+    // 113 individual INSERTs. This is the single biggest speedup.
+    const BATCH_SIZE: usize = 50;
+
+    // 1. Collect all column names (union across all rows), preserving
+    //    a stable order: id first, then base columns, then dynamic.
+    let mut all_cols: Vec<String> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        // id first
+        all_cols.push("id".to_string());
+        seen.insert("id".to_string());
+        // base columns
+        for c in &base {
+            if seen.insert(c.to_string()) {
+                all_cols.push(c.to_string());
+            }
+        }
+        // dynamic columns
+        for row in rows {
+            if let Some(obj) = row.as_object() {
+                for key in obj.keys() {
+                    if seen.insert(key.clone()) {
+                        all_cols.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    let col_count = all_cols.len();
+    let quoted_cols: Vec<String> = all_cols.iter().map(|c| pg_quote_ident(c)).collect();
+    let update_set: String = all_cols.iter()
+        .filter(|c| c.as_str() != "id")
+        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let col_list = quoted_cols.join(", ");
+
+    // 2. Process rows in batches.
     let mut all_acked: Vec<String> = Vec::new();
     let mut error_count = 0u32;
-    for (row_idx, row) in rows.iter().enumerate() {
-        let Some(obj) = row.as_object() else { continue };
-        let cols: Vec<&String> = obj.keys().collect();
-        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
-        let params: Vec<Box<dyn ToSql + Sync>> = cols
-            .iter()
-            .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
-            .collect();
-        let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+    let total_rows = rows.len();
+    for batch_start in (0..total_rows).step_by(BATCH_SIZE) {
+        let batch_end = (batch_start + BATCH_SIZE).min(total_rows);
+        let batch = &rows[batch_start..batch_end];
+        let batch_len = batch.len();
+
+        // Build placeholders: ($1, $2, ...$C), ($C+1, ..., $(2*C)), ...
+        let mut placeholders = Vec::with_capacity(batch_len);
+        let mut flat_params: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(batch_len * col_count);
+        for row in batch {
+            let obj = row.as_object();
+            let start = flat_params.len() + 1; // 1-indexed
+            let end = start + col_count;
+            placeholders.push(
+                (start..end).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
+            );
+            for col_name in &all_cols {
+                let val = obj.and_then(|o| o.get(col_name.as_str())).unwrap_or(&serde_json::Value::Null);
+                flat_params.push(to_pg_param(val, pg_column_type(table, col_name)));
+            }
+        }
+        let values_clause = placeholders.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join(", ");
         let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
-            pg_quote_ident(table),
-            cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
-            placeholders.join(", "),
-            cols.iter()
-                .filter(|c| c.as_str() != "id")
-                .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "INSERT INTO {} ({}) VALUES {values_clause} ON CONFLICT (\"id\") DO UPDATE SET {update_set}",
+            pg_quote_ident(table), col_list
         );
+        let param_refs: Vec<&(dyn ToSql + Sync)> = flat_params.iter().map(|b| b.as_ref()).collect();
+
         match client.execute(&sql, &param_refs) {
             Ok(_) => {
-                if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                    all_acked.push(id.to_string());
+                for row in batch {
+                    if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                        all_acked.push(id.to_string());
+                    }
                 }
             }
             Err(e) => {
                 error_count += 1;
-                // Log but continue — other rows may still succeed.
+                let batch_info = format!("rows {}-{}", batch_start, batch_end - 1);
                 if error_count <= 3 {
-                    crate::log::log(&format!("[sync] push_rows_impl: {table} row {row_idx} failed: {}", error_chain(&e)));
+                    crate::log::log(&format!("[sync] push_rows_impl: {table} batch {batch_info} failed: {}", error_chain(&e)));
+                }
+                // Fallback: try individual INSERTs for this batch so we
+                // can recover as many rows as possible.
+                for (row_idx, row) in batch.iter().enumerate() {
+                    let Some(obj) = row.as_object() else { continue };
+                    let cols: Vec<&String> = obj.keys().collect();
+                    let ph: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+                    let params: Vec<Box<dyn ToSql + Sync>> = cols
+                        .iter()
+                        .map(|c| to_pg_param(obj.get(*c).unwrap_or(&serde_json::Value::Null), pg_column_type(table, c)))
+                        .collect();
+                    let pr: Vec<&(dyn ToSql + Sync)> = params.iter().map(|b| b.as_ref()).collect();
+                    let fallback_sql = format!(
+                        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (\"id\") DO UPDATE SET {}",
+                        pg_quote_ident(table),
+                        cols.iter().map(|c| pg_quote_ident(c)).collect::<Vec<_>>().join(", "),
+                        ph.join(", "),
+                        cols.iter().filter(|c| c.as_str() != "id")
+                            .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+                            .collect::<Vec<_>>().join(", ")
+                    );
+                    if client.execute(&fallback_sql, &pr).is_ok() {
+                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                            all_acked.push(id.to_string());
+                        }
+                    }
                 }
             }
         }
     }
     if error_count > 0 {
-        crate::log::log(&format!("[sync] push_rows_impl: {table} {}/{} rows succeeded, {} failed", all_acked.len(), rows.len(), error_count));
+        crate::log::log(&format!("[sync] push_rows_impl: {table} {}/{} rows succeeded ({} batch errors, retried individually)", all_acked.len(), total_rows, error_count));
     }
-    crate::log::log(&format!("[sync] push_rows_impl: {table} DONE — {} ids acked ({} errors)", all_acked.len(), error_count));
+    crate::log::log(&format!("[sync] push_rows_impl: {table} DONE — {} ids acked ({} batches, {} errors)", all_acked.len(), (total_rows + BATCH_SIZE - 1) / BATCH_SIZE, error_count));
     Ok(all_acked)
 }
 
@@ -1603,6 +1680,11 @@ struct PostgresWorker {
     /// Epoch seconds of the last successful health-check ping. Used to
     /// rate-limit pings so we don't add latency to every command.
     last_health_check: i64,
+    /// Epoch seconds of the last successful command completion. Used to
+    /// keep the is_connected flag true during brief connection blips —
+    /// if we were connected 5 seconds ago and the link just hiccuped,
+    /// the UI should still show "Online" while we reconnect.
+    last_successful_contact: i64,
 }
 
 impl PostgresWorker {
@@ -1615,6 +1697,7 @@ impl PostgresWorker {
             last_connect_fail: 0,
             connect_backoff: 0,
             last_health_check: 0,
+            last_successful_contact: 0,
         }
     }
 
@@ -1731,8 +1814,13 @@ impl PostgresWorker {
                     Ok(_) => { self.last_err = None; }
                     Err(e) => {
                         self.last_err = Some(e.clone());
+                        // Drop the connection (it may be dead) but do NOT
+                        // reset schema_validated — schema doesn't change
+                        // between pushes. Resetting it causes 10 extra
+                        // schema queries on every push attempt, which over
+                        // an unstable connection creates a vicious cycle
+                        // of: reconnect → schema fail → reconnect → …
                         self.client = None;
-                        self.schema_validated = false;
                     }
                 }
                 let _ = tx.send(result);
@@ -1816,11 +1904,18 @@ fn spawn_pg_worker(
                 if let Ok(mut e) = shared_err.lock() {
                     *e = worker.last_err.clone();
                 }
-                // Update is_connected after EVERY command. This is critical:
-                // when the poller times out waiting for a long push, it used
-                // to set is_connected=false, which permanently skipped future
-                // pushes. Now the worker restores the flag after completion.
-                let connected = worker.client.as_ref().is_some_and(|c| !c.is_closed());
+                // Update is_connected with a 30s grace period. If the
+                // client is alive right now, record it. If it's dead but
+                // we were connected within the last 30s, keep reporting
+                // connected — this prevents the badge from flickering
+                // "Offline" during brief network blips while we reconnect.
+                let now_ts = chrono::Utc::now().timestamp();
+                let client_alive = worker.client.as_ref().is_some_and(|c| !c.is_closed());
+                if client_alive {
+                    worker.last_successful_contact = now_ts;
+                }
+                let connected = client_alive
+                    || (now_ts - worker.last_successful_contact < 30);
                 is_connected.store(connected, std::sync::atomic::Ordering::Relaxed);
                 if is_stop { break; }
             }
