@@ -26,8 +26,8 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
 
   // Non-blocking run: fires action, shows pending on that item, never freezes UI
-  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => {
-    fire(key, fn, { successMsg: okMsg, successEvent: event, refresh });
+  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => {
+    fire(key, fn, { successMsg: okMsg, successEvent: event, errorEvent, refresh });
   };
 
   return (
@@ -73,7 +73,7 @@ function PostgresPanel({
   status: SyncStatusView | null;
   totalPending: number;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {
@@ -109,7 +109,7 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured");
+    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
   };
 
   const disconnect = () => {
@@ -267,7 +267,7 @@ function ColumnMappingPanel({
   isPending: _isPending,
 }: {
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
 }) {
   const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
@@ -420,7 +420,7 @@ function SheetsPanel({
 }: {
   status: SyncStatusView | null;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {

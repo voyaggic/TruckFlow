@@ -654,12 +654,41 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                 }
             }
 
+            // ── Auto-reconnect probe ──────────────────────────────────────
+            // When PG is configured but offline (connection dropped, internet
+            // returned after hours/days/months), proactively trigger a
+            // reconnect so sync resumes automatically. The worker's
+            // ensure_client() handles backoff internally — this just ensures
+            // a reconnect attempt happens every poller cycle instead of only
+            // when a push is attempted.
+            if pg.configured() && !pg.connected() {
+                // Non-blocking: configure() sends to the worker and waits up
+                // to 15s. If the worker is busy, it queues behind the current
+                // command. Either way, the worker will attempt ensure_client().
+                let conn_string = {
+                    let conn = match sync_db.lock() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    crate::db::get_setting(&conn, "pg_connection_string")
+                };
+                if let Some(cs) = conn_string {
+                    let _ = pg.configure(Some(cs));
+                }
+            }
+
             // ── Postgres push (local → central) ──────────────────────────
             let mut any_pushed = false;
             for (table, _display) in sync::PG_SYNC_TABLES {
-                // Read unsynced rows from dedicated sync connection
+                // Read unsynced rows from dedicated sync connection.
+                // Use blocking lock — sync_db is only shared with sync_now_pg
+                // (both background threads), so blocking is safe and prevents
+                // the poller from silently skipping entire tables.
                 let rows = {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
+                    let conn = match sync_db.lock() {
+                        Ok(c) => c,
+                        Err(e) => { crate::log::log(&format!("[sync] sync_db poisoned: {e}")); continue; }
+                    };
                     match sync::collect_unsynced_rows(&conn, table) {
                         Ok(r) => r,
                         Err(e) => { crate::log::log(&format!("[sync] collect {table}: {e}")); continue; }
@@ -675,25 +704,29 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     any_pushed = true;
                     crate::log::log(&format!("[sync] push {table}: {}/{} rows synced", pushed_ids.len(), rows.len()));
                 }
-                // Mark synced — queue for deferred marking if lock fails
+                // Mark synced — use blocking lock so we never lose acked IDs
                 if !pushed_ids.is_empty() {
-                    if let Ok(conn) = sync_db.try_lock() {
-                        if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
-                            crate::log::log(&format!("[sync] mark {table}: {e}"));
+                    match sync_db.lock() {
+                        Ok(conn) => {
+                            if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
+                                crate::log::log(&format!("[sync] mark {table}: {e}"));
+                            }
                         }
-                    } else {
-                        // Queue for next cycle — rows were already pushed to PG
-                        if let Ok(mut marks) = pending_marks.try_lock() {
-                            marks.push((table.to_string(), pushed_ids));
-                            crate::log::log(&format!("[sync] queued mark {table} for next cycle"));
+                        Err(_) => {
+                            // Mutex poisoned — queue for next cycle
+                            if let Ok(mut marks) = pending_marks.try_lock() {
+                                marks.push((table.to_string(), pushed_ids));
+                                crate::log::log(&format!("[sync] queued mark {table} for next cycle"));
+                            }
                         }
                     }
                 }
             }
             // Only update last synced timestamp when rows were actually pushed
             if any_pushed {
-                let Ok(conn) = sync_db.try_lock() else { continue };
-                let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
+                if let Ok(conn) = sync_db.lock() {
+                    let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
+                }
             }
 
             // ── Postgres pull (central → local) ──────────────────────────
@@ -703,7 +736,10 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
             if pg.configured() && pg.connected() {
                 for &table in sync::REFERENCE_TABLES {
                     let last_pull = {
-                        let Ok(conn) = sync_db.try_lock() else { continue };
+                        let conn = match sync_db.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
                         crate::db::get_setting(&conn, "pg_last_pulled_at").unwrap_or_default()
                     };
                     let central_rows = match sync::fetch_central_rows(&*pg, table, &last_pull) {
@@ -712,20 +748,27 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
                     };
                     if central_rows.is_empty() { continue; }
                     {
-                        let Ok(conn) = sync_db.try_lock() else { continue };
+                        let conn = match sync_db.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
                         let _ = sync::upsert_central_rows(&conn, table, &central_rows);
                     }
                 }
                 {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
-                    let _ = crate::db::set_setting(&conn, "pg_last_pulled_at", &crate::db::now_iso());
+                    if let Ok(conn) = sync_db.lock() {
+                        let _ = crate::db::set_setting(&conn, "pg_last_pulled_at", &crate::db::now_iso());
+                    }
                 }
             }
 
             // ── Google Sheets sync ────────────────────────────────────────
             // Phase 1: check if due + prepare data (read-only, under lock)
             let sheets_data = {
-                let Ok(conn) = sync_db.try_lock() else { continue };
+                let conn = match sync_db.lock() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
                 if !sync::sheets_due(&conn, &*sheets) { continue; }
                 let data = match sync::prepare_sheets_data(&conn, &*sheets) {
                     Ok(d) => d,
@@ -742,8 +785,9 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
             };
             // Phase 3: write results back (re-acquire lock — network is done)
             {
-                let Ok(conn) = sync_db.try_lock() else { continue };
-                let _ = sync::finalize_sheets_results(&conn, &sheets_data.new_rows, &sheets_data.update_rows, &acked_ids);
+                if let Ok(conn) = sync_db.lock() {
+                    let _ = sync::finalize_sheets_results(&conn, &sheets_data.new_rows, &sheets_data.update_rows, &acked_ids);
+                }
             }
         }
     });

@@ -990,6 +990,19 @@ pub fn sync_now_pg(state: State<AppState>, actor_id: String, handle: AppHandle) 
     let pg = state.pg.clone();
     let db = state.sync_db.clone();
     let actor = actor_id.clone();
+
+    // Early checks: give the user instant honest feedback instead of spawning
+    // a thread that silently fails on every table.
+    if !pg.configured() {
+        let _ = handle.emit("pg-sync-done", json!({ "pushed": 0, "error": "PostgreSQL is not configured. Enter a connection string first." }));
+        return Ok("not configured".to_string());
+    }
+    if !pg.connected() {
+        let err_detail = pg.last_error().unwrap_or_else(|| "no connection".to_string());
+        let _ = handle.emit("pg-sync-done", json!({ "pushed": 0, "error": format!("PostgreSQL is currently offline — {err_detail}. The background sync will push automatically when connectivity returns.") }));
+        return Ok("offline".to_string());
+    }
+
     crate::log::log(&format!("[sync] manual sync triggered by {actor_id} — pg.configured={} pg.connected={}",
         pg.configured(), pg.connected(),
     ));
@@ -1529,9 +1542,11 @@ fn push_rows_impl(
     // only touches columns present in this INSERT, so the next batch
     // handles remaining columns. All rows are idempotent.
     //
-    // Over an unstable connection: 113 rows → 3 batches instead of
-    // 113 individual INSERTs. This is the single biggest speedup.
-    const BATCH_SIZE: usize = 50;
+    // Over an unstable connection: 113 rows → 1 batch instead of 3.
+    // For bulk data: 10,000 rows → 20 batches instead of 200 (10x speedup).
+    // PostgreSQL handles multi-row INSERTs up to ~1000 rows efficiently.
+    // Each batch is idempotent (ON CONFLICT DO UPDATE) so partial failures are safe.
+    const BATCH_SIZE: usize = 500;
 
     // 1. Collect all column names (union across all rows), preserving
     //    a stable order: id first, then base columns, then dynamic.
@@ -1707,14 +1722,13 @@ impl PostgresWorker {
             None => return Err("PostgreSQL is not configured".to_string()),
         };
         if self.client.as_ref().is_some_and(|c| !c.is_closed()) {
-            crate::log::log("[sync] ensure_client: reusing existing connection");
             return Ok(());
         }
         let now = chrono::Utc::now().timestamp();
         if self.connect_backoff > 0 && now - self.last_connect_fail < self.connect_backoff {
             return Err(format!("backed off (retry in {}s)", self.connect_backoff - (now - self.last_connect_fail)));
         }
-        crate::log::log("[sync] ensure_client: calling connect_with_create");
+        crate::log::log("[sync] ensure_client: connecting…");
         match connect_with_create(&cs) {
             Ok(c) => {
                 crate::log::log("[sync] ensure_client: connection SUCCESS");
@@ -1727,8 +1741,10 @@ impl PostgresWorker {
             Err(e) => {
                 crate::log::log(&format!("[sync] ensure_client: connection FAILED: {e}"));
                 self.last_err = Some(e.clone());
+                // Backoff: 5 → 10 → 20 → 30s cap. Fast recovery when internet
+                // returns after seconds, minutes, or months — max 30s wait, not 120s.
                 let prev = self.connect_backoff;
-                self.connect_backoff = (prev.max(10) * 2).min(120);
+                self.connect_backoff = (prev.max(5) * 2).min(30);
                 self.last_connect_fail = now;
                 Err(e)
             }
@@ -1998,14 +2014,19 @@ impl RealPostgres {
         }
     }
 
-    /// Restore a previously saved connection string without touching the
-    /// network (startup path); the first real use connects lazily.
+    /// Restore a previously saved connection string on startup.
+    /// Waits for the worker to attempt the connection (up to 20s) so
+    /// `is_connected` reflects the real state immediately. If the worker
+    /// is busy or the connection fails, the adapter is still marked
+    /// configured so the background poller retries on the next cycle.
     pub fn restore(&self, conn_string: String) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _ = self.tx.send(PgCommand::Configure(Some(conn_string), tx));
-        // Don't wait for response — the worker connects lazily.
-        // Just mark as configured so callers don't skip.
         self.is_configured.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Use configure() which waits for the worker response (up to 15s)
+        // so is_connected gets properly set on startup.
+        match self.configure(Some(conn_string)) {
+            Ok(()) => crate::log::log("[sync] restore: connected on startup"),
+            Err(e) => crate::log::log(&format!("[sync] restore: startup connect deferred — {e}")),
+        }
     }
 
     /// Send a command to the worker with a custom timeout.
