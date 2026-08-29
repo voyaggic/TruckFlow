@@ -1798,28 +1798,64 @@ impl PostgresWorker {
             }
             PgCommand::PushRows(table, rows, tx) => {
                 crate::log::log(&format!("[sync] worker: PushRows {table} ({} rows)", rows.len()));
-                let result = (|| -> Result<Vec<String>, String> {
-                    crate::log::log(&format!("[sync] worker: PushRows {table} — ensure_client"));
-                    self.ensure_client()?;
-                    let client = self.client.as_mut().ok_or("no client")?;
-                    if !self.schema_validated {
-                        crate::log::log(&format!("[sync] worker: PushRows {table} — ensure_schema_for"));
-                        ensure_schema_for(client)?;
-                        self.schema_validated = true;
+                // Retry loop: up to 3 attempts with reconnection between
+                // each. Over an unstable connection, the first attempt may
+                // push some rows before the connection drops. The second
+                // attempt reconnects and pushes the remaining rows. Because
+                // every INSERT is idempotent (ON CONFLICT DO UPDATE),
+                // re-pushing already-pushed rows is safe and fast.
+                const MAX_ATTEMPTS: u32 = 3;
+                let mut all_acked: Vec<String> = Vec::new();
+                let mut last_err = String::new();
+                for attempt in 1..=MAX_ATTEMPTS {
+                    if attempt > 1 {
+                        crate::log::log(&format!("[sync] worker: PushRows {table} — retry attempt {attempt}/{MAX_ATTEMPTS}, reconnecting"));
+                        self.client = None;
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
-                    crate::log::log(&format!("[sync] worker: PushRows {table} — push_rows_impl"));
-                    push_rows_impl(client, &table, &rows)
-                })();
+                    let result = (|| -> Result<Vec<String>, String> {
+                        self.ensure_client()?;
+                        let client = self.client.as_mut().ok_or("no client")?;
+                        if !self.schema_validated {
+                            ensure_schema_for(client)?;
+                            self.schema_validated = true;
+                        }
+                        push_rows_impl(client, &table, &rows)
+                    })();
+                    match result {
+                        Ok(ids) => {
+                            all_acked = ids;
+                            if !all_acked.is_empty() {
+                                crate::log::log(&format!("[sync] worker: PushRows {table} — attempt {attempt} pushed {}/{} rows", all_acked.len(), rows.len()));
+                                // Got results — if all rows pushed, done.
+                                // If partial, retry remaining on next attempt.
+                                if all_acked.len() >= rows.len() {
+                                    break;
+                                }
+                                last_err = format!("partial: {}/{} pushed", all_acked.len(), rows.len());
+                            } else {
+                                last_err = "push returned 0 rows".to_string();
+                            }
+                        }
+                        Err(e) => {
+                            last_err = e;
+                            crate::log::log(&format!("[sync] worker: PushRows {table} — attempt {attempt} failed: {last_err}"));
+                            self.client = None;
+                        }
+                    }
+                }
+                // Deduplicate acked ids (from overlapping retries)
+                all_acked.sort();
+                all_acked.dedup();
+                let result = if all_acked.is_empty() {
+                    Err(last_err)
+                } else {
+                    Ok(all_acked)
+                };
                 match &result {
                     Ok(_) => { self.last_err = None; }
                     Err(e) => {
                         self.last_err = Some(e.clone());
-                        // Drop the connection (it may be dead) but do NOT
-                        // reset schema_validated — schema doesn't change
-                        // between pushes. Resetting it causes 10 extra
-                        // schema queries on every push attempt, which over
-                        // an unstable connection creates a vicious cycle
-                        // of: reconnect → schema fail → reconnect → …
                         self.client = None;
                     }
                 }
