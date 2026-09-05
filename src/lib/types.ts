@@ -235,6 +235,8 @@ export interface AnprConfigView {
   max_pending_duration_hours: number | null;
   /** Machine fingerprint for auto-start (hostname:MAC). */
   designated_machine_id: string | null;
+  /** ANPR plate detection method: "contour", "paddleocr", or "consecutive" */
+  detection_method: string;
 }
 
 /** Machine info for ANPR auto-start detection. */
@@ -684,4 +686,37 @@ export interface CombinedImportSummary {
   companies: ReferenceImportSummary;
   drivers: ReferenceImportSummary;
   vehicles: ReferenceImportSummary;
+}
+
+// ---------------------------------------------------------------------------
+// Machine & User Monitoring (Phase 7 Pilot Deployment)
+// ---------------------------------------------------------------------------
+
+export interface MachineStatusView {
+  machine_id: string;
+  user_id: string | null;
+  user_name: string | null;
+  role: string;
+  last_seen_at: string;
+  is_online: boolean;
+  ip_address: string | null;
+  pc_name: string | null;
+}
+
+export interface UserStatusView {
+  id: string;
+  name: string;
+  status: string;
+  auth_type: string;
+  must_change_password: boolean;
+  credential_pending: boolean;
+  last_login: string | null;
+  created_at: string;
+}
+
+export interface MonitoringDashboard {
+  machines: MachineStatusView[];
+  users: UserStatusView[];
+  pending_users_count: number;
+  online_machines_count: number;
 }

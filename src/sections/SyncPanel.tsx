@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
+import { listen } from "@tauri-apps/api/event";
 
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
@@ -20,7 +21,17 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
     // background poller pushes rows. Pure read-only call — no I/O beyond
     // a single SQLite query, so no lag or freeze.
     const id = setInterval(refresh, 5000);
-    return () => clearInterval(id);
+
+    // Listen for tables-created event and trigger sync automatically
+    const unlisten = listen("pg-tables-created", () => {
+      console.log("[SyncPanel] pg-tables-created received, triggering sync...");
+      fire("pg-auto-sync", () => api.syncNowPg(user.id), { successEvent: "pg-sync-done" });
+    });
+
+    return () => {
+      clearInterval(id);
+      unlisten.then((fn) => fn());
+    };
   }, [refresh]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
@@ -78,6 +89,8 @@ function PostgresPanel({
   getError: (key: string) => string | undefined;
 }) {
   const [connString, setConnString] = useState("");
+  const [pat, setPat] = useState("");
+  const [connType, setConnType] = useState<"pgbouncer" | "rest">("pgbouncer");
   const [tripRetention, setTripRetention] = useState("");
   const pg = status?.pg;
 
@@ -109,7 +122,37 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
+    let finalConnString = connString.trim();
+    if (connType === "rest") {
+      // User provides only the service_role key (eyJ...)
+      // Extract project_ref from JWT payload, build 3-part format: REST|URL|service_role_key
+      const apiKey = finalConnString;
+
+      try {
+        const parts = apiKey.split('.');
+        if (parts.length !== 3) {
+          window.alert("Invalid service_role key format. Should be a JWT like: eyJ...");
+          return;
+        }
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        const projectRef = payload?.ref;
+        if (!projectRef) {
+          window.alert("Could not extract project reference from service_role key.");
+          return;
+        }
+        // 3-part format: REST|URL|service_role_key
+        finalConnString = `REST|https://${projectRef}.supabase.co/rest/v1|${apiKey}`;
+      } catch (e) {
+        window.alert("Failed to parse service_role key. Make sure you copied the full key starting with eyJ...");
+        return;
+      }
+    }
+    run("pg-connect", async () => {
+      await api.configurePostgres(actor.id, finalConnString);
+      if (connType === "rest" && pat.trim()) {
+        await api.createPostgresTables(actor.id, pat.trim());
+      }
+    }, "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
   };
 
   const disconnect = () => {
@@ -145,17 +188,59 @@ function PostgresPanel({
         <div className="stack">
           <p className="muted small">
             Connect to a PostgreSQL server by pasting its connection string. The first connect <b>creates the database
-            and its tables automatically</b>, so setup is paste-and-go. On this machine your local server accepts:
+            and its tables automatically</b>, so setup is paste-and-go.
           </p>
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <span className="muted small">Connection type:</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "pgbouncer"}
+                onChange={() => setConnType("pgbouncer")}
+              />
+              <span className="small">PgBouncer (fast, recommended)</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "rest"}
+                onChange={() => setConnType("rest")}
+              />
+              <span className="small">REST API (more resilient for unstable connections)</span>
+            </label>
+          </div>
           <div className="row">
             <div className="field grow">
               <label>Connection string</label>
               <input
                 value={connString}
                 onChange={(e) => setConnString(e.target.value)}
-                placeholder="postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                placeholder={connType === "pgbouncer"
+                  ? "postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                  : "Paste your Supabase service_role key (eyJ...)"}
                 spellCheck={false}
               />
+              {connType === "rest" && (
+                <p className="muted small" style={{ marginTop: 4 }}>
+                  Paste the <b>service_role</b> key from Supabase Dashboard → Settings → API.
+                </p>
+              )}
+              {connType === "rest" && (
+                <div className="field" style={{ marginTop: 8 }}>
+                  <label>Personal Access Token (for table creation)</label>
+                  <input
+                    value={pat}
+                    onChange={(e) => setPat(e.target.value)}
+                    placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                    spellCheck={false}
+                  />
+                  <p className="muted small" style={{ marginTop: 4 }}>
+                    Generate at Supabase Dashboard → Settings → API → Personal Tokens → "Create a new token"
+                  </p>
+                </div>
+              )}
             </div>
             <div className="field">
               <label>&nbsp;</label>
@@ -460,6 +545,8 @@ function SheetsPanel({
     run("sheets-connect",
       () => api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
       "Google Sheets connected — logged trips will now export.",
+      "sheets-configured",
+      "sheets-config-error",
     );
   };
 

@@ -3,6 +3,7 @@
 //! Exercises the real pipeline logic (cross-reference, confidence thresholding,
 //! manual entry, queue routing, time_in preservation) against a fresh temp DB.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +47,7 @@ impl Drop for TempDb {
 struct TestCtx {
     _tmp: TempDb,
     app: App<tauri::test::MockRuntime>,
+    company_id: RefCell<String>,
 }
 
 impl TestCtx {
@@ -54,18 +56,26 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
+        let db_path = tmp.db_path();
         let app = mock_app();
+        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Mutex::new(conn),
+            db: Arc::new(Mutex::new(conn)),
+            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
             pg: Arc::new(MockPostgres::new()),
             sheets: Arc::new(MockSheets::new()),
+            anpr_processes: Arc::new(Mutex::new(Vec::new())),
+            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+            sync_notify: sync_tx,
         });
-        Self { _tmp: tmp, app }
+        Self { _tmp: tmp, app, company_id: RefCell::new(String::new()) }
     }
 
     fn state(&self) -> State<'_, AppState> {
@@ -81,20 +91,43 @@ impl TestCtx {
     }
 
     fn create_admin(&self) -> SessionUser {
-        commands::create_first_admin(self.state(), "Boss".to_string(), ADMIN_PASS.to_string())
-            .expect("create first admin")
-            .user
+        let result = commands::create_first_admin_for_company(self.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
+            .expect("create first admin");
+        if let Some(ref cid) = result.user.company_id {
+            *self.company_id.borrow_mut() = cid.clone();
+        }
+        result.user
+    }
+
+    fn company_id(&self) -> String {
+        self.company_id.borrow().clone()
     }
 
     fn create_gate_user(&self, admin: &SessionUser, name: &str) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             name.to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            "GatePass!2024".to_string(),
+            company_id,
         )
         .expect("create gate user")
+    }
+
+    fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        let user = commands::create_user(
+            self.state(),
+            admin.id.clone(),
+            name.to_string(),
+            permissions,
+            company_id.clone(),
+        )
+        .expect("create user");
+        commands::set_initial_password(self.state(), name.to_string(), company_id, password.to_string())
+            .expect("set initial password");
+        user
     }
 }
 

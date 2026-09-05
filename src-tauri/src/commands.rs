@@ -2,12 +2,13 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::State;
 
-use crate::auth::{validate_password, verify_credential};
+use crate::auth::{hash_credential, validate_password, verify_credential};
 use crate::db::{append_audit, now_iso, AppState, PERMISSION_CATALOG, ROLE_PRESETS};
 use crate::models::{
     AppStatus, LoginResult, PasswordStrength, PermissionChangeResult, PermissionView, RolePresetView,
     SessionUser, UserView,
 };
+use crate::sync;
 
 // ── Session token management ───────────────────────────────────────────────
 // Token-based persistent login: on login we generate a random token, store
@@ -132,7 +133,7 @@ fn load_session_user(conn: &Connection, user_id: &str) -> Result<SessionUser, St
     let row = conn
         .query_row(
             "SELECT id, name, auth_type, status, theme_mode, theme_accent, phone_number,
-                    profile_photo_ref, language_preference, notification_sound, must_change_password
+                    profile_photo_ref, language_preference, notification_sound, must_change_password, company_id
              FROM users WHERE id = ?1",
             params![user_id],
             |r| {
@@ -148,6 +149,7 @@ fn load_session_user(conn: &Connection, user_id: &str) -> Result<SessionUser, St
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, Option<i64>>(9)?,
                     r.get::<_, i64>(10)?,
+                    r.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -190,6 +192,7 @@ fn load_session_user(conn: &Connection, user_id: &str) -> Result<SessionUser, St
         language_preference: row.8,
         notification_sound: row.9.map(|v| v != 0),
         must_change_password: row.10 != 0,
+        company_id: row.11,
     })
 }
 
@@ -220,6 +223,57 @@ fn set_credential(conn: &Connection, user_id: &str, credential: &str) -> Result<
         params![hash, now_iso(), user_id],
     )
     .map_err(|e| format!("credential update failed: {e}"))?;
+    Ok(())
+}
+
+/// Set initial password for a user (first-time login).
+/// Called when credential_hash is 'pending' (not set yet).
+#[tauri::command]
+pub fn set_initial_password(
+    state: State<AppState>,
+    username: String,
+    company_id: String,
+    password: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    
+    // Find user by username and company
+    let user_id: Option<String> = match conn.query_row(
+            "SELECT id FROM users WHERE name = ?1 AND company_id = ?2",
+            params![username.trim(), company_id],
+            |r| r.get(0),
+        ) {
+        Ok(id) => Some(id),
+        Err(_) => None,
+    };
+    
+    let user_id = user_id.ok_or("Username not found in this company.")?;
+    
+    // Check if password is already set
+    let current_hash: Option<String> = match conn.query_row(
+            "SELECT credential_hash FROM users WHERE id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        ) {
+        Ok(hash) => Some(hash),
+        Err(_) => None,
+    };
+    
+    if current_hash.as_deref() != Some("pending") {
+        return Err("Password has already been set. Use login instead.".to_string());
+    }
+    
+    // Validate and set password
+    set_credential(&conn, &user_id, &password)?;
+    
+    append_audit(
+        &conn,
+        &user_id,
+        "set_initial_password",
+        Some(&user_id),
+        Some(serde_json::json!({ "username": username })),
+    )?;
+    
     Ok(())
 }
 
@@ -294,12 +348,14 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
     if name.is_empty() {
         return Err("Name is required.".to_string());
     }
+    let now = now_iso();
+
     let id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
         "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
          VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
-        params![id, name, hash, now_iso()],
+        params![id, name, hash, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -313,7 +369,7 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
         let pid = crate::db::permission_id_for_key(&conn, key)?;
         conn.execute(
             "INSERT INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
-            params![id, pid, now_iso()],
+            params![id, pid, now],
         )
         .map_err(|e| format!("permission grant failed: {e}"))?;
     }
@@ -346,11 +402,188 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
 }
 
 #[tauri::command]
-pub fn login_password(state: State<AppState>, username: String, password: String) -> Result<LoginResult, String> {
+pub fn create_first_admin_for_company(
+    state: State<AppState>,
+    name: String,
+    password: String,
+    company_name: String,
+) -> Result<LoginResult, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let user_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .map_err(|e| format!("user count failed: {e}"))?;
+    if user_count != 0 {
+        return Err("First admin already created.".to_string());
+    }
+    let strength = validate_password(&password);
+    if !strength.valid {
+        return Err("Password does not meet the required strength rules.".to_string());
+    }
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    let company_name = company_name.trim().to_string();
+    if company_name.is_empty() {
+        return Err("Company name is required.".to_string());
+    }
+    let now = now_iso();
+
+    let company_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO companies (id, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)",
+        params![company_id, company_name, now],
+    )
+    .map_err(|e| format!("company creation failed: {e}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_credential(&password)?;
+    conn.execute(
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, company_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![id, name, hash, company_id, now],
+    )
+    .map_err(|e| format!("admin creation failed: {e}"))?;
+
+    let admin_keys: &[&str] = ROLE_PRESETS
+        .iter()
+        .find(|(_, n, _)| *n == "Admin")
+        .map(|(_, _, keys)| *keys)
+        .unwrap();
+    for key in admin_keys {
+        let pid = crate::db::permission_id_for_key(&conn, key)?;
+        conn.execute(
+            "INSERT INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
+            params![id, pid, now],
+        )
+        .map_err(|e| format!("permission grant failed: {e}"))?;
+    }
+    append_audit(&conn, &id, "created_user", Some(&id), Some(serde_json::json!({ "name": name, "preset": "Admin" })))?;
+    append_audit(&conn, &id, "first_admin_created", Some(&id), Some(serde_json::json!({ "name": name })))?;
+
+    let recovery_code = generate_recovery_code();
+    save_recovery_code(&conn, &recovery_code)?;
+    if let Some(dir) = state.frames_dir.parent() {
+        crate::db::write_recovery_file(dir, &recovery_code)?;
+    }
+
+    save_session_token(&conn, &id)?;
+
+    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+        user_id: id.clone(),
+        logged_in_at: now_iso(),
+        auth_type: "password".to_string(),
+    });
+    let user = load_session_user(&conn, &id)?;
+    Ok(LoginResult {
+        must_change_password: false,
+        recovery_code: Some(recovery_code),
+        user,
+    })
+}
+
+#[tauri::command]
+pub fn create_company_and_admin(
+    state: State<AppState>,
+    company_name: String,
+    admin_name: String,
+    password: String,
+) -> Result<LoginResult, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let user_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .map_err(|e| format!("user count failed: {e}"))?;
+    if user_count != 0 {
+        return Err("First admin already created.".to_string());
+    }
+
+    let company_name = company_name.trim().to_string();
+    if company_name.is_empty() {
+        return Err("Company name is required.".to_string());
+    }
+
+    let strength = validate_password(&password);
+    if !strength.valid {
+        return Err("Password does not meet the required strength rules.".to_string());
+    }
+
+    let admin_name = admin_name.trim().to_string();
+    if admin_name.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+
+    let now = now_iso();
+
+    // Create company
+    let company_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO companies (id, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)",
+        params![company_id, company_name, now],
+    )
+    .map_err(|e| format!("company creation failed: {e}"))?;
+
+    // Create admin user
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let hash = crate::auth::hash_credential(&password)?;
+    conn.execute(
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, company_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![user_id, admin_name, hash, company_id, now],
+    )
+    .map_err(|e| format!("admin creation failed: {e}"))?;
+
+    // Grant the full Admin preset bundle
+    let admin_keys: &[&str] = ROLE_PRESETS
+        .iter()
+        .find(|(_, n, _)| *n == "Admin")
+        .map(|(_, _, keys)| *keys)
+        .unwrap();
+    for key in admin_keys {
+        let pid = crate::db::permission_id_for_key(&conn, key)?;
+        conn.execute(
+            "INSERT INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
+            params![user_id, pid, now],
+        )
+        .map_err(|e| format!("permission grant failed: {e}"))?;
+    }
+
+    append_audit(&conn, &user_id, "created_user", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "preset": "Admin", "company": company_name })))?;
+    append_audit(&conn, &user_id, "first_admin_created", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "company": company_name })))?;
+
+    // One-time recovery code for the single-admin "forgot password" scenario.
+    let recovery_code = generate_recovery_code();
+    save_recovery_code(&conn, &recovery_code)?;
+    if let Some(dir) = state.frames_dir.parent() {
+        crate::db::write_recovery_file(dir, &recovery_code)?;
+    }
+
+    // Save persistent session token
+    save_session_token(&conn, &user_id)?;
+
+    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+        user_id: user_id.clone(),
+        logged_in_at: now,
+        auth_type: "password".to_string(),
+    });
+    let user = load_session_user(&conn, &user_id)?;
+    Ok(LoginResult {
+        must_change_password: false,
+        recovery_code: Some(recovery_code),
+        user,
+    })
+}
+
+#[tauri::command]
+pub fn login_password(
+    state: State<AppState>,
+    username: String,
+    password: String,
+) -> Result<LoginResult, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let row = conn
         .query_row(
-            "SELECT id, name, auth_type, credential_hash, status, revoked_by, must_change_password, failed_login_attempts, locked_until FROM users WHERE name = ?1",
+            "SELECT id, name, auth_type, credential_hash, status, revoked_by, must_change_password, failed_login_attempts, locked_until
+             FROM users WHERE name = ?1",
             params![username.trim()],
             |r| {
                 Ok((
@@ -366,7 +599,7 @@ pub fn login_password(state: State<AppState>, username: String, password: String
                 ))
             },
         )
-        .map_err(|_| "Incorrect username or password.".to_string())?;
+        .map_err(|_| "No account found with this username.".to_string())?;
 
     // --- Brute-force lockout check (audit §2.2) ---
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -416,7 +649,7 @@ pub fn login_password(state: State<AppState>, username: String, password: String
             ).map_err(|e| e.to_string())?;
             append_audit(&conn, &row.0, "login_failed", None, Some(serde_json::json!({ "name": row.1, "attempts": attempts })))?;
         }
-        return Err("Incorrect username or password.".to_string());
+        return Err("Incorrect password. Please try again.".to_string());
     }
     // Successful login — reset failed attempts
     conn.execute(
@@ -434,6 +667,29 @@ pub fn login_password(state: State<AppState>, username: String, password: String
     });
     let user = load_session_user(&conn, &id)?;
     append_audit(&conn, &id, "login", Some(&id), Some(serde_json::json!({ "method": "password", "name": row.1 })))?;
+    
+    // Auto-pull config from PostgreSQL on login (best-effort, non-blocking)
+    // Extract data before spawning thread to avoid borrowing issues
+    let company_id = conn.query_row(
+        "SELECT company_id FROM users WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, String>(0),
+    ).ok();
+    drop(conn);
+    
+    if let Some(company_id) = company_id {
+        let pg = state.pg.clone();
+        let db = state.db.clone();
+        let user_id = id.clone();
+        std::thread::spawn(move || {
+            // Pull config from PostgreSQL
+            let _ = crate::sync::pull_company_config_raw(&pg, &db, &company_id);
+            
+            // Update machine heartbeat
+            crate::update_machine_heartbeat_raw(&db, &pg, &user_id, &company_id, "gate_person");
+        });
+    }
+    
     Ok(LoginResult {
         must_change_password: row.6 != 0,
         recovery_code: None,
@@ -536,10 +792,15 @@ pub fn list_role_presets(state: State<AppState>) -> Result<Vec<RolePresetView>, 
 }
 
 #[tauri::command]
-pub fn list_users(state: State<AppState>) -> Result<Vec<UserView>, String> {
+pub fn list_users(state: State<AppState>, include_deleted: bool) -> Result<Vec<UserView>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let sql = if include_deleted {
+        "SELECT id, name, auth_type, status, phone_number, theme_mode, theme_accent, created_at FROM users ORDER BY name"
+    } else {
+        "SELECT id, name, auth_type, status, phone_number, theme_mode, theme_accent, created_at FROM users WHERE status != 'deleted' ORDER BY name"
+    };
     let mut stmt = conn
-        .prepare("SELECT id, name, auth_type, status, phone_number, theme_mode, theme_accent, created_at FROM users ORDER BY name")
+        .prepare(sql)
         .map_err(|e| format!("user list failed: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -567,14 +828,14 @@ pub fn list_users(state: State<AppState>) -> Result<Vec<UserView>, String> {
 }
 
 /// Admin creates a user. Credential kind is derived from the granted permissions,
-/// not chosen freely (03 §3).
+/// not chosen freely (03 §3). The admin sets the initial password.
 #[tauri::command]
 pub fn create_user(
     state: State<AppState>,
     actor_id: String,
     name: String,
+    password: String,
     permission_keys: Vec<String>,
-    initial_password: String,
 ) -> Result<UserView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     ensure_admin_permission(&conn, &actor_id, "manage_users")?;
@@ -584,23 +845,62 @@ pub fn create_user(
         return Err("Name is required.".to_string());
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-         VALUES (?1, ?2, 'password', 'pending', 'active', ?3, ?3)",
-        params![id, name, now_iso()],
-    )
-    .map_err(|e| format!("user creation failed: {e}"))?;
+    // Check if a user with this name already exists (including soft-deleted)
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, status FROM users WHERE name = ?1",
+            params![&name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    // Check if a user with this name already exists (including soft-deleted)
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, status FROM users WHERE name = ?1",
+            params![&name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
 
-    if let Err(e) = set_credential(&conn, &id, &initial_password) {
-        let _ = conn.execute("DELETE FROM users WHERE id = ?1", params![id]);
-        return Err(e);
-    }
+    let (id, is_restored) = if let Some((existing_id, status)) = &existing {
+        if status == "deleted" {
+            // Reactivate the deleted user - this preserves audit history
+            // Set synced=0 so the restored user will be pushed to Supabase on next sync
+            conn.execute(
+                "UPDATE users SET status = 'active', revoked_by = NULL, revoked_at = NULL, credential_hash = ?1, synced = 0 WHERE id = ?2",
+                params![hash_credential(&password)?, existing_id],
+            )
+            .map_err(|e| format!("failed to restore deleted user: {}", e))?;
+            (existing_id.clone(), true)
+        } else {
+            return Err(format!("A user with the name '{}' already exists. Please choose a different name.", name));
+        }
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Hash the password provided by admin
+        let hash = hash_credential(&password)?;
+        // Insert user with hashed password
+        conn.execute(
+            "INSERT INTO users (id, name, auth_type, credential_hash, status, synced, created_at, updated_at)
+             VALUES (?1, ?2, 'password', ?3, 'active', 0, ?4, ?4)",
+            params![id, name, hash, now_iso()],
+        )
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("UNIQUE constraint") {
+                "A user with this name already exists.".to_string()
+            } else {
+                format!("failed to create user: {}", e)
+            }
+        })?;
+        (id, false)
+    };
 
+    // If restored, permissions may need to be re-added - add them as requested
     for key in &permission_keys {
         let pid = crate::db::permission_id_for_key(&conn, key)?;
         conn.execute(
-            "INSERT INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?3, ?4)",
             params![id, pid, actor_id, now_iso()],
         )
         .map_err(|e| format!("permission grant failed: {e}"))?;
@@ -791,9 +1091,11 @@ pub fn change_own_credential(
     let current_hash: String = conn
         .query_row("SELECT credential_hash FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
         .map_err(|_| "account not found".to_string())?;
+
     if !verify_credential(&current_hash, &current_credential) {
         return Err("Current credential is incorrect.".to_string());
     }
+
     set_credential(&conn, &user_id, &new_credential)?;
     // Changing your own password clears any admin-imposed forced change.
     conn.execute("UPDATE users SET must_change_password = 0 WHERE id = ?1", params![user_id])
@@ -1142,6 +1444,9 @@ pub fn purge_user(
     tx.execute("DELETE FROM users WHERE id = ?1", params![user_id])
         .map_err(|e| format!("user delete failed: {e}"))?;
     tx.commit().map_err(|e| format!("commit failed: {e}"))?;
+    // Record deletion for central sync AFTER successful commit
+    sync::record_deleted_ids(&conn, "users", &[user_id.clone()])
+        .map_err(|e| format!("record delete failed: {e}"))?;
     append_audit(&conn, &actor_id, "purged_user", Some(&user_id), None)?;
     Ok(())
 }

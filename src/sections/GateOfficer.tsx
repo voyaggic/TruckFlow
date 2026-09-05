@@ -811,6 +811,29 @@ function ResolveScreen({
     }
   };
 
+  const logTripManually = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const cap = capacity.trim() === "" ? null : Number(capacity);
+      const logged = await api.resolveQueuedManual(
+        trip.id,
+        officerId,
+        companyId || null,
+        driverId || null,
+        Number.isFinite(cap as number) ? (cap as number) : null,
+        capacityUnit,
+        receipt.trim() || null,
+      );
+      await onDone(`Trip ${logged.plate_number} logged.`, logged);
+    } catch (e) {
+      setError(String(e));
+      setTimeout(() => setError(null), 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const discard = async () => {
     setBusy(true);
     setError(null);
@@ -988,6 +1011,11 @@ function ResolveScreen({
                   New vehicle
                 </button>
               )}
+              {canEditTrip && !selectedVehicleId ? (
+                <button className="ghost" onClick={logTripManually} disabled={busy}>
+                  Log trip anyway
+                </button>
+              ) : null}
               {canEditTrip ? (
                 <button className="danger" onClick={() => setConfirmingDiscard(true)} disabled={busy}>
                   Discard
