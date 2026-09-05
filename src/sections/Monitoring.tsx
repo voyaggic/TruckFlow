@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { MachineStatusView, MonitoringDashboard, UserStatusView } from "../lib/types";
+import type { MonitoringDashboard } from "../lib/types";
 import type { SessionUser } from "../lib/types";
 
 function formatTimeAgo(dateStr: string): string {
@@ -11,10 +11,6 @@ function formatTimeAgo(dateStr: string): string {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return `${Math.floor(diff / 86400)}d ago`;
-}
-
-function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleString();
 }
 
 function OnlineIndicator({ online }: { online: boolean }) {
@@ -144,12 +140,9 @@ export function MonitoringDashboard({ user }: { user: SessionUser }) {
           </div>
           <div>
             <div className="muted small" style={{ marginBottom: 2 }}>Role</div>
-            <div style={{ fontWeight: 500 }}>{user.permissions.includes("manage_users") ? "Administrator" : "User"}</div>
+            <div style={{ fontWeight: 500 }}>{user.permissions.some(p => p.key === "manage_users") ? "Administrator" : "User"}</div>
           </div>
-          <div>
-            <div className="muted small" style={{ marginBottom: 2 }}>Session started</div>
-            <div style={{ fontWeight: 500 }}>{formatDate(user.created_at)}</div>
-          </div>
+
           <div>
             <div className="muted small" style={{ marginBottom: 2 }}>Account ID</div>
             <div style={{ fontFamily: "monospace", fontSize: 12 }}>{user.id.slice(0, 8)}...</div>
