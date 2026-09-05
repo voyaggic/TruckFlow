@@ -4047,7 +4047,38 @@ impl RestPostgres {
         let sql = self.generate_create_table_sql(table);
         match self.exec_sql(&sql) {
             Ok(_) => {
-                crate::log::log(&format!("[sync] create_table_if_missing: {table} OK"));
+                crate::log::log(&format!("[sync] create_table_if_missing: {table} OK, ensuring notify function exists"));
+                // First ensure the notify function exists
+                let create_fn_sql = r#"
+                    CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()
+                    RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+                    BEGIN
+                      NOTIFY pgrst, 'reload schema cache';
+                    END;
+                    $$;
+                    GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
+                "#;
+                if let Ok(config) = self.config.lock() {
+                    if let Some(cfg) = config.as_ref() {
+                        // Create the function first
+                        let fn_url = format!("https://{}.supabase.co/sql", cfg.project_ref);
+                        let _ = self.client.post(&fn_url)
+                            .header("apikey", &cfg.service_role_key)
+                            .header("Authorization", format!("Bearer {}", cfg.service_role_key))
+                            .header("Content-Type", "application/json")
+                            .body(create_fn_sql.to_string())
+                            .send();
+                        
+                        // Then call it to reload schema cache
+                        let rpc_url = format!("https://{}.supabase.co/rest/v1/rpc/notify_pgrst_cache_needs_refresh", cfg.project_ref);
+                        let _ = self.client.post(&rpc_url)
+                            .header("apikey", &cfg.service_role_key)
+                            .header("Authorization", format!("Bearer {}", cfg.service_role_key))
+                            .header("Content-Type", "application/json")
+                            .send();
+                        crate::log::log(&format!("[sync] create_table_if_missing: {table} schema cache refresh notified"));
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
