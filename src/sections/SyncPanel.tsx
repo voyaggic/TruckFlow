@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
+import { listen } from "@tauri-apps/api/event";
 
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
@@ -16,13 +17,28 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
 
   useEffect(() => {
     refresh();
+    // Auto-refresh every 5 seconds so pending counts update as the
+    // background poller pushes rows. Pure read-only call — no I/O beyond
+    // a single SQLite query, so no lag or freeze.
+    const id = setInterval(refresh, 5000);
+
+    // Listen for tables-created event and trigger sync automatically
+    const unlisten = listen("pg-tables-created", () => {
+      console.log("[SyncPanel] pg-tables-created received, triggering sync...");
+      fire("pg-auto-sync", () => api.syncNowPg(user.id), { successEvent: "pg-sync-done" });
+    });
+
+    return () => {
+      clearInterval(id);
+      unlisten.then((fn) => fn());
+    };
   }, [refresh]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
 
   // Non-blocking run: fires action, shows pending on that item, never freezes UI
-  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => {
-    fire(key, fn, { successMsg: okMsg, successEvent: event, refresh });
+  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => {
+    fire(key, fn, { successMsg: okMsg, successEvent: event, errorEvent, refresh });
   };
 
   return (
@@ -68,13 +84,28 @@ function PostgresPanel({
   status: SyncStatusView | null;
   totalPending: number;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {
   const [connString, setConnString] = useState("");
+  const [pat, setPat] = useState("");
+  const [connType, setConnType] = useState<"pgbouncer" | "rest">("pgbouncer");
   const [tripRetention, setTripRetention] = useState("");
   const pg = status?.pg;
+
+  // Track the pending count when sync starts so we can show incremental
+  // progress ("3 of 120 rows synced") as the background poller pushes.
+  // Baseline resets to 0 when all synced, or ratchets up if new rows arrive.
+  const [pgBaseline, setPgBaseline] = useState(0);
+  useEffect(() => {
+    if (totalPending > 0) {
+      setPgBaseline((prev) => (prev === 0 || totalPending > prev ? totalPending : prev));
+    } else {
+      setPgBaseline(0);
+    }
+  }, [totalPending]);
+  const pgSynced = pgBaseline > 0 ? pgBaseline - totalPending : 0;
 
   const saveTripRetention = () => {
     const v = tripRetention.trim();
@@ -91,7 +122,37 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured");
+    let finalConnString = connString.trim();
+    if (connType === "rest") {
+      // User provides only the service_role key (eyJ...)
+      // Extract project_ref from JWT payload, build 3-part format: REST|URL|service_role_key
+      const apiKey = finalConnString;
+
+      try {
+        const parts = apiKey.split('.');
+        if (parts.length !== 3) {
+          window.alert("Invalid service_role key format. Should be a JWT like: eyJ...");
+          return;
+        }
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        const projectRef = payload?.ref;
+        if (!projectRef) {
+          window.alert("Could not extract project reference from service_role key.");
+          return;
+        }
+        // 3-part format: REST|URL|service_role_key
+        finalConnString = `REST|https://${projectRef}.supabase.co/rest/v1|${apiKey}`;
+      } catch (e) {
+        window.alert("Failed to parse service_role key. Make sure you copied the full key starting with eyJ...");
+        return;
+      }
+    }
+    run("pg-connect", async () => {
+      await api.configurePostgres(actor.id, finalConnString);
+      if (connType === "rest" && pat.trim()) {
+        await api.createPostgresTables(actor.id, pat.trim());
+      }
+    }, "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
   };
 
   const disconnect = () => {
@@ -127,17 +188,59 @@ function PostgresPanel({
         <div className="stack">
           <p className="muted small">
             Connect to a PostgreSQL server by pasting its connection string. The first connect <b>creates the database
-            and its tables automatically</b>, so setup is paste-and-go. On this machine your local server accepts:
+            and its tables automatically</b>, so setup is paste-and-go.
           </p>
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <span className="muted small">Connection type:</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "pgbouncer"}
+                onChange={() => setConnType("pgbouncer")}
+              />
+              <span className="small">PgBouncer (fast, recommended)</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "rest"}
+                onChange={() => setConnType("rest")}
+              />
+              <span className="small">REST API (more resilient for unstable connections)</span>
+            </label>
+          </div>
           <div className="row">
             <div className="field grow">
               <label>Connection string</label>
               <input
                 value={connString}
                 onChange={(e) => setConnString(e.target.value)}
-                placeholder="postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                placeholder={connType === "pgbouncer"
+                  ? "postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                  : "Paste your Supabase service_role key (eyJ...)"}
                 spellCheck={false}
               />
+              {connType === "rest" && (
+                <p className="muted small" style={{ marginTop: 4 }}>
+                  Paste the <b>service_role</b> key from Supabase Dashboard → Settings → API.
+                </p>
+              )}
+              {connType === "rest" && (
+                <div className="field" style={{ marginTop: 8 }}>
+                  <label>Personal Access Token (for table creation)</label>
+                  <input
+                    value={pat}
+                    onChange={(e) => setPat(e.target.value)}
+                    placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                    spellCheck={false}
+                  />
+                  <p className="muted small" style={{ marginTop: 4 }}>
+                    Generate at Supabase Dashboard → Settings → API → Personal Tokens → "Create a new token"
+                  </p>
+                </div>
+              )}
             </div>
             <div className="field">
               <label>&nbsp;</label>
@@ -174,10 +277,34 @@ function PostgresPanel({
             </table>
           )}
 
+          {pgSynced > 0 && (
+            <div style={{ margin: '4px 0 8px' }}>
+              <div style={{
+                height: 4,
+                borderRadius: 2,
+                background: 'var(--border, #e0e0e0)',
+                overflow: 'hidden',
+                marginBottom: 4,
+              }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(pgSynced / pgBaseline) * 100}%`,
+                  background: 'var(--primary, #1976d2)',
+                  borderRadius: 2,
+                  transition: 'width 0.4s ease',
+                }} />
+              </div>
+              <p className="muted small" style={{ margin: 0 }}>
+                Syncing… {pgSynced} of {pgBaseline} rows pushed by background sync.
+              </p>
+            </div>
+          )}
           <p className="muted small">
             {totalPending === 0
               ? "All data synced."
-              : `${totalPending} record${totalPending === 1 ? "" : "s"} waiting for connectivity.`}{" "}
+              : pg?.connected
+                ? `${totalPending} record${totalPending === 1 ? "" : "s"} pending — sync in progress.`
+                : `${totalPending} record${totalPending === 1 ? "" : "s"} waiting for connectivity.`}{" "}
             {status?.pg.last_synced_at ? `Last sync: ${new Date(status.pg.last_synced_at).toLocaleString()}` : "No sync yet."}
           </p>
 
@@ -225,7 +352,7 @@ function ColumnMappingPanel({
   isPending: _isPending,
 }: {
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
 }) {
   const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
@@ -233,13 +360,16 @@ function ColumnMappingPanel({
   const [editHeader, setEditHeader] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    let cancelled = false;
     api.getSheetColumnMapping().then((m) => {
+      if (cancelled) return;
       setMapping(m);
       const h: Record<string, string> = {};
       m.forEach((e) => (h[e.field_key] = e.header));
       setEditHeader(h);
       setLoading(false);
     });
+    return () => { cancelled = true; };
   }, []);
 
   const save = () => {
@@ -375,7 +505,7 @@ function SheetsPanel({
 }: {
   status: SyncStatusView | null;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {
@@ -385,6 +515,19 @@ function SheetsPanel({
   const [sharedGroup, setSharedGroup] = useState("");
   const [frequency, setFrequency] = useState<string>("realtime");
   const [retention, setRetention] = useState<string>("");
+
+  // Track the pending count when export starts so we can show incremental
+  // progress as the background poller pushes trips to the sheet.
+  const sheetsPending = sheets?.pending ?? 0;
+  const [sheetsBaseline, setSheetsBaseline] = useState(0);
+  useEffect(() => {
+    if (sheetsPending > 0) {
+      setSheetsBaseline((prev) => (prev === 0 || sheetsPending > prev ? sheetsPending : prev));
+    } else {
+      setSheetsBaseline(0);
+    }
+  }, [sheetsPending]);
+  const sheetsSynced = sheetsBaseline > 0 ? sheetsBaseline - sheetsPending : 0;
 
   const saveRetention = () => {
     const v = retention.trim();
@@ -402,6 +545,8 @@ function SheetsPanel({
     run("sheets-connect",
       () => api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
       "Google Sheets connected — logged trips will now export.",
+      "sheets-configured",
+      "sheets-config-error",
     );
   };
 
@@ -538,6 +683,16 @@ function SheetsPanel({
             </button>
           </div>
 
+          {sheetsSynced > 0 && (
+            <div style={{ margin: '4px 0 8px' }}>
+              <div style={{ height: 4, borderRadius: 2, background: 'var(--border, #e0e0e0)', overflow: 'hidden', marginBottom: 4 }}>
+                <div style={{ height: '100%', width: `${(sheetsSynced / sheetsBaseline) * 100}%`, background: 'var(--primary, #1976d2)', borderRadius: 2, transition: 'width 0.4s ease' }} />
+              </div>
+              <p className="muted small" style={{ margin: 0 }}>
+                Exporting… {sheetsSynced} of {sheetsBaseline} trips pushed to sheet.
+              </p>
+            </div>
+          )}
           <p className="muted small">
             {sheets.pending === 0
               ? "All logged trips exported."

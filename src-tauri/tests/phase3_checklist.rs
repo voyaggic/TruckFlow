@@ -55,16 +55,24 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
+        let db_path = tmp.db_path();
         let app = mock_app();
+        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Mutex::new(conn),
+            db: Arc::new(Mutex::new(conn)),
+            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
             pg: Arc::new(MockPostgres::new()),
             sheets: Arc::new(MockSheets::new()),
+            anpr_processes: Arc::new(Mutex::new(Vec::new())),
+            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+            sync_notify: sync_tx,
         });
         Self { _tmp: tmp, app }
     }
@@ -596,7 +604,7 @@ fn training_candidates_flag_low_confidence_and_human_corrected() {
     files.dedup();
     assert_eq!(files.len(), 3, "distinct frame files flagged");
     for fr in &files {
-        let prefix = format!("{}/", queued.id);
+        let prefix = format!("{}{}entry{}", queued.id, std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR);
         assert!(
             fr.starts_with(&prefix) && fr.ends_with(".png"),
             "frame_ref must reference the persisted frame file, got {fr}"
@@ -642,7 +650,7 @@ fn training_candidates_flag_low_confidence_and_human_corrected() {
     // manual entry of A123AB closes the earlier open trip as its exit, so
     // logged.id is the old trip (which already has candidates from the low-
     // confidence flagging). Use A223AB (registered, no open trip).
-    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir()).unwrap();
+    let manual = truckflow_lib::capture::manual_entry_impl(&ctx.conn(), &admin.id, "A223AB", &ctx.frames_dir(), None).unwrap();
     let logged = manual.trip.expect("manual exact match logs");
     assert_eq!(candidate_rows(&ctx, &logged.id).len(), 0, "manual entries carry no frames to flag");
 }

@@ -15,6 +15,7 @@ use crate::models::{
     ReferenceEntity, ReferenceImportPreview, ReferenceImportRequest, ReferenceImportSummary,
     SheetPreview, VehicleView,
 };
+use crate::sync;
 
 const REF_PERM: &str = "manage_reference_database";
 
@@ -527,6 +528,9 @@ pub fn delete_company(state: State<AppState>, actor_id: String, company_id: Stri
         params![company_id],
     )
     .map_err(|e| format!("trip company unlink failed: {e}"))?;
+    // Record deletion for central sync BEFORE deleting locally
+    sync::record_deleted_ids(&conn, "companies", &[company_id.clone()])
+        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM companies WHERE id = ?1", params![company_id])
         .map_err(|e| format!("company delete failed: {e}"))?;
@@ -553,6 +557,9 @@ pub fn delete_driver(state: State<AppState>, actor_id: String, driver_id: String
         params![driver_id],
     )
     .map_err(|e| format!("trip driver unlink failed: {e}"))?;
+    // Record deletion for central sync BEFORE deleting locally
+    sync::record_deleted_ids(&conn, "drivers", &[driver_id.clone()])
+        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM drivers WHERE id = ?1", params![driver_id])
         .map_err(|e| format!("driver delete failed: {e}"))?;
@@ -574,6 +581,9 @@ pub fn delete_vehicle(state: State<AppState>, actor_id: String, vehicle_id: Stri
         params![vehicle_id],
     )
     .map_err(|e| format!("vehicle unlink failed: {e}"))?;
+    // Record deletion for central sync BEFORE deleting locally
+    sync::record_deleted_ids(&conn, "vehicles", &[vehicle_id.clone()])
+        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM vehicles WHERE id = ?1", params![vehicle_id])
         .map_err(|e| format!("vehicle delete failed: {e}"))?;
@@ -1108,11 +1118,14 @@ fn read_csv_rows(path: &std::path::Path) -> Result<Vec<Vec<String>>, String> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(path)
-        .map_err(|e| format!("csv open failed: {e}"))?;
+        .map_err(|e| format!("Failed to open CSV file: {e}. Ensure the file is a valid CSV with UTF-8 encoding."))?;
     let mut out = Vec::new();
     for rec in rdr.records() {
-        let rec = rec.map_err(|e| format!("csv record failed: {e}"))?;
+        let rec = rec.map_err(|e| format!("Failed to read CSV row: {e}. The file may contain invalid characters or be corrupted."))?;
         out.push(rec.iter().map(|s| s.to_string()).collect());
+    }
+    if out.is_empty() {
+        return Err("The CSV file is empty. Please add data before importing.".to_string());
     }
     Ok(out)
 }
@@ -2012,17 +2025,25 @@ fn field_label(conn: &Connection, entity_type: &str, key: &str) -> Option<String
 
 /// Read every worksheet of an XLSX file as (sheet name, rows incl. header).
 fn read_xlsx_sheets(path: &std::path::Path) -> Result<Vec<(String, Vec<Vec<String>>)>, String> {
-    let mut workbook = calamine::open_workbook_auto(path).map_err(|e| format!("xlsx open failed: {e}"))?;
+    let mut workbook = calamine::open_workbook_auto(path)
+        .map_err(|e| format!("Failed to open Excel file: {e}. Ensure the file is a valid .xlsx or .xls file."))?;
     let names: Vec<String> = workbook.sheet_names().to_vec();
+    if names.is_empty() {
+        return Err("The Excel file has no worksheets. Please add a sheet with data before importing.".to_string());
+    }
     let mut out = Vec::new();
     for name in names {
         let range = workbook
             .worksheet_range(&name)
-            .map_err(|e| format!("xlsx sheet '{name}' read failed: {e}"))?;
-        out.push((
-            name,
-            range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect(),
-        ));
+            .map_err(|e| format!("Failed to read sheet '{name}': {e}. The sheet may be corrupted."))?;
+        let rows: Vec<Vec<String>> = range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        out.push((name, rows));
+    }
+    if out.is_empty() {
+        return Err("The Excel file contains no data. Please add data before importing.".to_string());
     }
     Ok(out)
 }

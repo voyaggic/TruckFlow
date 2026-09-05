@@ -22,6 +22,7 @@ import type {
   LoginResult,
   MachineInfo,
   ModelVersionView,
+  MonitoringDashboard,
   OfficerActivityView,
   PasswordResetRequestView,
   PasswordStrength,
@@ -60,6 +61,9 @@ export const api = {
   createFirstAdmin: (name: string, password: string) =>
     invoke<LoginResult>("create_first_admin", { name, password }),
 
+  createCompanyAndAdmin: (companyName: string, adminName: string, password: string) =>
+    invoke<LoginResult>("create_company_and_admin", { companyName, adminName, password }),
+
   loginPassword: (username: string, password: string) =>
     invoke<LoginResult>("login_password", { username, password }),
 
@@ -75,10 +79,10 @@ export const api = {
 
   listRolePresets: () => invoke<RolePresetView[]>("list_role_presets"),
 
-  listUsers: () => invoke<UserView[]>("list_users"),
+  listUsers: (includeDeleted: boolean = false) => invoke<UserView[]>("list_users", { includeDeleted }),
 
-  createUser: (actorId: string, name: string, permissionKeys: string[], initialPassword: string) =>
-    invoke<UserView>("create_user", { actorId, name, permissionKeys, initialPassword }),
+  createUser: (actorId: string, name: string, password: string, permissionKeys: string[]) =>
+    invoke<UserView>("create_user", { actorId, name, password, permissionKeys }),
 
   setUserPermissions: (actorId: string, userId: string, permissionKeys: string[], actorCredential: string) =>
     invoke<PermissionChangeResult>("set_user_permissions", { actorId, userId, permissionKeys, actorCredential }),
@@ -345,8 +349,8 @@ export const api = {
   simulateRead: (plate: string, confidence: number) =>
     invoke<IngestResult>("simulate_read", { plate, confidence }),
 
-  manualEntry: (plate: string, officerId: string) =>
-    invoke<IngestResult>("manual_entry", { plate, officerId }),
+  manualEntry: (plate: string, officerId: string, isDischarge?: boolean) =>
+    invoke<IngestResult>("manual_entry", { plate, officerId, isDischarge: isDischarge ?? null }),
 
   approveTrip: (tripId: string, officerId: string) =>
     invoke<TripView>("approve_trip", { tripId, officerId }),
@@ -452,6 +456,25 @@ export const api = {
       extraFields: extraFields ? JSON.stringify(extraFields) : null,
     }),
 
+  resolveQueuedManual: (
+    tripId: string,
+    officerId: string,
+    companyId: string | null,
+    driverId: string | null,
+    capacityAtTrip: number | null,
+    capacityUnit: string,
+    receiptNo: string | null,
+  ) =>
+    invoke<TripView>("resolve_queued_manual", {
+      tripId,
+      officerId,
+      companyId,
+      driverId,
+      capacityAtTrip,
+      capacityUnit,
+      receiptNo,
+    }),
+
   discardTrip: (tripId: string, officerId: string) =>
     invoke<TripView>("discard_trip", { tripId, officerId }),
 
@@ -518,6 +541,7 @@ export const api = {
         | "is_capture_point"
         | "max_pending_duration_hours"
         | "designated_machine_id"
+        | "detection_method"
       >
     >,
   ) =>
@@ -534,6 +558,7 @@ export const api = {
       isCapturePoint: changes.is_capture_point ?? null,
       maxPendingDurationHours: changes.max_pending_duration_hours ?? null,
       designatedMachineId: changes.designated_machine_id ?? null,
+      detectionMethod: changes.detection_method ?? null,
     }),
 
   listCameraSources: () => invoke<CameraSourceView[]>("list_camera_sources"),
@@ -683,6 +708,9 @@ export const api = {
   configurePostgres: (actorId: string, connectionString: string) =>
     invoke<string>("configure_postgres", { actorId, connectionString }),
 
+  createPostgresTables: (actorId: string, pat: string) =>
+    invoke<string>("create_postgres_tables", { actorId, pat }),
+
   disconnectPostgres: (actorId: string) =>
     invoke<string>("disconnect_postgres", { actorId }),
 
@@ -693,7 +721,7 @@ export const api = {
     sharedGroup: string | null,
     syncFrequency: string,
   ) =>
-    invoke<SheetsStateView>("configure_google_sheets", {
+    invoke<string>("configure_google_sheets", {
       actorId,
       serviceAccountJson,
       targetSheetId,
@@ -758,6 +786,10 @@ export const api = {
 
   deleteHealthEvents: (actorId: string, eventIds: string[]) =>
     invoke<number>("delete_health_events", { actorId, eventIds }),
+
+  // --- Phase 7: Machine & User Monitoring ---
+
+  monitoringDashboard: (actorId: string) => invoke<MonitoringDashboard>("monitoring_dashboard", { actorId }),
 
   // --- Phase 6: Settings / profile / monitor trend ---
 

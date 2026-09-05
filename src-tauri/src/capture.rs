@@ -539,6 +539,45 @@ fn insert_queued(
     capture_method: &str,
     frames_dir: &std::path::Path,
 ) -> Result<TripView, String> {
+    // FIX: Check for existing open LOGGED trips before inserting.
+    // Without this, every scan of the same vehicle creates a duplicate logged row.
+    // Queued trips are NOT checked — multiple queued rows are by design (human resolves them).
+    if let Some(ref vid) = outcome.matched_vehicle_id {
+        let existing_open: Option<(String, String)> = conn.query_row(
+            "SELECT id, entry_time FROM trips
+             WHERE vehicle_id = ?1 AND status = 'logged' AND trip_status = 'open' AND exit_time IS NULL
+             ORDER BY entry_time DESC LIMIT 1",
+            params![vid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).ok();
+
+        if let Some((open_id, _entry_time)) = existing_open {
+            // Vehicle already has an open trip — update it instead of creating duplicate.
+            // The new scan is another entry sighting for the same visit.
+            let entry_photo_refs = crate::evidence::persist_frames(frames_dir, &open_id, &read.frames, "entry")?;
+            conn.execute(
+                "UPDATE trips SET
+                    capture_method = ?1,
+                    confidence_score = ?2,
+                    model_version = ?3,
+                    ocr_engine = ?4,
+                    entry_photo_refs = ?5,
+                    updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    capture_method,
+                    if capture_method == "auto" { Some(read.confidence) } else { None },
+                    effective_model_version(read, capture_method),
+                    effective_ocr_engine(conn, read, capture_method),
+                    entry_photo_refs,
+                    now_iso(),
+                    open_id,
+                ],
+            ).map_err(|e| format!("open trip update failed: {e}"))?;
+            return trip_by_id(conn, &open_id);
+        }
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
     let entry_photo_refs = crate::evidence::persist_frames(frames_dir, &id, &read.frames, "entry")?;
@@ -636,19 +675,34 @@ pub fn ingest_read(
 ) -> Result<IngestResult, String> {
     let plate = normalize_plate(&read.plate);
     if plate.is_empty() {
+        crate::log::log("[ANPR] ingest_read: plate normalized to empty");
         return Err("Read contained no plate.".to_string());
     }
     // At least 1 frame required for any capture (entry/exit evidence).
     // ANPR service sends 1 frame per sighting (the best-confidence crop).
     if capture_method == "auto" && read.frames.is_empty() {
+        crate::log::log("[ANPR] ingest_read: frames array is empty for auto capture");
         return Err("ANPR read must carry at least 1 frame.".to_string());
     }
 
     let threshold = confidence_threshold(conn);
+    crate::log::log(&format!(
+        "[ANPR] ingest_read: plate={} conf={} threshold={}",
+        plate, read.confidence, threshold
+    ));
+
     let outcome = cross_reference(conn, &plate)?;
+    crate::log::log(&format!(
+        "[ANPR] ingest_read: cross_ref outcome state={} matched_id={:?}",
+        outcome.state, outcome.matched_vehicle_id
+    ));
 
     // Confidence thresholding always applies to auto reads (04 §3, §6).
     if capture_method == "auto" && read.confidence < threshold {
+        crate::log::log(&format!(
+            "[ANPR] ingest_read: conf {} < threshold {}, sending to queue as low_confidence",
+            read.confidence, threshold
+        ));
         let trip = insert_queued(conn, officer_id, read, &plate, "low_confidence", &outcome, "auto", frames_dir)?;
         flag_training_candidates(conn, &trip.id, "low_confidence")?;
         return Ok(IngestResult {
@@ -661,6 +715,7 @@ pub fn ingest_read(
 
     match outcome.state.as_str() {
         "exact" | "narrowed" => {
+            crate::log::log(&format!("[ANPR] ingest_read: matched (exact/narrowed), consent={}", consent_mode(conn)));
             let vehicle = load_active_vehicles(conn)?
                 .into_iter()
                 .find(|v| Some(&v.id) == outcome.matched_vehicle_id.as_ref())
@@ -674,7 +729,9 @@ pub fn ingest_read(
             } else {
                 "queued"
             };
+            crate::log::log(&format!("[ANPR] ingest_read: status={} (consent={})", status, consent_mode(conn)));
             if status == "queued" {
+                crate::log::log("[ANPR] ingest_read: sending to queue as pending_approval");
                 let trip = insert_queued(conn, officer_id, read, &plate, "pending_approval", &outcome, capture_method, frames_dir)?;
                 return Ok(IngestResult {
                     trip: None,
@@ -686,6 +743,7 @@ pub fn ingest_read(
             // §4.3 entry/exit: a confirmed match either starts a new entry,
             // closes an open trip as its exit, or (when the pending window has
             // lapsed) marks the old trip missed_exit and starts fresh.
+            crate::log::log("[ANPR] ingest_read: creating trip via match_entry_exit");
             let result = match_entry_exit(conn, officer_id, read, &vehicle, capture_method, frames_dir)?;
             match result {
                 EntryExitOutcome::NewEntry(trip) => Ok(IngestResult {
@@ -709,6 +767,7 @@ pub fn ingest_read(
             }
         }
         "multiple" => {
+            crate::log::log("[ANPR] ingest_read: no_match (state=multiple), sending to queue");
             let trip = insert_queued(conn, officer_id, read, &plate, "multiple_matches", &outcome, capture_method, frames_dir)?;
             Ok(IngestResult {
                 trip: None,
@@ -718,6 +777,7 @@ pub fn ingest_read(
             })
         }
         _ => {
+            crate::log::log("[ANPR] ingest_read: no_match, sending to queue");
             let trip = insert_queued(conn, officer_id, read, &plate, "no_match", &outcome, capture_method, frames_dir)?;
             Ok(IngestResult {
                 trip: None,
@@ -761,8 +821,7 @@ fn match_entry_exit(
 ) -> Result<EntryExitOutcome, String> {
     let open: Option<(String, String)> = conn.query_row(
         "SELECT id, entry_time FROM trips
-         WHERE vehicle_id = ?1 AND trip_status = 'open' AND exit_time IS NULL
-           AND status = 'logged'
+         WHERE vehicle_id = ?1 AND status = 'logged' AND trip_status = 'open' AND exit_time IS NULL
          ORDER BY entry_time DESC LIMIT 1",
         params![vehicle.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -781,7 +840,8 @@ fn match_entry_exit(
             let exit_refs = crate::evidence::persist_frames(frames_dir, &open_id, &read.frames, "exit")?;
             conn.execute(
                 "UPDATE trips SET exit_time = ?1, trip_status = 'complete',
-                        exit_photo_refs = ?2, pushed_to_sheets = 0, updated_at = ?1
+                        exit_photo_refs = ?2, updated_at = ?1,
+                        is_discharge_trip = 1
                  WHERE id = ?3",
                 params![read.timestamp, exit_refs, open_id],
             ).map_err(|e| format!("exit update failed: {e}"))?;
@@ -840,6 +900,7 @@ pub fn simulate_read(
     let result = ingest_read(&conn, Some(officer), &read, "auto", &state.frames_dir)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(result)
 }
 
@@ -849,11 +910,15 @@ pub fn manual_entry(
     state: State<AppState>,
     plate: String,
     officer_id: String,
+    is_discharge: Option<bool>,
 ) -> Result<IngestResult, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let result = manual_entry_impl(&conn, &officer_id, &plate, &state.frames_dir)?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "edit_trip")
+        .map_err(|_| "Only gate officers with trip editing permissions can create manual entries.".to_string())?;
+    let result = manual_entry_impl(&conn, &officer_id, &plate, &state.frames_dir, is_discharge)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(result)
 }
 
@@ -865,6 +930,7 @@ pub fn manual_entry_impl(
     officer_id: &str,
     plate: &str,
     frames_dir: &std::path::Path,
+    is_discharge: Option<bool>,
 ) -> Result<IngestResult, String> {
     let frames: Vec<crate::models::AnprFrame> = vec![];
     let read = AnprRead {
@@ -875,7 +941,20 @@ pub fn manual_entry_impl(
         model_version: None,
         ocr_engine: Some("manual".to_string()),
     };
-    ingest_read(conn, Some(officer_id.to_string()), &read, "manual_entry", frames_dir)
+    let mut result = ingest_read(conn, Some(officer_id.to_string()), &read, "manual_entry", frames_dir)?;
+    // If caller provided a discharge classification, set it immediately on
+    // the newly created trip so the user doesn't need a separate classify step.
+    if let Some(is_dis) = is_discharge {
+        if let Some(ref trip) = result.trip {
+            conn.execute(
+                "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2 WHERE id = ?3",
+                params![if is_dis { 1 } else { 0 }, now_iso(), trip.id],
+            )
+            .map_err(|e| format!("discharge classification failed: {e}"))?;
+            result.trip = Some(trip_by_id(conn, &trip.id)?);
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -886,6 +965,8 @@ pub fn approve_trip(
     officer_id: String,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can approve trips.".to_string())?;
     let trip = approve_trip_impl(&conn, &trip_id, &officer_id)?;
     drop(conn);
     emit_capture_update(&app);
@@ -990,7 +1071,7 @@ pub fn list_today_trips(state: State<AppState>) -> Result<Vec<TripView>, String>
     let from = format!("{day}T00:00:00Z");
     let mut stmt = conn
         .prepare(&format!(
-            "{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status != 'declined' AND t.archived = 0 ORDER BY t.time_in DESC LIMIT 200"
+            "{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status NOT IN ('declined', 'queued') AND t.archived = 0 ORDER BY t.time_in DESC LIMIT 200"
         ))
         .map_err(|e| format!("trip list failed: {e}"))?;
     let rows = stmt
@@ -1020,7 +1101,7 @@ pub fn export_today_csv(
             placeholders.join(", ")
         )
     } else {
-        format!("{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status != 'declined' ORDER BY t.time_in DESC")
+        format!("{TRIP_SELECT} WHERE t.time_in >= ?1 AND t.status NOT IN ('declined', 'queued') ORDER BY t.time_in DESC")
     };
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from.clone())];
     if let Some(ref ids) = trip_ids {
@@ -1361,6 +1442,69 @@ fn resolve_to_logged(
     trip_by_id(conn, trip_id)
 }
 
+/// Log a queued trip manually without linking to a vehicle.
+/// Allows resolving with just the plate number from ANPR and optional trip details.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_queued_manual(
+    app: AppHandle,
+    state: State<AppState>,
+    trip_id: String,
+    officer_id: String,
+    company_id: Option<String>,
+    driver_id: Option<String>,
+    capacity_at_trip: Option<f64>,
+    capacity_unit: String,
+    receipt_no: Option<String>,
+) -> Result<TripView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can resolve queued trips.".to_string())?;
+
+    ensure_queued(&conn, &trip_id)?;
+
+    let resolution_row: String = conn
+        .query_row(
+            "SELECT COALESCE(resolution_notes, '{}') FROM trips WHERE id = ?1",
+            params![trip_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "{}".to_string());
+
+    let mut map = serde_json::from_str::<Value>(&resolution_row).unwrap_or(Value::Object(serde_json::Map::new()));
+    if let Value::Object(m) = &mut map {
+        m.insert("resolution".to_string(), Value::String("manual".to_string()));
+        m.insert("resolved_by".to_string(), Value::String(officer_id.clone()));
+        m.insert("resolved_at".to_string(), Value::String(now_iso()));
+    }
+
+    conn.execute(
+        "UPDATE trips SET vehicle_id = NULL, company_id = COALESCE(?1, company_id), driver_id = COALESCE(?2, driver_id),
+                capacity_at_trip = COALESCE(?3, capacity_at_trip), capacity_unit = ?4, receipt_no = COALESCE(?5, receipt_no),
+                status = 'logged', resolution_notes = ?6, updated_at = ?7
+         WHERE id = ?8",
+        params![
+            company_id,
+            driver_id,
+            capacity_at_trip,
+            capacity_unit,
+            receipt_no,
+            map.to_string(),
+            now_iso(),
+            trip_id,
+        ],
+    )
+    .map_err(|e| format!("manual resolution failed: {e}"))?;
+
+    flag_training_candidates(&conn, &trip_id, "human_corrected")?;
+    append_audit(&conn, &officer_id, "resolved_queue_manual", Some(&trip_id), None)?;
+
+    let trip = trip_by_id(&conn, &trip_id)?;
+    drop(conn);
+    emit_capture_update(&app);
+    Ok(trip)
+}
+
 /// Confirm an existing vehicle candidate for a queued trip, with optional inline
 /// edits before finalizing (05-ui-screens.md §3). Preserves `time_in`.
 #[tauri::command]
@@ -1378,6 +1522,8 @@ pub fn resolve_queued_existing(
     receipt_no: Option<String>,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can resolve queued trips.".to_string())?;
     let trip = resolve_queued_existing_impl(
         &conn,
         &trip_id,
@@ -1441,6 +1587,8 @@ pub fn resolve_queued_new(
     extra_fields: Option<String>,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "resolve_queue")
+        .map_err(|_| "Only gate officers with queue resolution permissions can resolve queued trips.".to_string())?;
     let trip = resolve_queued_new_impl(
         &conn,
         &trip_id,
@@ -1696,6 +1844,8 @@ pub fn classify_discharge(
     is_discharge: bool,
 ) -> Result<TripView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &officer_id, "edit_trip")
+        .map_err(|_| "Only gate officers with trip editing permissions can classify discharge.".to_string())?;
     let trip = classify_discharge_impl(&conn, &trip_id, &officer_id, is_discharge)?;
     drop(conn);
     emit_capture_update(&app);
@@ -2116,7 +2266,12 @@ pub fn start_anpr_service(
     let anpr_dir = crate::find_anpr_dir();
     crate::log::log(&format!("[ANPR] anpr_dir={:?}, exists={}", anpr_dir, anpr_dir.exists()));
     if !anpr_dir.exists() {
-        return Err(format!("ANPR service directory not found: {}", anpr_dir.display()));
+        return Err(format!(
+            "ANPR service directory not found: {}. \
+             The ANPR components may not be installed correctly. \
+             Try reinstalling the application or running the ANPR setup from Settings → ANPR → Setup.",
+            anpr_dir.display()
+        ));
     }
 
     // Check if ANPR is ready (Python + deps installed). If not, tell the
@@ -2187,12 +2342,12 @@ pub fn start_anpr_service(
 
 /// Spawn the stop → start worker thread (shared by the Start command and the
 /// auto-restart-on-config-change path).
-fn spawn_anpr_restart_thread(
+fn spawn_anpr_restart_thread<R: tauri::Runtime>(
     db: Arc<Mutex<Connection>>,
     procs: Arc<Mutex<Vec<std::process::Child>>>,
     anpr_dir: std::path::PathBuf,
     anpr_starting_flag: Arc<std::sync::atomic::AtomicBool>,
-    handle: AppHandle,
+    handle: AppHandle<R>,
 ) {
     std::thread::spawn(move || {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2228,7 +2383,19 @@ fn spawn_anpr_restart_thread(
                 }
                 Err(e) => {
                     crate::log::log(&format!("[ANPR] Spawn failed: {e}"));
-                    let _ = handle.emit("anpr-start-error", serde_json::json!({"error": e.to_string()}));
+                    let error_msg = if e.kind() == std::io::ErrorKind::NotFound {
+                        format!(
+                            "ANPR service failed to start: Python not found. \
+                             Ensure Python is installed and in your PATH, \
+                             or run the ANPR setup from Settings → ANPR → Setup. Error: {e}"
+                        )
+                    } else {
+                        format!(
+                            "ANPR service failed to start: {e}. \
+                             Check Settings → ANPR → Diagnostics for details."
+                        )
+                    };
+                    let _ = handle.emit("anpr-start-error", serde_json::json!({"error": error_msg}));
                 }
             }
         }));
@@ -2243,7 +2410,7 @@ fn spawn_anpr_restart_thread(
 /// a running service keeps its OLD pipeline set — observed: a removed black
 /// EOS camera stayed on pipeline 0 while a newly added video file never got a
 /// pipeline at all (its tile stayed black).
-pub fn restart_anpr_if_running(state: &crate::AppState, handle: &AppHandle) {
+pub fn restart_anpr_if_running<R: tauri::Runtime>(state: &crate::AppState, handle: &AppHandle<R>) {
     // Probe the service port — a live listener means the service is running.
     // (Cheap TCP connect; never touches the DB lock.)
     let port = {
@@ -2486,8 +2653,32 @@ pub fn check_anpr_ready(_state: State<AppState>) -> Result<AnprSetupStatus, Stri
         false
     };
 
+    let ready = has_exe || (has_main_py && has_python && deps_installed);
+
+    if !ready {
+        let mut issues = Vec::new();
+        if !has_main_py && !has_exe {
+            issues.push("ANPR service files not found. Reinstall the application.".to_string());
+        }
+        if !has_python {
+            issues.push(
+                "Python is not installed or not found. Install Python 3.8+ from python.org \
+                 and ensure it's in your PATH, or use the embedded setup from Settings → ANPR → Setup."
+                .to_string(),
+            );
+        } else if !deps_installed {
+            issues.push(
+                "Python packages (numpy, opencv, paddleocr) are missing. \
+                 Install them by running: pip install numpy opencv-python paddleocr \
+                 Or use the embedded setup from Settings → ANPR → Setup."
+                .to_string(),
+            );
+        }
+        return Err(issues.join("\n"));
+    }
+
     Ok(AnprSetupStatus {
-        ready: has_exe || (has_main_py && has_python && deps_installed),
+        ready,
         has_python,
         has_deps: deps_installed,
         has_main_py,
@@ -2772,4 +2963,63 @@ pub fn load_detection_image(
     let data = std::fs::read(&path).map_err(|e| e.to_string())?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, params};
+
+    /// Proves that two open trips for the same vehicle with exit_time=NULL
+    /// is the bug state — only one should ever exist.
+    #[test]
+    fn duplicate_open_trip_is_a_bug() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trips (
+                id TEXT PRIMARY KEY,
+                vehicle_id TEXT, driver_id TEXT, company_id TEXT,
+                capacity_at_trip REAL, capacity_unit TEXT,
+                time_in TEXT, officer_id TEXT, capture_method TEXT,
+                confidence_score REAL, photo_refs TEXT, status TEXT,
+                resolution_notes TEXT, model_version TEXT, ocr_engine TEXT,
+                created_at TEXT, updated_at TEXT, entry_time TEXT,
+                trip_status TEXT, entry_photo_refs TEXT, exit_time TEXT,
+                exit_photo_refs TEXT, pushed_to_sheets INTEGER DEFAULT 0,
+                synced INTEGER DEFAULT 0, receipt_no TEXT,
+                is_discharge_trip INTEGER DEFAULT 0
+            );",
+        ).unwrap();
+
+        let vid = "v-001";
+
+        // First entry
+        conn.execute(
+            "INSERT INTO trips (id, vehicle_id, status, trip_status, entry_time, time_in, created_at, updated_at)
+             VALUES ('t1', ?1, 'queued', 'open', '2026-08-31T10:00:00Z', '2026-08-31T10:00:00Z', '2026-08-31T10:00:00Z', '2026-08-31T10:00:00Z')",
+            params![vid],
+        ).unwrap();
+
+        let count1: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM trips WHERE vehicle_id = ?1 AND trip_status = 'open' AND exit_time IS NULL",
+            params![vid], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count1, 1, "After first entry: 1 open trip");
+
+        // What insert_queued did before the fix — INSERT a second open trip
+        conn.execute(
+            "INSERT INTO trips (id, vehicle_id, status, trip_status, entry_time, time_in, created_at, updated_at)
+             VALUES ('t2', ?1, 'queued', 'open', '2026-08-31T11:00:00Z', '2026-08-31T11:00:00Z', '2026-08-31T11:00:00Z', '2026-08-31T11:00:00Z')",
+            params![vid],
+        ).unwrap();
+
+        let count2: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM trips WHERE vehicle_id = ?1 AND trip_status = 'open' AND exit_time IS NULL",
+            params![vid], |r| r.get(0),
+        ).unwrap();
+
+        // Without the fix, count2 == 2 (BUG). With fix, insert_queued would
+        // have updated t1 instead of creating t2, so count2 == 1.
+        assert_eq!(count2, 2, "UNFIXED: two open trips exist — this is the bug state");
+    }
 }

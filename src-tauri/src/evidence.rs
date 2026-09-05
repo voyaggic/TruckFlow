@@ -66,7 +66,9 @@ pub fn persist_frames(frames_dir: &Path, trip_id: &str, frames: &[AnprFrame], ki
             "index": frame.index,
             "captured_at": frame.captured_at,
             "kind": frame.kind,
-            "file": trip_dir.join(&file).to_string_lossy().to_string(),
+            "file": trip_dir.join(&file).strip_prefix(frames_dir)
+                .unwrap_or(&trip_dir.join(&file))
+                .to_string_lossy().to_string(),
         }));
     }
     serde_json::to_string(&entries).map_err(|e| format!("photo_refs serialize failed: {e}"))

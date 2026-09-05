@@ -317,3 +317,83 @@ pub fn delete_health_events(
     )?;
     Ok(deleted as i64)
 }
+
+// ---------------------------------------------------------------------------
+// Machine & User Monitoring (Phase 7 Pilot Deployment)
+// ---------------------------------------------------------------------------
+
+use crate::models::{MachineStatusView, MonitoringDashboard, UserStatusView};
+
+#[tauri::command]
+pub fn monitoring_dashboard(
+    state: State<AppState>,
+    actor_id: String,
+) -> Result<MonitoringDashboard, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::commands::ensure_admin_permission(&conn, &actor_id, "view_reporting_dashboard")?;
+
+    // Get machine statuses
+    let mut stmt = conn
+        .prepare(
+            "SELECT ms.machine_id, ms.user_id, u.name, ms.role, ms.last_seen_at, ms.is_online, ms.ip_address, ms.pc_name
+             FROM machine_status ms
+             LEFT JOIN users u ON ms.user_id = u.id
+             ORDER BY ms.last_seen_at DESC",
+        )
+        .map_err(|e| format!("machine list failed: {e}"))?;
+
+    let machines: Vec<MachineStatusView> = stmt
+        .query_map([], |r| {
+            Ok(MachineStatusView {
+                machine_id: r.get(0)?,
+                user_id: r.get(1)?,
+                user_name: r.get(2)?,
+                role: r.get(3)?,
+                last_seen_at: r.get(4)?,
+                is_online: r.get::<_, i64>(5)? == 1,
+                ip_address: r.get(6)?,
+                pc_name: r.get(7)?,
+            })
+        })
+        .map_err(|e| format!("machine query failed: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Get user statuses
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, status, auth_type, must_change_password, credential_hash, created_at
+             FROM users
+             WHERE status != 'deleted'
+             ORDER BY created_at DESC",
+        )
+        .map_err(|e| format!("user list failed: {e}"))?;
+
+    let users: Vec<UserStatusView> = stmt
+        .query_map([], |r| {
+            let credential_hash: String = r.get(5)?;
+            Ok(UserStatusView {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                status: r.get(2)?,
+                auth_type: r.get(3)?,
+                must_change_password: r.get::<_, i64>(4)? == 1,
+                credential_pending: credential_hash == "pending",
+                last_login: None,
+                created_at: r.get(6)?,
+            })
+        })
+        .map_err(|e| format!("user query failed: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let pending_users_count = users.iter().filter(|u| u.credential_pending).count() as i64;
+    let online_machines_count = machines.iter().filter(|m| m.is_online).count() as i64;
+
+    Ok(MonitoringDashboard {
+        machines,
+        users,
+        pending_users_count,
+        online_machines_count,
+    })
+}

@@ -12,13 +12,14 @@ pub mod reference;
 pub mod reporting;
 pub mod sync;
 
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, atomic::Ordering};
 
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use tauri::{Emitter, Manager, State};
 
 use crate::capture::AnprSource;
 use db::AppState;
+use sync::PostgresAdapter;
 
 pub fn run() {
     // Initialize the async log system FIRST — all subsequent log() calls
@@ -52,7 +53,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let state = db::init_state(app.handle())?;
+            let (state, sync_rx) = db::init_state(app.handle())?;
             // Auto-start ANPR service in background (non-blocking)
             {
                 let state_handle = app.handle().clone();
@@ -70,7 +71,9 @@ pub fn run() {
                 });
             }
             spawn_anpr_poller(app.handle(), &state);
-            spawn_sync_poller(app.handle(), &state);
+            spawn_sync_poller(app.handle(), &state, sync_rx);
+            spawn_keepalive_pinger(&state);
+            spawn_heartbeat(&state);
             app.manage(state);
             Ok(())
         })
@@ -78,6 +81,7 @@ pub fn run() {
             commands::app_status,
             get_app_setting,
             commands::create_first_admin,
+            commands::create_company_and_admin,
             commands::login_password,
             commands::logout,
             commands::get_current_user,
@@ -155,6 +159,7 @@ pub fn run() {
             capture::simulator_push_reads,
             capture::resolve_queued_existing,
             capture::resolve_queued_new,
+            capture::resolve_queued_manual,
             capture::discard_trip,
             capture::decline_trip,
             capture::list_declined,
@@ -205,6 +210,8 @@ pub fn run() {
             anpr::set_user_auto_start,
             sync::sync_status,
             sync::sync_now_pg,
+            sync::load_archive_trips,
+            sync::get_date_range_presets,
             sync::connect_google_sheets,
             sync::disconnect_google_sheets,
             sync::set_google_sheets_frequency,
@@ -212,6 +219,7 @@ pub fn run() {
             sync::simulate_connectivity,
             sync::configure_postgres,
             sync::disconnect_postgres,
+            sync::create_postgres_tables,
             sync::configure_google_sheets,
             sync::set_sheets_retention,
             sync::set_trip_retention,
@@ -237,6 +245,7 @@ pub fn run() {
             monitor::acknowledge_health_event,
             monitor::anpr_confidence_trend,
             monitor::delete_health_events,
+            monitor::monitoring_dashboard,
             commands::update_own_profile,
             commands::set_profile_photo,
             commands::get_profile_photo,
@@ -244,6 +253,18 @@ pub fn run() {
             set_frames_dir,
             pick_folder,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(st) = window.try_state::<AppState>() {
+                    if let Ok(mut procs) = st.anpr_processes.try_lock() {
+                        for mut child in procs.drain(..) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -526,10 +547,12 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
             // Skip entirely on non-capture-point machines — no ANPR service
             // will ever run here, so don't waste cycles or spam health events.
             if !capture::is_capture_point(&conn) {
+                crate::log::log("[ANPR] Skipping — is_capture_point is false");
                 drop(conn);
                 continue;
             }
             if !capture::anpr_enabled(&conn) {
+                crate::log::log("[ANPR] Skipping — anpr_enabled is false");
                 drop(conn);
                 continue;
             }
@@ -562,8 +585,6 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                 let Ok(mut procs) = st.anpr_processes.try_lock() else { continue };
                 procs.clear(); // remove dead handles
                 drop(procs);
-                // Re-spawn using the same logic as auto_start_anpr
-                let _ = auto_start_anpr(&st);
                 let Ok(conn) = anpr_db.try_lock() else { continue };
                 let _ = monitor::record_health_event(&conn, "anpr_service", "restarted", Some("ANPR process died, auto-restarted"));
                 drop(conn);
@@ -589,7 +610,15 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                 continue; // service down — skip this cycle
             }
 
-            let Some(read) = http.poll() else { continue };
+            let Some(read) = http.poll() else {
+                crate::log::log("[ANPR] poll() returned None — no new read available");
+                continue;
+            };
+
+            crate::log::log(&format!(
+                "[ANPR] Got read: plate={} conf={} frames={}",
+                read.plate, read.confidence, read.frames.len()
+            ));
 
             if let Ok(mut last) = st.anpr_last.try_lock() {
                 *last = Some((read.timestamp.clone(), read.plate.clone()));
@@ -599,109 +628,365 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let _ = capture::ingest_read(&conn, officer, &read, "auto", &st.frames_dir);
+            let result = capture::ingest_read(&conn, officer, &read, "auto", &st.frames_dir);
+            match &result {
+                Ok(r) => {
+                    crate::log::log(&format!(
+                        "[ANPR] ingest_read ok: trip_id={:?} queued_id={:?} outcome={} msg={}",
+                        r.trip.as_ref().map(|t| &t.id),
+                        r.queued.as_ref().map(|q| &q.id),
+                        r.outcome.state,
+                        r.message
+                    ));
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[ANPR] ingest_read error: {}", e));
+                }
+            }
             let _ = capture::record_read_event(&conn, &read, "auto", "captured");
             let _ = monitor::record_health_event(&conn, "anpr_service", "ok", None);
             drop(conn);
             let _ = handle.emit("capture-updated", ());
+            let _ = st.sync_notify.try_send(());
         }
     });
 }
 
-/// Background sync retry loop (06-data-flow.md §5). Every ~10s both targets
-/// get a best-effort pass — Postgres whenever connected, Sheets on its
-/// frequency schedule — so nothing waits for a manual "send" action. A failure
-/// never blocks capture; rows stay pending and retry on the next pass.
-///
-/// Lock discipline: we NEVER hold the DB lock during network calls.
-/// Each phase is split into: read (lock) → release → network → reacquire → write.
-fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState) {
+/// Event-driven sync worker. Sleeps on the notification channel until a trip
+/// is created, then immediately processes all pending sync work (PG + Sheets).
+/// No polling timer — zero latency from trip creation to export.
+/// Sheets and Postgres run in parallel so one can't block the other.
+fn spawn_keepalive_pinger(state: &AppState) {
+    let sync_notify = state.sync_notify.clone();
+    let running = state.running.clone();
+    std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            // Send a signal to wake the sync poller. This ensures pending rows
+            // get pushed even when no new trips are created (e.g., after internet
+            // comes back online). The channel has capacity 1, so extra signals
+            // while the poller is busy are safely dropped.
+            let _ = sync_notify.try_send(());
+        }
+    });
+}
+
+/// Machine heartbeat: updates machine_status every 30s and marks stale
+/// machines as offline. Runs on a dedicated thread.
+fn spawn_heartbeat(state: &AppState) {
+    let sync_db = state.sync_db.clone();
+    let running = state.running.clone();
+    std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Ok(conn) = sync_db.try_lock() {
+                // Mark machines offline if not seen in 90s (3 missed heartbeats)
+                let _ = conn.execute(
+                    "UPDATE machine_status SET is_online = 0 WHERE last_seen_at < datetime('now', '-90 seconds')",
+                    [],
+                );
+            }
+        }
+    });
+}
+
+/// Update this machine's heartbeat. Call on login and periodically.
+pub fn update_machine_heartbeat(state: &AppState, user_id: &str, company_id: &str, role: &str) {
+    update_machine_heartbeat_raw(&state.db, &state.pg, user_id, company_id, role);
+}
+
+/// Raw version for use in background threads (takes individual parameters).
+pub fn update_machine_heartbeat_raw(
+    db: &Arc<Mutex<Connection>>,
+    pg: &Arc<dyn PostgresAdapter>,
+    user_id: &str,
+    company_id: &str,
+    role: &str,
+) {
+    let machine_id = get_machine_id();
+    let pc_name = get_pc_name();
+    let now = crate::db::now_iso();
+    
+    // Update local SQLite
+    if let Ok(conn) = db.try_lock() {
+        let _ = conn.execute(
+            "INSERT INTO machine_status (id, machine_id, user_id, company_id, role, last_seen_at, is_online, pc_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+             ON CONFLICT(machine_id) DO UPDATE SET 
+                 user_id = excluded.user_id,
+                 role = excluded.role,
+                 last_seen_at = excluded.last_seen_at,
+                 is_online = 1,
+                 pc_name = excluded.pc_name",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), machine_id, user_id, company_id, role, now, pc_name],
+        );
+    }
+    
+    // Sync to PostgreSQL (best-effort)
+    if pg.configured() && pg.connected() {
+        let sql = format!(
+            "INSERT INTO machine_status (machine_id, user_id, company_id, role, last_seen_at, is_online, pc_name)
+             VALUES ('{}', '{}', '{}', '{}', '{}', 1, '{}')
+             ON CONFLICT (machine_id) DO UPDATE SET 
+                 user_id = EXCLUDED.user_id,
+                 role = EXCLUDED.role,
+                 last_seen_at = EXCLUDED.last_seen_at,
+                 is_online = 1,
+                 pc_name = EXCLUDED.pc_name",
+            crate::sync::pg_literal_string(&machine_id),
+            crate::sync::pg_literal_string(user_id),
+            crate::sync::pg_literal_string(company_id),
+            crate::sync::pg_literal_string(role),
+            crate::sync::pg_literal_string(&now),
+            crate::sync::pg_literal_string(&pc_name),
+        );
+        let _ = pg.query_rows(&sql, &[]);
+    }
+}
+
+/// Get a stable machine identifier (hardware-based or generated).
+fn get_machine_id() -> String {
+    // Try to get a stable machine ID from the OS
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("wmic").args(["csproduct", "get", "UUID"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            if lines.len() > 1 {
+                return lines[1].trim().to_string();
+            }
+        }
+    }
+    
+    // Fallback: generate and store a UUID
+    "machine-".to_string() + &uuid::Uuid::new_v4().to_string()
+}
+
+/// Get the PC name for display.
+fn get_pc_name() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::sync::mpsc::Receiver<()>) {
     let handle = app.clone();
     let running = state.running.clone();
     let pg = state.pg.clone();
     let sheets = state.sheets.clone();
     let sync_db = state.sync_db.clone();
+    let pending_marks = state.pending_sync_marks.clone();
     std::thread::spawn(move || {
+        let mut last_sheets_run = std::time::Instant::now();
+        let sheets_interval = std::time::Duration::from_secs(30);
         while running.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            let Some(st) = handle.try_state::<AppState>() else {
+            // Block until a trip is created (or shutdown).
+            let got_signal = match sync_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+            // Drain any buffered signals (multiple trips created at once).
+            while sync_rx.try_recv().is_ok() {}
+
+            // On timeout without signal: only run Sheets if interval elapsed
+            // (catches exit updates that don't trigger a new signal).
+            if !got_signal && last_sheets_run.elapsed() < sheets_interval {
+                continue;
+            }
+            last_sheets_run = std::time::Instant::now();
+
+            // Brief pause so the UI has time to show "pending" state
+            // before the sync completes and clears the counter.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            let Some(_st) = handle.try_state::<AppState>() else {
                 continue;
             };
 
-            // ── Postgres push (local → central) ──────────────────────────
-            for (table, _display) in sync::PG_SYNC_TABLES {
-                // Read unsynced rows from dedicated sync connection
-                let rows = {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
-                    match sync::collect_unsynced_rows(&conn, table) {
-                        Ok(r) => r,
-                        Err(e) => { crate::log::log(&format!("[sync] collect {table}: {e}")); continue; }
+            // ── Drain pending mark-synced from previous cycles ─────────
+            if let Ok(mut marks) = pending_marks.try_lock() {
+                while let Some((table, ids)) = marks.pop() {
+                    if let Ok(conn) = sync_db.try_lock() {
+                        if let Err(e) = sync::mark_rows_synced(&conn, &table, &ids) {
+                            crate::log::log(&format!("[sync] deferred mark {table}: {e}"));
+                        }
+                    } else {
+                        marks.push((table, ids));
+                        break;
                     }
-                };
-                if rows.is_empty() { continue; }
-                // Push to Postgres (no lock held — may take seconds)
-                let pushed_ids = match sync::push_rows_to_central(&*pg, table, &rows) {
-                    Ok(ids) => ids,
-                    Err(e) => { crate::log::log(&format!("[sync] push {table}: {e}")); continue; }
-                };
-                // Mark synced
-                if !pushed_ids.is_empty() {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
-                    let _ = sync::mark_rows_synced(&conn, table, &pushed_ids);
-                }
-            }
-            // Update last synced timestamp
-            {
-                let Ok(conn) = sync_db.try_lock() else { continue };
-                let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
-            }
-
-            // ── Postgres pull (central → local) ──────────────────────────
-            if pg.connected() {
-                for &table in sync::REFERENCE_TABLES {
-                    let last_pull = {
-                        let Ok(conn) = sync_db.try_lock() else { continue };
-                        crate::db::get_setting(&conn, "pg_last_pulled_at").unwrap_or_default()
-                    };
-                    let central_rows = match sync::fetch_central_rows(&*pg, table, &last_pull) {
-                        Ok(r) => r,
-                        Err(e) => { crate::log::log(&format!("[sync] pull {table}: {e}")); continue; }
-                    };
-                    if central_rows.is_empty() { continue; }
-                    {
-                        let Ok(conn) = sync_db.try_lock() else { continue };
-                        let _ = sync::upsert_central_rows(&conn, table, &central_rows);
-                    }
-                }
-                {
-                    let Ok(conn) = sync_db.try_lock() else { continue };
-                    let _ = crate::db::set_setting(&conn, "pg_last_pulled_at", &crate::db::now_iso());
                 }
             }
 
-            // ── Google Sheets sync ────────────────────────────────────────
-            // Phase 1: check if due + prepare data (read-only, under lock)
-            let sheets_data = {
-                let Ok(conn) = sync_db.try_lock() else { continue };
-                if !sync::sheets_due(&conn, &*sheets) { continue; }
-                let data = match sync::prepare_sheets_data(&conn, &*sheets) {
-                    Ok(d) => d,
-                    Err(e) => { crate::log::log(&format!("[sync] sheets prepare: {e}")); continue; }
-                };
-                if data.pending == 0 || !sheets.connected() { continue; }
-                Some(data)
-            };
-            let Some(sheets_data) = sheets_data else { continue };
-            // Phase 2: network I/O (NO lock held — sync_db is free)
-            let acked_ids = match sync::execute_sheets_network(&*sheets, &sheets_data.mapping, &sheets_data.new_rows, &sheets_data.update_rows) {
-                Ok(ids) => ids,
-                Err(e) => { crate::log::log(&format!("[sync] sheets network: {e}")); continue; }
-            };
-            // Phase 3: write results back (re-acquire lock — network is done)
+            // ── Fire Sheets and PG in parallel ──────────────────────────
+            let pg_handle = pg.clone();
+            let sync_db_pg = sync_db.clone();
+            let pending_marks_pg = pending_marks.clone();
+
+            let pg_thread = std::thread::spawn(move || {
+                if !pg_handle.configured() { return; }
+
+                // ── Postgres push (local → central) ──────────────────────
+                let mut any_pushed = false;
+                for (table, _display) in sync::PG_SYNC_TABLES {
+                    let rows = {
+                        let conn = match sync_db_pg.lock() {
+                            Ok(c) => c,
+                            Err(e) => { crate::log::log(&format!("[sync] sync_db poisoned: {e}")); continue; }
+                        };
+                        match sync::collect_unsynced_rows(&conn, table) {
+                            Ok(r) => r,
+                            Err(e) => { crate::log::log(&format!("[sync] collect {table}: {e}")); continue; }
+                        }
+                    };
+                    if rows.is_empty() { continue; }
+                    let pushed_ids = match sync::push_rows_to_central(&*pg_handle, table, &rows) {
+                        Ok(ids) => ids,
+                        Err(e) => { crate::log::log(&format!("[sync] push {table}: {e}")); continue; }
+                    };
+                    if !pushed_ids.is_empty() {
+                        any_pushed = true;
+                        crate::log::log(&format!("[sync] push {table}: {}/{} rows synced", pushed_ids.len(), rows.len()));
+                    }
+                    if !pushed_ids.is_empty() {
+                        match sync_db_pg.lock() {
+                            Ok(conn) => {
+                                if let Err(e) = sync::mark_rows_synced(&conn, table, &pushed_ids) {
+                                    crate::log::log(&format!("[sync] mark {table}: {e}"));
+                                }
+                            }
+                            Err(_) => {
+                                if let Ok(mut marks) = pending_marks_pg.try_lock() {
+                                    marks.push((table.to_string(), pushed_ids));
+                                }
+                            }
+                        }
+                    }
+                }
+                if any_pushed {
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
+                    }
+                }
+
+                // ── Postgres pull (central → local) ──────────────────────
+                if pg_handle.connected() {
+                    for &table in sync::REFERENCE_TABLES {
+                        let last_pull = {
+                            let conn = match sync_db_pg.lock() {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            crate::db::get_setting(&conn, "pg_last_pulled_at").unwrap_or_default()
+                        };
+                        let central_rows = match sync::fetch_central_rows(&*pg_handle, table, &last_pull) {
+                            Ok(r) => r,
+                            Err(e) => { crate::log::log(&format!("[sync] pull {table}: {e}")); continue; }
+                        };
+                        if central_rows.is_empty() { continue; }
+                        {
+                            let conn = match sync_db_pg.lock() {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let _ = sync::upsert_central_rows(&conn, table, &central_rows);
+                        }
+                    }
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let _ = crate::db::set_setting(&conn, "pg_last_pulled_at", &crate::db::now_iso());
+                    }
+                }
+
+                // ── Process pending deletes (local deletions → central) ───
+                // Try to process deletes even when offline - delete_rows will attempt connection
+                if pg_handle.configured() {
+                    match {
+                        let conn = match sync_db_pg.lock() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        sync::get_all_pending_deletes(&conn)
+                    } {
+                        Ok(pending_deletes) if !pending_deletes.is_empty() => {
+                            crate::log::log(&format!("[sync] processing {} pending deletes", pending_deletes.len()));
+                            // Group by table
+                            let mut by_table: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                            for (table, id) in pending_deletes {
+                                by_table.entry(table).or_default().push(id);
+                            }
+                            for (table, ids) in by_table {
+                                match pg_handle.delete_rows(&table, &ids) {
+                                    Ok(()) => {
+                                        crate::log::log(&format!("[sync] delete_rows {table}: deleted {} rows from central", ids.len()));
+                                        if let Ok(conn) = sync_db_pg.lock() {
+                                            let _ = sync::clear_pending_deletes(&conn, &table, &ids);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        crate::log::log(&format!("[sync] delete_rows {table}: failed to delete from central: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::log::log(&format!("[sync] pending deletes query failed: {e}"));
+                        }
+                    }
+                }
+            });
+
+            // ── Google Sheets sync (runs on poller thread) ─────────────
             {
-                let Ok(conn) = sync_db.try_lock() else { continue };
-                let _ = sync::finalize_sheets_results(&conn, &sheets_data.new_rows, &sheets_data.update_rows, &acked_ids);
+                let conn = match sync_db.lock() {
+                    Ok(c) => c,
+                    Err(_) => { let _ = pg_thread.join(); continue; }
+                };
+                let timer_due = sync::sheets_due(&conn, &*sheets);
+                let pending_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM trips WHERE status = 'logged'
+                     AND (
+                       (sheet_row IS NULL AND (capture_method = 'auto' OR is_discharge_trip = 1))
+                       OR (sheet_row IS NOT NULL AND sheet_exit_pushed = 0 AND exit_time IS NOT NULL)
+                     )",
+                    [],
+                    |r| r.get(0),
+                ).unwrap_or(0);
+                let has_pending = pending_count > 0;
+                crate::log::log(&format!("[sync] sheets poll: timer_due={timer_due} has_pending={has_pending} pending_count={pending_count} configured={}", sheets.configured()));
+                if timer_due || has_pending {
+                    let data = match sync::prepare_sheets_data(&conn, &*sheets) {
+                        Ok(d) => d,
+                        Err(e) => { crate::log::log(&format!("[sync] sheets prepare: {e}")); let _ = pg_thread.join(); continue; }
+                    };
+                    drop(conn);
+                    crate::log::log(&format!("[sync] sheets data: pending={} new_rows={} update_rows={}", data.pending, data.new_rows.len(), data.update_rows.len()));
+                    if data.pending > 0 && sheets.configured() {
+                        let mut sheets_data = data;
+                        sync::dedup_sheets_rows(&*sheets, &mut sheets_data);
+                        crate::log::log(&format!("[sync] sheets after dedup: new_rows={} update_rows={}", sheets_data.new_rows.len(), sheets_data.update_rows.len()));
+                        let has_work = !sheets_data.new_rows.is_empty() || !sheets_data.update_rows.is_empty();
+                        if has_work {
+                            match sync::execute_sheets_network(&*sheets, &sheets_data.mapping, &sheets_data.new_rows, &sheets_data.update_rows) {
+                                Ok(acked_ids) => {
+                                    crate::log::log(&format!("[sync] sheets network OK: acked_ids={} new_rows={} update_rows={}", acked_ids.len(), sheets_data.new_rows.len(), sheets_data.update_rows.len()));
+                                    if let Ok(conn) = sync_db.lock() {
+                                        let _ = sync::finalize_sheets_results(&conn, &sheets_data.new_rows, &sheets_data.update_rows, &acked_ids);
+                                    }
+                                }
+                                Err(e) => { crate::log::log(&format!("[sync] sheets network: {e}")); }
+                            }
+                        } else {
+                            crate::log::log("[sync] sheets: no work after dedup");
+                        }
+                    }
+                }
             }
+
+            // Wait for PG to finish before next cycle.
+            let _ = pg_thread.join();
         }
     });
 }

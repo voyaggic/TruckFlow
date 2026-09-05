@@ -66,14 +66,19 @@ function clearLoggedOut() {
   }
 }
 
-export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) => void }) {
+export default function LoginScreen({
+  onLogin,
+}: {
+  onLogin: (user: SessionUser) => void;
+}) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [auto, setAuto] = useState(false);
-  const [forgot, setForgot] = useState(false);
+  const [showForgot, setShowForgot] = useState(false);
+  const [showSignup, setShowSignup] = useState(false);
   const [codeMode, setCodeMode] = useState(false);
   const [reqMode, setReqMode] = useState(false);
   const [codeUser, setCodeUser] = useState("");
@@ -240,11 +245,18 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
           </button>
         </form>
 
-        <div style={{ textAlign: "center", marginTop: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 16 }}>
+          <button
+            className="ghost small"
+            onClick={() => setShowSignup(true)}
+            disabled={busy}
+          >
+            Sign up
+          </button>
           <button
             className="ghost small"
             onClick={() => {
-              setForgot((f) => !f);
+              setShowForgot((f) => !f);
               setCodeMode(false);
               setReqMode(false);
               setReqSent(false);
@@ -252,11 +264,11 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
             }}
             disabled={busy}
           >
-            {forgot ? "Back to sign in" : "Forgot your password?"}
+            {showForgot ? "Back to sign in" : "Forgot password?"}
           </button>
         </div>
 
-        {forgot && (
+        {showForgot && (
           <div
             className="stack"
             style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}
@@ -264,11 +276,11 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
             {!codeMode && !reqMode && (
               <>
                 <div className="muted small" style={{ marginBottom: 10 }}>
-                  Choose how to get back in:
+                  Recover your account:
                 </div>
                 <div className="row" style={{ gap: 10 }}>
                   <button className="ghost" style={{ flex: 1 }} onClick={() => setCodeMode(true)}>
-                    Enter recovery code
+                    I have a recovery code
                   </button>
                   <button className="ghost" style={{ flex: 1 }} onClick={() => setReqMode(true)}>
                     Request password reset
@@ -280,16 +292,15 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
             {codeMode && (
               <>
                 <div className="section-title" style={{ fontSize: 14 }}>
-                  Admin recovery code
+                  Enter recovery code
                 </div>
                 {!codeOk ? (
                   <>
                     <p className="muted small">
-                      For admins when no other admin can reset you. Enter your username and the recovery code from the
-                      file saved on your computer.
+                      Enter your username and the recovery code you saved.
                     </p>
                     <div className="field">
-                      <label>Admin username</label>
+                      <label>Username</label>
                       <input value={codeUser} onChange={(e) => setCodeUser(e.target.value)} placeholder="e.g. andreah" />
                     </div>
                     <div className="field">
@@ -307,7 +318,7 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
                   </>
                 ) : (
                   <>
-                    <p className="muted small">Code accepted. Set your new password to sign in.</p>
+                    <p className="muted small">Code accepted. Set your new password.</p>
                     <div className="field">
                       <label>New password</label>
                       <input type="password" value={codePass} onChange={(e) => setCodePass(e.target.value)} />
@@ -319,7 +330,7 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
                     </div>
                     <div className="row">
                       <button className="primary" onClick={submitCode} disabled={busy || !codePass || codePass !== codeConfirm}>
-                        {busy ? "Signing in…" : "Recover and sign in"}
+                        {busy ? "Saving…" : "Set password"}
                       </button>
                     </div>
                   </>
@@ -334,16 +345,15 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
                 </div>
                 {reqSent ? (
                   <p className="muted small">
-                    Request sent — an admin will review it and reset your password. You'll be asked to set a new
-                    password at your next sign-in.
+                    Your request has been sent. An administrator will review it and reset your password. You'll be able to sign in once it's been approved.
                   </p>
                 ) : (
                   <>
                     <p className="muted small">
-                      An admin will review your request and reset your password.
+                      Enter your username to request a password reset.
                     </p>
                     <div className="field">
-                      <label>Your username</label>
+                      <label>Username</label>
                       <input value={reqUser} onChange={(e) => setReqUser(e.target.value)} placeholder="e.g. peter" />
                     </div>
                     <div className="row">
@@ -358,6 +368,25 @@ export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) 
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {showSignup && (
+          <div
+            className="stack"
+            style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}
+          >
+            <div className="section-title" style={{ fontSize: 14 }}>
+              Create an account
+            </div>
+            <p className="muted small">
+              Contact your administrator to create your account. Once created, you'll receive your login credentials.
+            </p>
+            <div className="row">
+              <button className="ghost" onClick={() => setShowSignup(false)}>
+                Back to sign in
+              </button>
+            </div>
           </div>
         )}
       </div>

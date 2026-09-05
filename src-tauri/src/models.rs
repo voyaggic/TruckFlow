@@ -39,6 +39,7 @@ pub struct SessionUser {
     /// Set when an admin reset this account's password — the user must choose a
     /// new password at the next sign-in before using the app.
     pub must_change_password: bool,
+    pub company_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -263,6 +264,8 @@ pub struct AnprConfigView {
     pub max_pending_duration_hours: Option<f64>,
     /// Machine hostname:MAC fingerprint for auto-start (§9.1). Null = not yet designated.
     pub designated_machine_id: Option<String>,
+    /// ANPR plate detection method: "contour", "paddleocr", or "consecutive"
+    pub detection_method: String,
 }
 
 /// A stored ANPR credential (API/license key). Values are stored encrypted-at-
@@ -746,4 +749,43 @@ pub struct EntityRecordView {
     pub data: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Machine & User Monitoring (Phase 7 Pilot Deployment)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MachineStatusView {
+    pub machine_id: String,
+    pub user_id: Option<String>,
+    pub user_name: Option<String>,
+    pub role: String,
+    pub last_seen_at: String,
+    pub is_online: bool,
+    pub ip_address: Option<String>,
+    pub pc_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UserStatusView {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub auth_type: String,
+    pub must_change_password: bool,
+    pub credential_pending: bool,
+    pub last_login: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MonitoringDashboard {
+    pub machines: Vec<MachineStatusView>,
+    pub users: Vec<UserStatusView>,
+    pub pending_users_count: i64,
+    pub online_machines_count: i64,
 }

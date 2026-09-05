@@ -100,8 +100,26 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
   // stale pipeline mapping, so feeds appeared under the wrong camera name.
   useEffect(() => {
     const unlisten = listen("anpr-started", () => {
-      setTimeout(refreshCore, 2500); // after pipelines connect
-      setTimeout(refreshCore, 7000); // settle pass for slow sources (RTSP)
+      // Poll /health until the service is actually ready
+      let attempts = 0;
+      const pollHealth = async () => {
+        const maxAttempts = 30; // 60 seconds max
+        const interval = setInterval(async () => {
+          attempts++;
+          try {
+            const status = await api.anprDiagnostics();
+            if (status?.service_running) {
+              clearInterval(interval);
+              refreshCore();
+            }
+          } catch {}
+          if (attempts >= maxAttempts) {
+            clearInterval(interval);
+            refreshCore(); // refresh anyway after timeout
+          }
+        }, 2000);
+      };
+      pollHealth();
     });
     return () => { unlisten.then((f) => f()); };
   }, [refreshCore]);
@@ -770,6 +788,7 @@ function SensitivityPanel({
   const [paddle, setPaddle] = useState(config.confidence_threshold_paddleocr);
   const [easy, setEasy] = useState(config.confidence_threshold_easyocr);
   const [pending, setPending] = useState(config.max_pending_duration_hours?.toString() ?? "24");
+  const [detectionMethod, setDetectionMethod] = useState(config.detection_method ?? "contour");
 
   // Resync local state when the saved config reloads after a save, so the
   // panel never shows stale values.
@@ -778,6 +797,7 @@ function SensitivityPanel({
     setPaddle(config.confidence_threshold_paddleocr);
     setEasy(config.confidence_threshold_easyocr);
     setPending(config.max_pending_duration_hours?.toString() ?? "24");
+    setDetectionMethod(config.detection_method ?? "contour");
   }, [config]);
 
   const num = (v: string, fallback: number) => {
@@ -797,11 +817,69 @@ function SensitivityPanel({
       confidence_threshold_paddleocr: paddle,
       confidence_threshold_easyocr: easy,
       max_pending_duration_hours: num(pending, 24),
+      detection_method: detectionMethod,
     });
 
   return (
     <div className="card">
-      <div className="section-title" style={{ fontSize: 15 }}>Detection sensitivity</div>
+      <div className="section-title" style={{ fontSize: 15 }}>Detection Method</div>
+      <p className="muted small" style={{ marginTop: -6 }}>
+        Choose how plates are detected in video frames.
+      </p>
+
+      <div className="stack" style={{ marginTop: 8, gap: 6 }}>
+        <label className="radio-card" style={{ cursor: "pointer" }}>
+          <input
+            type="radio"
+            name="detection_method"
+            value="contour"
+            checked={detectionMethod === "contour"}
+            onChange={() => setDetectionMethod("contour")}
+            style={{ marginRight: 10 }}
+          />
+          <div>
+            <div style={{ fontWeight: 600 }}>Contour Detection (Default)</div>
+            <div className="muted small">Fast, works at CCTV distances. Uses edge/shape analysis to find plate-like regions.</div>
+          </div>
+        </label>
+
+        <label className="radio-card" style={{ cursor: "pointer" }}>
+          <input
+            type="radio"
+            name="detection_method"
+            value="paddleocr"
+            checked={detectionMethod === "paddleocr"}
+            onChange={() => setDetectionMethod("paddleocr")}
+            style={{ marginRight: 10 }}
+          />
+          <div>
+            <div style={{ fontWeight: 600 }}>PaddleOCR Detection</div>
+            <div className="muted small">AI-powered detection. Better accuracy but slower. Requires PaddleOCR models.</div>
+          </div>
+        </label>
+
+        <label className="radio-card" style={{ cursor: "pointer" }}>
+          <input
+            type="radio"
+            name="detection_method"
+            value="consecutive"
+            checked={detectionMethod === "consecutive"}
+            onChange={() => setDetectionMethod("consecutive")}
+            style={{ marginRight: 10 }}
+          />
+          <div>
+            <div style={{ fontWeight: 600 }}>Consecutive Reads</div>
+            <div className="muted small">Most reliable. Requires 3 matching reads before accepting. Best for controlled gate environments.</div>
+          </div>
+        </label>
+      </div>
+
+      <div className="row" style={{ marginTop: 12 }}>
+        <button className="primary" onClick={save}>Save settings</button>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        <div className="section-title" style={{ fontSize: 15 }}>Detection sensitivity</div>
       <p className="muted small" style={{ marginTop: -6 }}>
         How strict the recognition gate is. <b>Balanced</b> is the default; choose <b>Strict</b> if the queue gets too
         many confident-but-wrong reads, or <b>Lenient</b> to log more automatically. Tune the raw values under
@@ -853,6 +931,7 @@ function SensitivityPanel({
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }
@@ -1705,6 +1784,10 @@ function EngineTab({
       </div>
 
       <div className="row">
+        <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
+          <input style={{ width: "auto" }} type="checkbox" checked={isCapturePoint} onChange={(e) => setIsCapturePoint(e.target.checked)} />
+          <span>Act as capture point (process ANPR readings)</span>
+        </label>
         <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, width: "auto" }}>
           <input style={{ width: "auto" }} type="checkbox" checked={confirmRequired} onChange={(e) => setConfirmRequired(e.target.checked)} />
           <span>Discharge confirmation required</span>

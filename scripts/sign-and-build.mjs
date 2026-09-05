@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync } from 'fs';
-import { spawn } from 'child_process';
+import { execSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -10,6 +10,10 @@ const key = readFileSync(resolve(root, '.updater-keys', 'tauri.key'), 'utf8').tr
 
 const env = { ...process.env, TAURI_SIGNING_PRIVATE_KEY: key, TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'truckflow-dev' };
 
-const args = process.argv.slice(2);
-const child = spawn('npx', ['tauri', ...args], { cwd: root, env, stdio: 'inherit' });
-child.on('exit', code => process.exit(code ?? 0));
+const args = process.argv.slice(2).join(' ');
+const cmd = `npx tauri ${args}`;
+try {
+  execSync(cmd, { cwd: root, env, stdio: 'inherit', shell: true });
+} catch (e) {
+  process.exit(e.status ?? 1);
+}

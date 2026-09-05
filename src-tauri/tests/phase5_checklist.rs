@@ -10,6 +10,7 @@
 //! - System Monitor: per-component health from `system_health_events`,
 //!   acknowledge action, incident history, and sync-failure wiring.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -58,6 +59,7 @@ impl Drop for TempDb {
 struct TestCtx {
     _tmp: TempDb,
     app: App<tauri::test::MockRuntime>,
+    company_id: RefCell<String>,
 }
 
 impl TestCtx {
@@ -66,18 +68,26 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
+        let db_path = tmp.db_path();
         let app = mock_app();
+        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Mutex::new(conn),
+            db: Arc::new(Mutex::new(conn)),
+            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
             pg: Arc::new(MockPostgres::new()),
             sheets: Arc::new(MockSheets::new()),
+            anpr_processes: Arc::new(Mutex::new(Vec::new())),
+            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+            sync_notify: sync_tx,
         });
-        Self { _tmp: tmp, app }
+        Self { _tmp: tmp, app, company_id: RefCell::new(String::new()) }
     }
 
     fn state(&self) -> State<'_, AppState> {
@@ -93,23 +103,47 @@ impl TestCtx {
     }
 
     fn create_admin(&self) -> SessionUser {
-        commands::create_first_admin(self.state(), "Boss".to_string(), ADMIN_PASS.to_string())
-            .expect("create first admin")
-            .user
+        let result = commands::create_first_admin_for_company(self.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
+            .expect("create first admin");
+        if let Some(ref cid) = result.user.company_id {
+            *self.company_id.borrow_mut() = cid.clone();
+        }
+        result.user
+    }
+
+    fn company_id(&self) -> String {
+        self.company_id.borrow().clone()
     }
 
     fn create_gate_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            "GatePass!2024".to_string(),
+            company_id,
         )
         .expect("create gate user")
     }
 
+    fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        let user = commands::create_user(
+            self.state(),
+            admin.id.clone(),
+            name.to_string(),
+            permissions,
+            company_id.clone(),
+        )
+        .expect("create user");
+        commands::set_initial_password(self.state(), name.to_string(), company_id, password.to_string())
+            .expect("set initial password");
+        user
+    }
+
     fn create_monitor_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
@@ -119,9 +153,21 @@ impl TestCtx {
                 "acknowledge_health_alerts".to_string(),
                 "view_health_history".to_string(),
             ],
-            "WatchdogPass!2024".to_string(),
+            company_id,
         )
         .expect("create monitor user")
+    }
+
+    fn create_operations_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        commands::create_user(
+            self.state(),
+            admin.id.clone(),
+            "OpsChief".to_string(),
+            vec!["view_reports".to_string(), "view_audit_log".to_string(), "view_gate_entries".to_string()],
+            company_id,
+        )
+        .expect("create operations user")
     }
 }
 
@@ -450,8 +496,8 @@ fn sync_failure_and_recovery_flow_into_monitor() {
     // Force the app's PG adapter offline, then run a manual sync: nothing
     // pushes, pending stays, and a sync health event is recorded.
     simulate_connectivity(ctx.state(), false, true).unwrap();
-    let off = sync_now_pg(ctx.state(), admin.id.clone()).expect("sync is best-effort even offline");
-    assert_eq!(off.pushed, 0, "offline sync pushes nothing");
+    let off = sync_now_pg(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("sync is best-effort even offline");
+    assert_eq!(off, "syncing");
 
     let dash = truckflow_lib::monitor::health_dashboard(ctx.state(), monitor.id.clone()).expect("health");
     let sync_card = dash.components.iter().find(|c| c.component == "sync").expect("sync card");
@@ -460,8 +506,8 @@ fn sync_failure_and_recovery_flow_into_monitor() {
 
     // Reconnect and sync successfully → health clears.
     simulate_connectivity(ctx.state(), true, true).unwrap();
-    let ok = sync_now_pg(ctx.state(), admin.id.clone()).expect("reconnected sync");
-    assert!(ok.pushed >= 1);
+    let ok = sync_now_pg(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("reconnected sync");
+    assert_eq!(ok, "syncing");
 
     let dash2 = truckflow_lib::monitor::health_dashboard(ctx.state(), monitor.id.clone()).expect("health");
     let sync2 = dash2.components.iter().find(|c| c.component == "sync").expect("sync card");
@@ -708,12 +754,11 @@ fn reporting_reads_from_postgres_archive_when_connected() {
     let trip = |id: &str, cid: &str, status: &str, archived: &str, time_in: &str| {
         serde_json::json!({
             "id": id, "vehicle_id": null, "driver_id": null, "company_id": cid,
-            "capacity_at_trip": 40.0, "capacity_unit": "litres", "time_in": time_in,
+            "capacity_at_trip": 40.0, "time_in": time_in,
             "receipt_no": null, "officer_id": null, "capture_method": "auto",
             "confidence_score": 0.95, "photo_refs": null, "status": status,
             "resolution_notes": null, "pushed_to_sheets": 0,
             "created_at": time_in, "updated_at": time_in, "synced": 1,
-            "is_discharge_trip": "0", "model_version": "v1", "ocr_engine": "paddleocr",
             "archived": archived,
         })
     };
@@ -869,15 +914,22 @@ fn reference_export_then_import_round_trips_custom_fields() {
     std::fs::create_dir_all(&fdir).unwrap();
     let fconn = open_db(&fresh.db_path()).expect("open fresh db");
     let fapp = mock_app();
+    let (f_sync_tx, _f_sync_rx) = std::sync::mpsc::sync_channel(1);
     fapp.manage(AppState {
-        db: Mutex::new(fconn),
+        db: Arc::new(Mutex::new(fconn)),
+        sync_db: Arc::new(Mutex::new(open_db(&fresh.db_path()).unwrap())),
+        anpr_db: Arc::new(Mutex::new(open_db(&fresh.db_path()).unwrap())),
         session: Mutex::new(None),
         simulator: Arc::new(SimulatorSource::new()),
         anpr_last: Mutex::new(None),
         running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         frames_dir: fdir,
         pg: Arc::new(MockPostgres::new()),
         sheets: Arc::new(MockSheets::new()),
+        anpr_processes: Arc::new(Mutex::new(Vec::new())),
+        pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+        sync_notify: f_sync_tx,
     });
     let admin2 = commands::create_first_admin(fapp.state(), "Boss2".into(), ADMIN_PASS.into())
         .expect("create second admin")
@@ -1049,7 +1101,7 @@ fn combined_export_then_import_round_trips_all_entities() {
     };
     let summary = reference::reference_import_combined(ctx.state(), admin.id.clone(), req).expect("apply combined import");
     assert_eq!(summary.vehicles.updated, 1, "same DB → vehicle updated, not duplicated");
-    assert_eq!(summary.companies.updated, 1);
+    assert_eq!(summary.companies.updated, 2, "Default Company + Acme Waste both exist and get updated");
     assert_eq!(summary.drivers.updated, 1);
     assert_eq!(summary.vehicles.created, 0);
     assert!(summary.vehicles.errors.is_empty(), "vehicle errors: {:?}", summary.vehicles.errors);
@@ -1226,6 +1278,7 @@ fn deleting_driver_with_trip_history_does_not_fail_foreign_key() {
         &admin.id,
         "KDH100X",
         &ctx.frames_dir(),
+        None,
     )
     .expect("manual entry matches vehicle")
     .trip

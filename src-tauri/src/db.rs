@@ -39,6 +39,13 @@ pub struct AppState {
     pub sheets: Arc<dyn SheetsProvider>,
     /// ANPR service child processes (managed by start/stop commands).
     pub anpr_processes: Arc<Mutex<Vec<std::process::Child>>>,
+    /// Queued mark-synced operations: (table, ids) that were pushed to PG
+    /// but couldn't be marked locally because sync_db was contended.
+    /// Drained at the start of each poller cycle before pushing.
+    pub pending_sync_marks: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    /// Event-driven sync trigger. When a trip is created, send(()) wakes
+    /// the sync worker instantly — zero polling delay.
+    pub sync_notify: std::sync::mpsc::SyncSender<()>,
 }
 
 pub fn now_iso() -> String {
@@ -51,7 +58,7 @@ pub fn now_iso_offset(secs: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
+pub fn init_state(app: &AppHandle) -> Result<(AppState, std::sync::mpsc::Receiver<()>), String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -64,6 +71,10 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
     let conn = open_db(&db_path)?;
     let sync_conn = open_db(&db_path)?;
     let anpr_conn = open_db(&db_path)?;
+    // Set WAL auto-checkpoint threshold and run initial checkpoint
+    for conn in [&conn, &sync_conn, &anpr_conn] {
+        let _ = conn.execute_batch("PRAGMA wal_autocheckpoint = 1000");
+    }
     // Check if user has set a custom frames directory
     let frames_dir = get_setting(&conn, "frames_dir")
         .map(std::path::PathBuf::from)
@@ -71,7 +82,11 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("cannot create frames dir: {e}"))?;
     let pg = crate::sync::real_postgres(&conn);
     let sheets = crate::sync::real_sheets(&conn);
-    Ok(AppState {
+    // Event-driven sync channel: send(()) wakes the sync worker instantly.
+    // SyncSender capacity 1 — extra signals while busy are dropped (safe,
+    // the worker already knows to process pending rows).
+    let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel(1);
+    Ok((AppState {
         db: Arc::new(Mutex::new(conn)),
         sync_db: Arc::new(Mutex::new(sync_conn)),
         anpr_db: Arc::new(Mutex::new(anpr_conn)),
@@ -84,7 +99,9 @@ pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
         sheets,
         anpr_processes: Arc::new(Mutex::new(Vec::new())),
         anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    })
+        pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+        sync_notify: sync_tx,
+    }, sync_rx))
 }
 
 /// Open a database file, enable foreign keys, run migrations and seed data.
@@ -980,6 +997,93 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    // Migration 31: Multi-PC architecture tables
+    if current < 31 {
+        conn.execute_batch(
+            r#"
+            -- Machine status: track which PC is online/offline
+            CREATE TABLE IF NOT EXISTS machine_status (
+                id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                user_id TEXT,
+                company_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'gate_person',
+                last_seen_at TEXT NOT NULL,
+                is_online INTEGER NOT NULL DEFAULT 1,
+                ip_address TEXT,
+                pc_name TEXT,
+                UNIQUE(machine_id)
+            );
+
+            -- Company config: shared PG/Sheets settings
+            CREATE TABLE IF NOT EXISTS company_config (
+                company_id TEXT PRIMARY KEY,
+                pg_connection_string TEXT,
+                sheets_id TEXT,
+                sheets_frequency TEXT DEFAULT 'realtime',
+                anpr_enabled INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT
+            );
+            "#,
+        )
+        .map_err(|e| format!("migration 31 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 31;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // Migration 32: Add company_id to users, unique username per company
+    if current < 32 {
+        // Add company_id column to users table (nullable for existing users)
+        conn.execute_batch(
+            r#"
+            ALTER TABLE users ADD COLUMN company_id TEXT REFERENCES companies(id);
+            "#,
+        )
+        .map_err(|e| format!("migration 32a failed: {e}"))?;
+        
+        // Create unique index: username must be unique per company
+        // Handle existing duplicates by keeping first user per (name, company_id) pair
+        conn.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_company 
+            ON users(name, company_id);
+            "#,
+        )
+        .map_err(|e| format!("migration 32b failed: {e}"))?;
+        
+        conn.execute_batch("PRAGMA user_version = 32;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // Migration 33: Add pending_deletes table to track deletions for sync
+    if current < 33 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_deletes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                row_id TEXT NOT NULL,
+                deleted_at TEXT NOT NULL,
+                UNIQUE(table_name, row_id)
+            );
+            "#,
+        )
+        .map_err(|e| format!("migration 33 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 33;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
+    // Migration 34: Add detection_method to anpr_config
+    if current < 34 {
+        conn.execute_batch(
+            "ALTER TABLE anpr_config ADD COLUMN detection_method TEXT NOT NULL DEFAULT 'contour';",
+        )
+        .map_err(|e| format!("migration 34 failed: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 34;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -1062,22 +1166,24 @@ pub const PERMISSION_CATALOG: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
-    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles", "edit_trip"]),
+    ("preset-gate-officer", "Gate Officer", &["view_gate_entries", "resolve_queue", "edit_existing_vehicles", "edit_trip", "register_new_vehicle"]),
     (
         "preset-admin",
         "Admin",
         &[
-            "register_new_vehicle",
-            "resolve_queue",
-            "manage_users",
+            "view_gate_entries",
             "manage_reference_database",
+            "manage_users",
             "view_audit_log",
             "manage_integrations",
             "manage_anpr_config",
             "view_reporting_dashboard",
             "view_system_health",
-            "view_gate_entries",
             "acknowledge_health_alerts",
+            "export_reporting",
+            "register_new_vehicle",
+            "edit_existing_vehicles",
+            "resolve_queue",
         ],
     ),
     ("preset-reporting", "Reporting", &["view_reporting_dashboard", "export_reporting"]),
