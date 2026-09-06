@@ -1392,6 +1392,92 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
     Ok(())
 }
 
+/// Configure a webhook to trigger Google Sheets sync via Supabase Edge Function.
+/// The Edge Function receives trip data and pushes to Google Sheets.
+#[tauri::command]
+pub fn configure_sheets_webhook(
+    state: State<AppState>,
+    actor_id: String,
+    edge_function_url: String,
+    pat: String,
+) -> Result<String, String> {
+    // Get Supabase connection info
+    let (supabase_url, project_ref) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn_string = crate::db::get_setting(&conn, "pg_connection_string")
+            .ok_or("Supabase not configured. Please enter Supabase URL and API Key first.")?;
+
+        let config = crate::sync::RestConfig::parse(&conn_string)
+            .map_err(|e| format!("Invalid Supabase config: {}", e))?;
+
+        (config.url, config.project_ref)
+    };
+
+    // Create webhook via Supabase Management API
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // First, get the database schema to find the trips table ID
+    let webhook_payload = serde_json::json!({
+        "id": null, // Let Supabase generate ID
+        "name": "TruckFlow Sheets Sync",
+        "table_id": "trips",
+        "enabled": true,
+        "insert": true,
+        "update": true,
+        "delete": false,
+        "headers": [
+            {
+                "key": "Content-Type",
+                "value": "application/json"
+            }
+        ],
+        "url": edge_function_url,
+        "events": ["INSERT", "UPDATE"]
+    });
+
+    let response = client
+        .post(format!("https://api.supabase.com/v1/projects/{}/webhooks", project_ref))
+        .header("Authorization", format!("Bearer {}", pat))
+        .header("Content-Type", "application/json")
+        .json(&webhook_payload)
+        .send()
+        .map_err(|e| format!("Failed to create webhook: {}", e))?;
+
+    if response.status() != 200 && response.status() != 201 {
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        return Err(format!("Failed to create webhook ({}): {}", status, text));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WebhookResponse {
+        id: String,
+    }
+
+    let webhook: WebhookResponse = response
+        .json()
+        .map_err(|e| format!("Failed to parse webhook response: {}", e))?;
+
+    // Store the webhook URL in settings
+    let webhook_id = webhook.id.clone();
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::db::set_setting(&conn, "sheets_webhook_url", &edge_function_url)?;
+        crate::db::set_setting(&conn, "sheets_webhook_id", &webhook_id)?;
+    }
+
+    crate::log::log(&format!("[sheets] Webhook created successfully: {}", webhook_id));
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    append_audit(&conn, &actor_id, "configured_sheets_webhook", None,
+        Some(serde_json::json!({ "webhook_id": webhook_id, "url": edge_function_url })))?;
+
+    Ok(format!("Webhook configured successfully! ID: {}\n\nTrips will now sync to Google Sheets via your Edge Function.", webhook.id))
+}
+
 #[tauri::command]
 pub fn logout(state: State<AppState>) -> Result<(), String> {
     // Lock order: db → session (matches app_status, get_current_user).
