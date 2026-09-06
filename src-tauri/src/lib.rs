@@ -227,6 +227,7 @@ pub fn run() {
             sync::clear_exported_trips,
             sync::get_sheet_column_mapping,
             sync::set_sheet_column_mapping,
+            commands::configure_sheets_webhook,
             reporting::report_dashboard,
             reporting::report_trips_drill,
             reporting::report_export,
