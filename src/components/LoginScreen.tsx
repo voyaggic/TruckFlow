@@ -5,7 +5,6 @@ import PasswordChecklist from "./PasswordChecklist";
 
 export const SAVED_KEY = "tf.saved-login";
 const LOGGED_OUT_KEY = "tf.logged-out";
-const SUPABASE_SAVED_KEY = "tf.supabase-saved";
 
 interface SavedLogin {
   username: string;
@@ -37,23 +36,6 @@ function saveLogin(username: string, password: string) {
 function clearSaved() {
   try {
     localStorage.removeItem(SAVED_KEY);
-  } catch {
-    /* ignore */
-  }
-}
-
-// Check if Supabase URL was ever saved on this machine
-function isSupabaseConfigured(): boolean {
-  try {
-    return localStorage.getItem(SUPABASE_SAVED_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function markSupabaseConfigured() {
-  try {
-    localStorage.setItem(SUPABASE_SAVED_KEY, "1");
   } catch {
     /* ignore */
   }
@@ -104,8 +86,6 @@ export default function LoginScreen({
   // Signup fields
   const [companyName, setCompanyName] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-
-  const hasSupabaseConfigured = isSupabaseConfigured();
 
   // Prefill from the saved sign-in. Auto sign-in only when the user did not
   // manually log out (a manual log out must stick until they sign in again).
@@ -164,7 +144,6 @@ export default function LoginScreen({
       const res = await api.loginPassword(username.trim(), password, supabaseUrl.trim(), apiKey.trim());
       if (remember) {
         saveLogin(username.trim(), password);
-        markSupabaseConfigured();
       } else {
         clearSaved();
       }
@@ -207,9 +186,6 @@ export default function LoginScreen({
       );
       if (remember) {
         saveLogin(username.trim(), password);
-        if (supabaseUrl.trim() && apiKey.trim()) {
-          markSupabaseConfigured();
-        }
       }
       clearLoggedOut();
       onLogin(res.user);
