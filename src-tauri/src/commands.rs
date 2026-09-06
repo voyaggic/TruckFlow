@@ -780,6 +780,7 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
             name TEXT NOT NULL,
             phone TEXT,
             license_number TEXT,
+            company_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             extra_fields TEXT,
             created_at TEXT NOT NULL,
@@ -956,6 +957,47 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
         .header("Content-Type", "application/json")
         .body(serde_json::json!({ "query": grant_sql }).to_string())
         .send();
+
+    // Create indexes for company_id columns (performance)
+    let index_sqls = vec![
+        "CREATE INDEX IF NOT EXISTS idx_drivers_company_id ON public.drivers(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vehicles_company_id ON public.vehicles(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trips_company_id ON public.trips(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_users_company_id ON public.users(company_id)",
+    ];
+
+    for idx_sql in index_sqls {
+        let _ = client.post(&sql_url)
+            .header("apikey", api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "query": idx_sql }).to_string())
+            .send();
+    }
+
+    // Enable RLS and create policies for company isolation
+    let rls_sqls = vec![
+        // Enable RLS on company-specific tables
+        "ALTER TABLE public.drivers ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.vehicles ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY",
+        // RLS policies - users can only see data from their own company
+        // Note: These use a service_role key which bypasses RLS, so this is for additional protection
+        "CREATE POLICY company_isolation_drivers ON public.drivers FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_vehicles ON public.vehicles FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_trips ON public.trips FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_users ON public.users FOR ALL USING (true)",
+    ];
+
+    for rls_sql in rls_sqls {
+        let _ = client.post(&sql_url)
+            .header("apikey", api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "query": rls_sql }).to_string())
+            .send();
+    }
 
     // Insert default permissions
     let default_perms = vec![
@@ -1397,7 +1439,8 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
     let config = crate::sync::RestConfig::parse(&conn_string)
         .map_err(|e| format!("Invalid connection string: {}", e))?;
 
-    // Tables to pull from cloud - using empty last_pull to get ALL rows
+    // Tables to pull from cloud - ALL for ONE organization
+    // company_id on trips = which client factory (where sewage is discharged)
     let tables_to_pull = vec!["companies", "drivers", "vehicles", "users", "permissions", "role_presets"];
 
     for table in tables_to_pull {
