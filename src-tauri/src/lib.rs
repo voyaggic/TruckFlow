@@ -74,7 +74,6 @@ pub fn run() {
             spawn_sync_poller(app.handle(), &state, sync_rx);
             spawn_keepalive_pinger(&state);
             spawn_heartbeat(&state);
-            spawn_user_status_checker(app.handle(), &state);
             app.manage(state);
             Ok(())
         })
@@ -91,6 +90,7 @@ pub fn run() {
             commands::list_role_presets,
             commands::list_users,
             commands::create_user,
+            commands::signup_local,
             commands::set_user_permissions,
             commands::complete_auth_upgrade,
             commands::change_own_credential,
@@ -779,6 +779,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
     let sheets = state.sheets.clone();
     let sync_db = state.sync_db.clone();
     let pending_marks = state.pending_sync_marks.clone();
+    let db = state.db.clone();
     std::thread::spawn(move || {
         let mut last_sheets_run = std::time::Instant::now();
         let sheets_interval = std::time::Duration::from_secs(30);
@@ -807,6 +808,87 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
             let Some(_st) = handle.try_state::<AppState>() else {
                 continue;
             };
+
+            // ── Check user status in cloud (immediate effect of disable) ───
+            let current_user_id = {
+                let conn = match db.lock() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                conn.query_row(
+                    "SELECT u.id FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = (SELECT MAX(id) FROM sessions) AND s.user_id IS NOT NULL",
+                    [],
+                    |r| r.get::<_, String>(0),
+                ).ok()
+            };
+            if let (Some(user_id), true) = (current_user_id, pg.configured()) {
+                let (supabase_url, api_key) = {
+                    let conn = match db.lock() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    match crate::db::get_setting(&conn, "pg_connection_string") {
+                        Some(conn_str) => {
+                            let parts: Vec<&str> = conn_str.split('|').collect();
+                            if parts.len() >= 3 {
+                                (Some(parts[1].to_string()), Some(parts[2].to_string()))
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        None => (None, None),
+                    }
+                };
+                if let (Some(url), Some(key)) = (supabase_url, api_key) {
+                    match check_user_status_in_cloud(&url, &key, &user_id) {
+                        Ok(Some(status)) if status == "disabled" || status == "deleted" => {
+                            crate::log::log(&format!("[sync] User {} status changed to {}", user_id, status));
+                            if let Ok(conn) = db.lock() {
+                                let _ = conn.execute(
+                                    "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                                    rusqlite::params![status, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
+                                );
+                            }
+                            let _ = handle.emit("user-kicked-out", serde_json::json!({
+                                "reason": format!("Account has been {}", status)
+                            }));
+                        }
+                        Ok(Some(_)) => {
+                            if let Ok(conn) = db.lock() {
+                                let local_status: Option<String> = conn.query_row(
+                                    "SELECT status FROM users WHERE id = ?1",
+                                    rusqlite::params![user_id],
+                                    |r| r.get::<_, Option<String>>(0),
+                                ).ok().flatten();
+                                if let Some(ref ls) = local_status {
+                                    if ls != "active" {
+                                        let _ = conn.execute(
+                                            "UPDATE users SET status = 'active', updated_at = ?1 WHERE id = ?2",
+                                            rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
+                                        );
+                                        crate::log::log(&format!("[sync] User {} reactivated locally", user_id));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            crate::log::log(&format!("[sync] User {} not found in cloud", user_id));
+                            if let Ok(conn) = db.lock() {
+                                let _ = conn.execute(
+                                    "UPDATE users SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
+                                    rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
+                                );
+                            }
+                            let _ = handle.emit("user-kicked-out", serde_json::json!({
+                                "reason": "Account not found in cloud. Please contact admin."
+                            }));
+                        }
+                        Err(e) => {
+                            crate::log::log(&format!("[sync] Cloud unreachable: {}. Continuing offline.", e));
+                        }
+                    }
+                }
+            }
 
             // ── Drain pending mark-synced from previous cycles ─────────
             if let Ok(mut marks) = pending_marks.try_lock() {
@@ -1027,131 +1109,6 @@ async fn pick_folder(handle: tauri::AppHandle) -> Result<Option<String>, String>
     use tauri_plugin_dialog::DialogExt;
     let folder = handle.dialog().file().blocking_pick_folder();
     Ok(folder.map(|p| p.to_string()))
-}
-
-/// Spawns a background thread that checks user status in Supabase every 5 minutes.
-/// If the user is disabled/deleted in the cloud, emits "user-kicked-out" event.
-/// Handles offline gracefully - skips check if Supabase unreachable.
-fn spawn_user_status_checker(app: &tauri::AppHandle, state: &AppState) {
-    let handle = app.clone();
-    let running = state.running.clone();
-    let db = state.db.clone();
-    let pg = state.pg.clone();
-
-    std::thread::spawn(move || {
-        let check_interval = std::time::Duration::from_secs(300); // 5 minutes
-
-        while running.load(Ordering::Relaxed) {
-            std::thread::sleep(check_interval);
-
-            // Get current user ID from session via db
-            let current_user_id = {
-                let conn = match db.lock() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                // Query the current user from the session token
-                match conn.query_row(
-                    "SELECT u.id FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = (SELECT MAX(id) FROM sessions) AND s.user_id IS NOT NULL",
-                    [],
-                    |r| r.get::<_, String>(0),
-                ) {
-                    Ok(uid) => uid,
-                    Err(_) => continue, // No active session
-                }
-            };
-
-            // Check if Supabase is configured
-            if !pg.configured() {
-                continue; // No cloud configured, skip
-            }
-
-            // Try to get Supabase connection info from settings
-            let (supabase_url, api_key) = {
-                let conn = match db.lock() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                match crate::db::get_setting(&conn, "pg_connection_string") {
-                    Some(conn_str) => {
-                        // Parse REST|url|key format
-                        let parts: Vec<&str> = conn_str.split('|').collect();
-                        if parts.len() >= 3 {
-                            (parts[1].to_string(), parts[2].to_string())
-                        } else {
-                            continue;
-                        }
-                    }
-                    None => continue,
-                }
-            };
-
-            // Try to check user status in cloud
-            match check_user_status_in_cloud(&supabase_url, &api_key, &current_user_id) {
-                Ok(Some(status)) if status == "disabled" || status == "deleted" => {
-                    crate::log::log(&format!("[user-check] User {} status changed to {}", current_user_id, status));
-                    // Update local user status before kicking out
-                    {
-                        let conn = match db.lock() {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        let _ = conn.execute(
-                            "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                            rusqlite::params![status, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
-                        );
-                    }
-                    let _ = handle.emit("user-kicked-out", serde_json::json!({
-                        "reason": format!("Account has been {}", status)
-                    }));
-                }
-                Ok(Some(_)) => {
-                    // User is still active, all good - but check if local status needs update
-                    let conn = match db.lock() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    let local_status: Option<String> = conn.query_row(
-                        "SELECT status FROM users WHERE id = ?1",
-                        rusqlite::params![current_user_id],
-                        |r| r.get::<_, Option<String>>(0),
-                    ).ok().flatten();
-                    if let Some(ref ls) = local_status {
-                        if ls != "active" {
-                            // Cloud says active but local says disabled - update local
-                            let _ = conn.execute(
-                                "UPDATE users SET status = 'active', updated_at = ?1 WHERE id = ?2",
-                                rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
-                            );
-                            crate::log::log(&format!("[user-check] User {} reactivated locally", current_user_id));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // User not found in cloud - might have been deleted
-                    crate::log::log(&format!("[user-check] User {} not found in cloud", current_user_id));
-                    // Mark as deleted locally
-                    {
-                        let conn = match db.lock() {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        let _ = conn.execute(
-                            "UPDATE users SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
-                            rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
-                        );
-                    }
-                    let _ = handle.emit("user-kicked-out", serde_json::json!({
-                        "reason": "Account not found in cloud. Please contact admin."
-                    }));
-                }
-                Err(e) => {
-                    // Cloud unreachable or error - just log and continue (offline mode)
-                    crate::log::log(&format!("[user-check] Cloud unreachable: {}. Continuing offline.", e));
-                }
-            }
-        }
-    });
 }
 
 /// Check user status in Supabase cloud. Returns Some(status) if found, None if not found.
