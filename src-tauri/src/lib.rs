@@ -1089,16 +1089,57 @@ fn spawn_user_status_checker(app: &tauri::AppHandle, state: &AppState) {
             match check_user_status_in_cloud(&supabase_url, &api_key, &current_user_id) {
                 Ok(Some(status)) if status == "disabled" || status == "deleted" => {
                     crate::log::log(&format!("[user-check] User {} status changed to {}", current_user_id, status));
+                    // Update local user status before kicking out
+                    {
+                        let conn = match db.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let _ = conn.execute(
+                            "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                            rusqlite::params![status, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
+                        );
+                    }
                     let _ = handle.emit("user-kicked-out", serde_json::json!({
                         "reason": format!("Account has been {}", status)
                     }));
                 }
                 Ok(Some(_)) => {
-                    // User is still active, all good
+                    // User is still active, all good - but check if local status needs update
+                    let conn = match db.lock() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let local_status: Option<String> = conn.query_row(
+                        "SELECT status FROM users WHERE id = ?1",
+                        rusqlite::params![current_user_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    ).ok().flatten();
+                    if let Some(ref ls) = local_status {
+                        if ls != "active" {
+                            // Cloud says active but local says disabled - update local
+                            let _ = conn.execute(
+                                "UPDATE users SET status = 'active', updated_at = ?1 WHERE id = ?2",
+                                rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
+                            );
+                            crate::log::log(&format!("[user-check] User {} reactivated locally", current_user_id));
+                        }
+                    }
                 }
                 Ok(None) => {
                     // User not found in cloud - might have been deleted
                     crate::log::log(&format!("[user-check] User {} not found in cloud", current_user_id));
+                    // Mark as deleted locally
+                    {
+                        let conn = match db.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let _ = conn.execute(
+                            "UPDATE users SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
+                            rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), current_user_id],
+                        );
+                    }
                     let _ = handle.emit("user-kicked-out", serde_json::json!({
                         "reason": "Account not found in cloud. Please contact admin."
                     }));

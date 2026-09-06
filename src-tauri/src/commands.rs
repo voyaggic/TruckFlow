@@ -1328,63 +1328,66 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
 }
 
 /// Pull all company data from cloud (vehicles, drivers, users, etc.)
-fn pull_all_cloud_data(db: &std::sync::Mutex<rusqlite::Connection>) -> Result<(), String> {
+/// Uses the same sync mechanism as the background poller.
+fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>) -> Result<(), String> {
     crate::log::log("[sync] Pulling all cloud data to local...");
-    
+
     // Get connection string
     let conn_string = {
         let guard = db.lock().map_err(|e| e.to_string())?;
         crate::db::get_setting(&*guard, "pg_connection_string")
     }.ok_or("No Supabase connection configured")?;
-    
+
     let config = crate::sync::RestConfig::parse(&conn_string)
         .map_err(|e| format!("Invalid connection string: {}", e))?;
-    
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    
-    let tables = vec!["companies", "drivers", "vehicles", "users", "permissions", "role_presets"];
-    
-    for table in tables {
+
+    // Tables to pull from cloud - using empty last_pull to get ALL rows
+    let tables_to_pull = vec!["companies", "drivers", "vehicles", "users", "permissions", "role_presets"];
+
+    for table in tables_to_pull {
         let url = format!("{}/{}", config.url, table);
-        
-        let response = client.get(&url)
+
+        let response = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?
+            .get(&url)
             .header("apikey", &config.service_role_key)
             .header("Authorization", format!("Bearer {}", config.service_role_key))
             .send()
             .map_err(|e| format!("Failed to fetch {}: {}", table, e))?;
-        
+
         if !response.status().is_success() {
             crate::log::log(&format!("[sync] Failed to fetch {}: {}", table, response.status()));
             continue;
         }
-        
+
         let rows: Vec<serde_json::Value> = response
             .json()
             .map_err(|e| format!("Failed to parse {}: {}", table, e))?;
-        
+
+        if rows.is_empty() {
+            continue;
+        }
+
         crate::log::log(&format!("[sync] Fetched {} {} from cloud", rows.len(), table));
-        
-        // Store each row as JSON in a simple sync table
+
+        // Use the same upsert mechanism as the sync poller
         let local_conn = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
-        
-        for row in rows {
-            let json = serde_json::to_string(&row).unwrap_or_default();
-            if json.is_empty() {
-                continue;
-            }
-            // Use INSERT OR REPLACE with just the id and json
-            if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
-                let _ = local_conn.execute(
-                    &format!("INSERT OR REPLACE INTO {} (id, data, synced) VALUES (?1, ?2, 1)", table),
-                    rusqlite::params![id, json],
-                );
-            }
+
+        // Convert to the format expected by upsert_central_rows (serde_json::Value)
+        let central_rows: Vec<serde_json::Value> = rows
+            .into_iter()
+            .filter_map(|v| v.as_object().map(|o| serde_json::Value::Object(o.clone())))
+            .collect();
+
+        if let Err(e) = crate::sync::upsert_central_rows(&local_conn, table, &central_rows) {
+            crate::log::log(&format!("[sync] Failed to upsert {}: {}", table, e));
+        } else {
+            crate::log::log(&format!("[sync] Upserted {} {} to local", central_rows.len(), table));
         }
     }
-    
+
     crate::log::log("[sync] Cloud data pull complete");
     Ok(())
 }
