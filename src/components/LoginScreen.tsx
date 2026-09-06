@@ -342,6 +342,18 @@ export default function LoginScreen({
                 />
               </div>
 
+              {/* Toggle to show Supabase credentials */}
+              {!needsCredentials && !supabaseUrl && !apiKey && (
+                <button
+                  type="button"
+                  className="small muted"
+                  style={{ background: "none", border: "none", cursor: "pointer", textDecoration: "underline", marginTop: 8 }}
+                  onClick={() => setNeedsCredentials(true)}
+                >
+                  + Connect to Supabase (first time setup)
+                </button>
+              )}
+
               {/* Supabase credentials - shown when needed */}
               {(needsCredentials || supabaseUrl || apiKey) && (
                 <div style={{ marginTop: 12, padding: 12, background: "var(--bg-secondary)", borderRadius: "var(--radius)" }}>
