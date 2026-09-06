@@ -988,6 +988,41 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
     Ok(())
 }
 
+/// Check if the required tables exist in Supabase
+fn check_tables_exist(client: &reqwest::blocking::Client, supabase_url: &str, api_key: &str) -> Result<bool, String> {
+    let base_url = supabase_url.trim_end_matches('/');
+
+    // Try to query the companies table - if it exists, tables are set up
+    let url = format!("{}/companies?select=id&limit=1", base_url);
+
+    match client.get(&url)
+        .header("apikey", api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send() {
+        Ok(response) => {
+            // If we get 200 or 404, we can determine if table exists
+            if response.status() == 200 {
+                Ok(true) // Table exists
+            } else if response.status() == 404 {
+                // Table might not exist or no data - check if it's a schema issue
+                let text = response.text().unwrap_or_default();
+                if text.contains("does not exist") {
+                    Ok(false) // Table definitely doesn't exist
+                } else {
+                    Ok(true) // Table exists but returned no rows (which is fine)
+                }
+            } else {
+                // Other error - assume tables might exist
+                Ok(true)
+            }
+        }
+        Err(_) => {
+            // Network error or timeout - assume tables exist to avoid blocking login
+            Ok(true)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn login_password(
     state: State<AppState>,
@@ -1004,7 +1039,28 @@ pub fn login_password(
             let conn_string = format!("REST|{}|{}", supabase_url.trim_end_matches('/'), api_key);
             crate::db::set_setting(&conn, "pg_connection_string", &conn_string);
         }
-        
+
+        // Check if tables exist, if not create them automatically
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+
+        match check_tables_exist(&client, &supabase_url, &api_key) {
+            Ok(true) => {
+                // Tables exist, try cloud login
+            }
+            Ok(false) => {
+                // Tables don't exist - auto-create them
+                crate::log::log("[login] Tables not found in Supabase, auto-creating...");
+                create_cloud_tables(&client, &supabase_url, &api_key)?;
+                crate::log::log("[login] Tables created successfully");
+            }
+            Err(e) => {
+                crate::log::log(&format!("[login] Could not check tables: {}", e));
+            }
+        }
+
         // Try to validate against Supabase
         match query_user_from_supabase(&supabase_url, &api_key, &username) {
             Ok(cloud_user) => {
