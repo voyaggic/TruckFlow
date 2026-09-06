@@ -87,6 +87,9 @@ export const api = {
   createUser: (actorId: string, name: string, password: string, permissionKeys: string[]) =>
     invoke<UserView>("create_user", { actorId, name, password, permissionKeys }),
 
+  createUserLocal: (name: string, password: string) =>
+    invoke<SessionUser>("signup_local", { name, password }),
+
   setUserPermissions: (actorId: string, userId: string, permissionKeys: string[], actorCredential: string) =>
     invoke<PermissionChangeResult>("set_user_permissions", { actorId, userId, permissionKeys, actorCredential }),
 

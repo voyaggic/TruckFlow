@@ -1790,14 +1790,6 @@ pub fn create_user(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
-    // Check if a user with this name already exists (including soft-deleted)
-    let existing: Option<(String, String)> = conn
-        .query_row(
-            "SELECT id, status FROM users WHERE name = ?1",
-            params![&name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
 
     let (id, is_restored) = if let Some((existing_id, status)) = &existing {
         if status == "deleted" {
@@ -1865,6 +1857,71 @@ pub fn create_user(
     };
     std::mem::swap(&mut view.permissions, &mut perms);
     Ok(view)
+}
+
+/// Create a local user account for signup - no admin permission needed
+/// User will be verified against Supabase on login
+#[tauri::command]
+pub fn signup_local(
+    state: State<AppState>,
+    name: String,
+    password: String,
+) -> Result<SessionUser, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Username is required.".to_string());
+    }
+    if password.len() < 8 {
+        return Err("Password must be at least 8 characters.".to_string());
+    }
+
+    // Check if user already exists
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM users WHERE name = ?1",
+            params![&name],
+            |r| Ok(r.get::<_, String>(0)?),
+        )
+        .ok();
+
+    if existing.is_some() {
+        return Err("A user with this username already exists.".to_string());
+    }
+
+    // Create new local user
+    let id = uuid::Uuid::new_v4().to_string();
+    let hash = hash_credential(&password)?;
+    let now = now_iso();
+
+    conn.execute(
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, role, created_at, updated_at, synced)
+         VALUES (?1, ?2, 'password', ?3, 'active', 'staff', ?4, ?4, 0)",
+        params![id, name, hash, now],
+    )
+    .map_err(|e| format!("failed to create user: {}", e))?;
+
+    // Grant basic staff permissions
+    let basic_perms = vec!["view_reports", "create_trips", "anpr"];
+    for key in basic_perms {
+        if let Ok(pid) = crate::db::permission_id_for_key(&conn, key) {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
+                params![id, pid, now],
+            );
+        }
+    }
+
+    // Save session
+    save_session_token(&conn, &id)?;
+    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+        user_id: id.clone(),
+        logged_in_at: now.clone(),
+        auth_type: "password".to_string(),
+    });
+
+    load_session_user(&conn, &id)
 }
 
 pub(crate) fn ensure_admin_permission(conn: &Connection, actor_id: &str, key: &str) -> Result<(), String> {
