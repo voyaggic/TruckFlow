@@ -3720,6 +3720,9 @@ impl RestPostgres {
 
         crate::log::log(&format!("[sync] push_rows {}: {} rows, {} columns after filtering", table, filtered.len(), if filtered.is_empty() { 0 } else { filtered[0].as_object().map(|m| m.len()).unwrap_or(0) }));
 
+        // Auto-create table if it doesn't exist in Supabase
+        self.ensure_table_exists(&config.url, table, &filtered, &config.service_role_key)?;
+
         let mut all_acked = Vec::new();
         let batch_size = 100;
 
@@ -3768,6 +3771,129 @@ impl RestPostgres {
         }
 
         Ok(all_acked)
+    }
+
+    /// Ensure table exists in Supabase. If not, create it based on the data structure.
+    fn ensure_table_exists(&self, base_url: &str, table: &str, rows: &[serde_json::Value], service_role_key: &str) -> Result<(), String> {
+        // First check if table exists by trying to query it
+        let check_url = format!("{}/{}?limit=1", base_url.trim_end_matches('/'), table);
+        let response = self.client.get(&check_url)
+            .header("apikey", service_role_key)
+            .header("Authorization", format!("Bearer {}", service_role_key))
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 400 => {
+                // Table might exist, check for PGRST204 (table not found)
+                let text = resp.text().unwrap_or_default();
+                if text.contains("does not exist") || text.contains("PGRST204") {
+                    // Table doesn't exist, create it
+                    crate::log::log(&format!("[sync] Table {} doesn't exist in Supabase, creating...", table));
+                    self.create_table_if_not_exists(base_url, table, rows, service_role_key)?;
+                }
+                Ok(())
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                // Table definitely doesn't exist, create it
+                crate::log::log(&format!("[sync] Table {} doesn't exist in Supabase, creating...", table));
+                self.create_table_if_not_exists(base_url, table, rows, service_role_key)?;
+                Ok(())
+            }
+            Err(e) => {
+                // Network error - table might exist, try to proceed
+                crate::log::log(&format!("[sync] Could not check if table {} exists: {}", table, e));
+                Ok(())
+            }
+            _ => Ok(()), // Other statuses - assume table exists
+        }
+    }
+
+    /// Create a table in Supabase based on the structure of the provided rows
+    fn create_table_if_not_exists(&self, base_url: &str, table: &str, rows: &[serde_json::Value], service_role_key: &str) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        // Get columns from the first row
+        let first_row = match rows.first().and_then(|r| r.as_object()) {
+            Some(obj) => obj,
+            None => return Ok(()),
+        };
+
+        // Build CREATE TABLE SQL
+        let mut column_defs = Vec::new();
+        for (col_name, value) in first_row {
+            let pg_type = match value {
+                serde_json::Value::Null => "TEXT".to_string(),
+                serde_json::Value::Bool(_) => "BOOLEAN".to_string(),
+                serde_json::Value::Number(n) => {
+                    if n.is_i64() || n.to_string().contains('.') == false {
+                        "BIGINT".to_string()
+                    } else {
+                        "DOUBLE PRECISION".to_string()
+                    }
+                }
+                serde_json::Value::String(_) => "TEXT".to_string(),
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => "JSONB".to_string(),
+            };
+            column_defs.push(format!("{} {}", col_name, pg_type));
+        }
+
+        // Add standard columns if not present
+        let has_id = first_row.contains_key("id");
+        let has_created_at = first_row.contains_key("created_at");
+        let has_updated_at = first_row.contains_key("updated_at");
+
+        if !has_id {
+            column_defs.insert(0, "id TEXT PRIMARY KEY".to_string());
+        }
+        if !has_created_at {
+            column_defs.push("created_at TEXT".to_string());
+        }
+        if !has_updated_at {
+            column_defs.push("updated_at TEXT".to_string());
+        }
+
+        let create_sql = format!(
+            "CREATE TABLE IF NOT EXISTS public.{} ({})",
+            table,
+            column_defs.join(", ")
+        );
+
+        // Execute the CREATE TABLE via Supabase SQL endpoint
+        let sql_url = format!("{}/sql", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({ "query": create_sql });
+
+        let response = self.client.post(&sql_url)
+            .header("apikey", service_role_key)
+            .header("Authorization", format!("Bearer {}", service_role_key))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("Failed to create table: {}", e))?;
+
+        if !response.status().is_success() {
+            let text = response.text().unwrap_or_default();
+            // If table already exists (probably created by another sync), that's OK
+            if !text.contains("already exists") {
+                crate::log::log(&format!("[sync] Failed to create table {}: {}", table, text));
+                // Don't fail the sync - maybe it was created by another process
+                return Ok(());
+            }
+        }
+
+        crate::log::log(&format!("[sync] Successfully created table {} in Supabase", table));
+
+        // Notify schema cache refresh
+        let notify_sql = r#"SELECT notify_pgrst_cache_needs_refresh()"#;
+        let _ = self.client.post(&sql_url)
+            .header("apikey", service_role_key)
+            .header("Authorization", format!("Bearer {}", service_role_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "query": notify_sql }))
+            .send();
+
+        Ok(())
     }
 
     fn do_push_batch(&self, base_url: &str, table: &str, rows: &[serde_json::Value], service_role_key: &str) -> Result<Vec<String>, String> {

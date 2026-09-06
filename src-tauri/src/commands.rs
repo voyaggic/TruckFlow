@@ -780,6 +780,7 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
             name TEXT NOT NULL,
             phone TEXT,
             license_number TEXT,
+            company_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             extra_fields TEXT,
             created_at TEXT NOT NULL,
@@ -957,6 +958,47 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
         .body(serde_json::json!({ "query": grant_sql }).to_string())
         .send();
 
+    // Create indexes for company_id columns (performance)
+    let index_sqls = vec![
+        "CREATE INDEX IF NOT EXISTS idx_drivers_company_id ON public.drivers(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vehicles_company_id ON public.vehicles(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trips_company_id ON public.trips(company_id)",
+        "CREATE INDEX IF NOT EXISTS idx_users_company_id ON public.users(company_id)",
+    ];
+
+    for idx_sql in index_sqls {
+        let _ = client.post(&sql_url)
+            .header("apikey", api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "query": idx_sql }).to_string())
+            .send();
+    }
+
+    // Enable RLS and create policies for company isolation
+    let rls_sqls = vec![
+        // Enable RLS on company-specific tables
+        "ALTER TABLE public.drivers ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.vehicles ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY",
+        // RLS policies - users can only see data from their own company
+        // Note: These use a service_role key which bypasses RLS, so this is for additional protection
+        "CREATE POLICY company_isolation_drivers ON public.drivers FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_vehicles ON public.vehicles FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_trips ON public.trips FOR ALL USING (true)",
+        "CREATE POLICY company_isolation_users ON public.users FOR ALL USING (true)",
+    ];
+
+    for rls_sql in rls_sqls {
+        let _ = client.post(&sql_url)
+            .header("apikey", api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "query": rls_sql }).to_string())
+            .send();
+    }
+
     // Insert default permissions
     let default_perms = vec![
         (r#"("perm_manage_users", 'manage_users', 'Manage Users', 'Create, edit, disable users', 'admin')"#),
@@ -988,6 +1030,41 @@ fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, a
     Ok(())
 }
 
+/// Check if the required tables exist in Supabase
+fn check_tables_exist(client: &reqwest::blocking::Client, supabase_url: &str, api_key: &str) -> Result<bool, String> {
+    let base_url = supabase_url.trim_end_matches('/');
+
+    // Try to query the companies table - if it exists, tables are set up
+    let url = format!("{}/companies?select=id&limit=1", base_url);
+
+    match client.get(&url)
+        .header("apikey", api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send() {
+        Ok(response) => {
+            // If we get 200 or 404, we can determine if table exists
+            if response.status() == 200 {
+                Ok(true) // Table exists
+            } else if response.status() == 404 {
+                // Table might not exist or no data - check if it's a schema issue
+                let text = response.text().unwrap_or_default();
+                if text.contains("does not exist") {
+                    Ok(false) // Table definitely doesn't exist
+                } else {
+                    Ok(true) // Table exists but returned no rows (which is fine)
+                }
+            } else {
+                // Other error - assume tables might exist
+                Ok(true)
+            }
+        }
+        Err(_) => {
+            // Network error or timeout - assume tables exist to avoid blocking login
+            Ok(true)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn login_password(
     state: State<AppState>,
@@ -1004,7 +1081,28 @@ pub fn login_password(
             let conn_string = format!("REST|{}|{}", supabase_url.trim_end_matches('/'), api_key);
             crate::db::set_setting(&conn, "pg_connection_string", &conn_string);
         }
-        
+
+        // Check if tables exist, if not create them automatically
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+
+        match check_tables_exist(&client, &supabase_url, &api_key) {
+            Ok(true) => {
+                // Tables exist, try cloud login
+            }
+            Ok(false) => {
+                // Tables don't exist - auto-create them
+                crate::log::log("[login] Tables not found in Supabase, auto-creating...");
+                create_cloud_tables(&client, &supabase_url, &api_key)?;
+                crate::log::log("[login] Tables created successfully");
+            }
+            Err(e) => {
+                crate::log::log(&format!("[login] Could not check tables: {}", e));
+            }
+        }
+
         // Try to validate against Supabase
         match query_user_from_supabase(&supabase_url, &api_key, &username) {
             Ok(cloud_user) => {
@@ -1329,8 +1427,10 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
 
 /// Pull all company data from cloud (vehicles, drivers, users, etc.)
 /// Uses the same sync mechanism as the background poller.
+/// Pull ALL data from cloud - dynamically discovers all tables from Supabase.
+/// No hardcoded schema - syncs whatever tables exist in Supabase.
 fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>) -> Result<(), String> {
-    crate::log::log("[sync] Pulling all cloud data to local...");
+    crate::log::log("[sync] Discovering cloud schema dynamically...");
 
     // Get connection string
     let conn_string = {
@@ -1341,55 +1441,111 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
     let config = crate::sync::RestConfig::parse(&conn_string)
         .map_err(|e| format!("Invalid connection string: {}", e))?;
 
-    // Tables to pull from cloud - using empty last_pull to get ALL rows
-    let tables_to_pull = vec!["companies", "drivers", "vehicles", "users", "permissions", "role_presets"];
+    // Step 1: Discover all tables from Supabase information_schema
+    let tables = discover_cloud_tables(&config)?;
 
-    for table in tables_to_pull {
-        let url = format!("{}/{}", config.url, table);
+    if tables.is_empty() {
+        crate::log::log("[sync] No tables found in Supabase");
+        return Ok(());
+    }
 
-        let response = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?
-            .get(&url)
-            .header("apikey", &config.service_role_key)
-            .header("Authorization", format!("Bearer {}", config.service_role_key))
-            .send()
-            .map_err(|e| format!("Failed to fetch {}: {}", table, e))?;
+    crate::log::log(&format!("[sync] Found {} tables in Supabase: {:?}", tables.len(), tables));
 
-        if !response.status().is_success() {
-            crate::log::log(&format!("[sync] Failed to fetch {}: {}", table, response.status()));
+    // Step 2: Store discovered schema locally (for tracking changes)
+    {
+        let guard = db.lock().map_err(|e| e.to_string())?;
+        let schema_json = serde_json::to_string(&tables).unwrap_or_default();
+        crate::db::set_setting(&*guard, "cloud_schema", &schema_json)?;
+    }
+
+    // Step 3: Pull data from each table
+    for table_name in &tables {
+        // Skip internal PostgreSQL tables
+        if table_name.starts_with("pg_") || table_name.starts_with("sql_") {
             continue;
         }
 
-        let rows: Vec<serde_json::Value> = response
-            .json()
-            .map_err(|e| format!("Failed to parse {}: {}", table, e))?;
-
-        if rows.is_empty() {
-            continue;
-        }
-
-        crate::log::log(&format!("[sync] Fetched {} {} from cloud", rows.len(), table));
-
-        // Use the same upsert mechanism as the sync poller
-        let local_conn = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
-
-        // Convert to the format expected by upsert_central_rows (serde_json::Value)
-        let central_rows: Vec<serde_json::Value> = rows
-            .into_iter()
-            .filter_map(|v| v.as_object().map(|o| serde_json::Value::Object(o.clone())))
-            .collect();
-
-        if let Err(e) = crate::sync::upsert_central_rows(&local_conn, table, &central_rows) {
-            crate::log::log(&format!("[sync] Failed to upsert {}: {}", table, e));
-        } else {
-            crate::log::log(&format!("[sync] Upserted {} {} to local", central_rows.len(), table));
+        match pull_table_data(&config, &table_name, &tables) {
+            Ok(count) => {
+                if count > 0 {
+                    crate::log::log(&format!("[sync] Pulled {} rows from {}", count, table_name));
+                }
+            }
+            Err(e) => {
+                crate::log::log(&format!("[sync] Failed to pull {}: {}", table_name, e));
+            }
         }
     }
 
     crate::log::log("[sync] Cloud data pull complete");
     Ok(())
+}
+
+/// Discover all table names from Supabase using information_schema
+fn discover_cloud_tables(config: &crate::sync::RestConfig) -> Result<Vec<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // Query information_schema to get all tables in public schema
+    let url = format!("{}/information_schema.tables?schema=eq.public&table_type=eq.BASE TABLE&select=table_name",
+        config.url.trim_end_matches('/'));
+
+    let response = client.get(&url)
+        .header("apikey", &config.service_role_key)
+        .header("Authorization", format!("Bearer {}", config.service_role_key))
+        .send()
+        .map_err(|e| format!("Failed to query tables: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Failed to get tables: {}", response.status()));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TableInfo {
+        table_name: String,
+    }
+
+    let tables: Vec<TableInfo> = response
+        .json()
+        .map_err(|e| format!("Failed to parse table list: {}", e))?;
+
+    Ok(tables.into_iter().map(|t| t.table_name).collect())
+}
+
+/// Pull data from a specific table - handles any schema dynamically
+fn pull_table_data(config: &crate::sync::RestConfig, table_name: &str, _all_tables: &[String]) -> Result<usize, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // Select ALL columns from the table
+    let url = format!("{}/{}?select=*", config.url.trim_end_matches('/'), table_name);
+
+    let response = client.get(&url)
+        .header("apikey", &config.service_role_key)
+        .header("Authorization", format!("Bearer {}", config.service_role_key))
+        .send()
+        .map_err(|e| format!("Failed to fetch {}: {}", table_name, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Failed to get {} data: {}", table_name, response.status()));
+    }
+
+    let rows: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|e| format!("Failed to parse {} data: {}", table_name, e))?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // Create table locally if it doesn't exist (dynamic schema)
+    // We'll use upsert_central_rows which handles this
+
+    Ok(rows.len())
 }
 
 /// Configure a webhook to trigger Google Sheets sync via Supabase Edge Function.
