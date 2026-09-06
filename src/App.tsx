@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "./lib/api";
 import type { AppStatus, SessionUser } from "./lib/types";
 import type { ThemeMode } from "./lib/theme";
@@ -29,6 +30,17 @@ export default function App() {
       applyTheme((theme_mode as ThemeMode) ?? "light", theme_accent ?? "blue");
     }
   }, [status?.current_user]);
+
+  // Listen for user-kicked-out event (user disabled/deleted in cloud)
+  useEffect(() => {
+    const unlisten = listen<{ reason: string }>("user-kicked-out", (event) => {
+      console.warn("[App] User kicked out:", event.payload.reason);
+      api.logout().catch(() => undefined);
+      markLoggedOut();
+      setStatus((s) => s ? { ...s, current_user: null } : { needs_first_run: false, current_user: null });
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
 
   const handleLogin = (user: SessionUser) => {
     setStatus({ needs_first_run: false, current_user: user });
