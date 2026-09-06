@@ -64,8 +64,11 @@ export const api = {
   createCompanyAndAdmin: (companyName: string, adminName: string, password: string) =>
     invoke<LoginResult>("create_company_and_admin", { companyName, adminName, password }),
 
-  loginPassword: (username: string, password: string) =>
-    invoke<LoginResult>("login_password", { username, password }),
+  createCompanyAndAdminCloud: (companyName: string, adminName: string, password: string, supabaseUrl: string, apiKey: string) =>
+    invoke<LoginResult>("create_company_and_admin_cloud", { companyName, adminName, password, supabaseUrl, apiKey }),
+
+  loginPassword: (username: string, password: string, supabaseUrl?: string, apiKey?: string) =>
+    invoke<LoginResult>("login_password", { username, password, supabaseUrl: supabaseUrl || "", apiKey: apiKey || "" }),
 
   logout: () => invoke<void>("logout"),
 

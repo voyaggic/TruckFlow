@@ -3620,15 +3620,15 @@ fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
 /// REST adapter config: "REST|URL|SERVICE_ROLE_KEY"
 /// - URL: https://[ref].supabase.co/rest/v1
 /// - SERVICE_ROLE_KEY: JWT for REST API calls (full admin access, bypasses RLS)
-struct RestConfig {
-    url: String,
-    service_role_key: String,
-    project_ref: String,
-    pat: Option<String>,
+pub struct RestConfig {
+    pub url: String,
+    pub service_role_key: String,
+    pub project_ref: String,
+    pub pat: Option<String>,
 }
 
 impl RestConfig {
-    fn parse(conn_string: &str) -> Result<Self, String> {
+    pub fn parse(conn_string: &str) -> Result<Self, String> {
         let prefix = "REST|";
         if !conn_string.starts_with(prefix) {
             return Err("Invalid REST config format: must start with 'REST|'. Expected: REST|https://...|[service-role-key]".to_string());
@@ -3673,7 +3673,7 @@ impl RestConfig {
     }
 }
 
-struct RestPostgres {
+pub struct RestPostgres {
     client: reqwest::blocking::Client,
     config: std::sync::Mutex<Option<RestConfig>>,
     is_connected: std::sync::atomic::AtomicBool,
