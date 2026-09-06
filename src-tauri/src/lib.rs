@@ -74,6 +74,7 @@ pub fn run() {
             spawn_sync_poller(app.handle(), &state, sync_rx);
             spawn_keepalive_pinger(&state);
             spawn_heartbeat(&state);
+            spawn_user_status_checker(app.handle(), &state);
             app.manage(state);
             Ok(())
         })
@@ -1025,4 +1026,133 @@ async fn pick_folder(handle: tauri::AppHandle) -> Result<Option<String>, String>
     use tauri_plugin_dialog::DialogExt;
     let folder = handle.dialog().file().blocking_pick_folder();
     Ok(folder.map(|p| p.to_string()))
+}
+
+/// Spawns a background thread that checks user status in Supabase every 5 minutes.
+/// If the user is disabled/deleted in the cloud, emits "user-kicked-out" event.
+/// Handles offline gracefully - skips check if Supabase unreachable.
+fn spawn_user_status_checker(app: &tauri::AppHandle, state: &AppState) {
+    let handle = app.clone();
+    let running = state.running.clone();
+    let db = state.db.clone();
+    let pg = state.pg.clone();
+
+    std::thread::spawn(move || {
+        let check_interval = std::time::Duration::from_secs(300); // 5 minutes
+
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(check_interval);
+
+            // Get current user ID from session via db
+            let current_user_id = {
+                let conn = match db.lock() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                // Query the current user from the session token
+                match conn.query_row(
+                    "SELECT u.id FROM users u JOIN sessions s ON s.user_id = u.id WHERE s.id = (SELECT MAX(id) FROM sessions) AND s.user_id IS NOT NULL",
+                    [],
+                    |r| r.get::<_, String>(0),
+                ) {
+                    Ok(uid) => uid,
+                    Err(_) => continue, // No active session
+                }
+            };
+
+            // Check if Supabase is configured
+            if !pg.configured() {
+                continue; // No cloud configured, skip
+            }
+
+            // Try to get Supabase connection info from settings
+            let (supabase_url, api_key) = {
+                let conn = match db.lock() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                match crate::db::get_setting(&conn, "pg_connection_string") {
+                    Some(conn_str) => {
+                        // Parse REST|url|key format
+                        let parts: Vec<&str> = conn_str.split('|').collect();
+                        if parts.len() >= 3 {
+                            (parts[1].to_string(), parts[2].to_string())
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => continue,
+                }
+            };
+
+            // Try to check user status in cloud
+            match check_user_status_in_cloud(&supabase_url, &api_key, &current_user_id) {
+                Ok(Some(status)) if status == "disabled" || status == "deleted" => {
+                    crate::log::log(&format!("[user-check] User {} status changed to {}", current_user_id, status));
+                    let _ = handle.emit("user-kicked-out", serde_json::json!({
+                        "reason": format!("Account has been {}", status)
+                    }));
+                }
+                Ok(Some(_)) => {
+                    // User is still active, all good
+                }
+                Ok(None) => {
+                    // User not found in cloud - might have been deleted
+                    crate::log::log(&format!("[user-check] User {} not found in cloud", current_user_id));
+                    let _ = handle.emit("user-kicked-out", serde_json::json!({
+                        "reason": "Account not found in cloud. Please contact admin."
+                    }));
+                }
+                Err(e) => {
+                    // Cloud unreachable or error - just log and continue (offline mode)
+                    crate::log::log(&format!("[user-check] Cloud unreachable: {}. Continuing offline.", e));
+                }
+            }
+        }
+    });
+}
+
+/// Check user status in Supabase cloud. Returns Some(status) if found, None if not found.
+fn check_user_status_in_cloud(supabase_url: &str, api_key: &str, user_id: &str) -> Result<Option<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let encoded_id = user_id
+        .replace('%', "%25")
+        .replace('=', "%3D")
+        .replace('&', "%26")
+        .replace('/', "%2F");
+
+    let url = format!(
+        "{}/users?id=eq.{}&select=status",
+        supabase_url.trim_end_matches('/'),
+        encoded_id
+    );
+
+    let response = client.get(&url)
+        .header("apikey", api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .map_err(|e| format!("Failed to connect to Supabase: {}", e))?;
+
+    if response.status() == 401 || response.status() == 403 {
+        return Err("Invalid Supabase credentials".to_string());
+    }
+
+    if response.status() == 404 {
+        return Ok(None); // User not found
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StatusResponse {
+        status: String,
+    }
+
+    let users: Vec<StatusResponse> = response
+        .json()
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    Ok(users.into_iter().next().map(|u| u.status))
 }
