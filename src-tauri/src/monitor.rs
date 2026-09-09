@@ -12,6 +12,7 @@ use tauri::State;
 
 use crate::db::{now_iso, AppState};
 use crate::models::{ComponentHealth, ConfidenceTrendPoint, HealthDashboard, HealthEventView};
+use crate::sync;
 
 pub const COMPONENTS: &[&str] = &["camera", "anpr_service", "sync", "database"];
 
@@ -25,11 +26,14 @@ pub fn record_health_event(conn: &Connection, component: &str, status: &str, det
     let now = now_iso();
     if status == "ok" {
         conn.execute(
-            "UPDATE system_health_events SET resolved_at = ?1
+            "UPDATE system_health_events SET resolved_at = ?1, synced = 0
              WHERE component = ?2 AND resolved_at IS NULL",
             params![now, component],
         )
         .map_err(|e| format!("health resolve failed: {e}"))?;
+        let _ = sync::write_to_sync_log(conn, "system_health_events", component, "UPDATE", Some(&serde_json::json!({
+            "component": component, "resolved_at": now
+        })));
         return Ok(());
     }
 
@@ -42,18 +46,25 @@ pub fn record_health_event(conn: &Connection, component: &str, status: &str, det
         .map_err(|e| format!("health scan failed: {e}"))?;
     if open > 0 {
         conn.execute(
-            "UPDATE system_health_events SET detail = ?1, detected_at = ?2
+            "UPDATE system_health_events SET detail = ?1, detected_at = ?2, synced = 0
              WHERE component = ?3 AND resolved_at IS NULL",
             params![detail, now, component],
         )
         .map_err(|e| format!("health refresh failed: {e}"))?;
+        let _ = sync::write_to_sync_log(conn, "system_health_events", component, "UPDATE", Some(&serde_json::json!({
+            "component": component, "detail": detail, "detected_at": now
+        })));
     } else {
+        let event_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO system_health_events (id, component, status, detail, detected_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![uuid::Uuid::new_v4().to_string(), component, status, detail, now],
+            params![event_id, component, status, detail, now],
         )
         .map_err(|e| format!("health insert failed: {e}"))?;
+        let _ = sync::write_to_sync_log(conn, "system_health_events", &event_id, "INSERT", Some(&serde_json::json!({
+            "id": event_id, "component": component, "status": status, "detail": detail, "detected_at": now
+        })));
     }
     Ok(())
 }
@@ -197,7 +208,7 @@ pub fn acknowledge_health_event(state: State<AppState>, actor_id: String, event_
     crate::commands::ensure_admin_permission(&conn, &actor_id, "acknowledge_health_alerts")?;
     let n = conn
         .execute(
-            "UPDATE system_health_events SET acknowledged_by = ?1, acknowledged_at = ?2
+            "UPDATE system_health_events SET acknowledged_by = ?1, acknowledged_at = ?2, synced = 0
              WHERE id = ?3 AND resolved_at IS NULL",
             params![actor_id, now_iso(), event_id],
         )
@@ -205,6 +216,9 @@ pub fn acknowledge_health_event(state: State<AppState>, actor_id: String, event_
     if n == 0 {
         return Err("Alert not found or already resolved.".to_string());
     }
+    let _ = sync::write_to_sync_log(&conn, "system_health_events", &event_id, "UPDATE", Some(&serde_json::json!({
+        "id": event_id, "acknowledged_by": actor_id, "acknowledged_at": now_iso()
+    })));
     let event = conn
         .query_row(
             "SELECT e.id, e.component, e.status, e.detail, e.detected_at,
@@ -307,6 +321,9 @@ pub fn delete_health_events(
         deleted += conn
             .execute("DELETE FROM system_health_events WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| format!("health event delete failed: {e}"))?;
+        let _ = sync::write_to_sync_log(&conn, "system_health_events", id, "DELETE", Some(&serde_json::json!({
+            "id": id
+        })));
     }
     crate::db::append_audit(
         &conn,

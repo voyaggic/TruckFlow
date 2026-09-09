@@ -23,6 +23,8 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
   const [signInPass, setSignInPass] = useState("");
   const [signInError, setSignInError] = useState<string | null>(null);
   const [signInBusy, setSignInBusy] = useState(false);
+  const [supabaseUrl, setSupabaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
 
   const submitSignUp = async () => {
     setError(null);
@@ -32,6 +34,7 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
     }
     setBusy(true);
     try {
+      // Local-only signup — cloud connection is configured later via the Sync panel
       const res = await api.createCompanyAndAdmin(companyName, adminName, password);
       let filePath: string | null = null;
       try {
@@ -52,7 +55,7 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
     setSignInError(null);
     setSignInBusy(true);
     try {
-      const res = await api.loginPassword(signInUser, signInPass);
+      const res = await api.loginPassword(signInUser, signInPass, supabaseUrl, apiKey);
       onDone(res.user);
     } catch (e) {
       setSignInError(String(e));
@@ -152,6 +155,32 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
                 autoComplete="current-password"
                 placeholder="••••••••"
               />
+            </div>
+
+            {/* Supabase fields */}
+            <div style={{ marginTop: 12, padding: 12, background: "var(--bg-secondary)", borderRadius: "var(--radius)" }}>
+              <div className="small muted" style={{ marginBottom: 8, fontWeight: 600 }}>
+                Supabase Connection
+              </div>
+              <div className="field" style={{ marginBottom: 8 }}>
+                <label>Supabase URL</label>
+                <input
+                  value={supabaseUrl}
+                  onChange={(e) => setSupabaseUrl(e.target.value)}
+                  placeholder="https://xxx.supabase.co"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>API Key</label>
+                <input
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="eyJhbGciOiJIUzI1NiIs..."
+                  autoComplete="off"
+                  type="password"
+                />
+              </div>
             </div>
 
             <button
@@ -261,7 +290,7 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
 
           <div className="auth-title">Set up your account</div>
           <div className="auth-hint">
-            This creates your account and configures the system.
+            Creates your account and syncs everything to the cloud.
           </div>
 
         {error && <div className="error-banner">{error}</div>}
@@ -311,6 +340,10 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
               placeholder="••••••••"
             />
           </div>
+
+          <p className="small muted" style={{ marginTop: 12 }}>
+            Cloud connection is configured later in the Sync panel.
+          </p>
 
           <button
             className="primary"

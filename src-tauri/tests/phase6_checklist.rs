@@ -71,7 +71,7 @@ impl TestCtx {
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
             anpr_processes: Arc::new(Mutex::new(Vec::new())),
             pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
@@ -111,8 +111,9 @@ impl TestCtx {
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string()],
-            company_id,
+            
         )
         .expect("create gate user")
     }
@@ -155,7 +156,7 @@ fn own_profile_fields_update_and_are_audited() {
     )
     .expect("profile update");
 
-    let relogin = commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), ctx.company_id())
+    let relogin = commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), ctx.company_id(), String::new(), String::new())
         .expect("login")
         .user;
     assert_eq!(relogin.phone_number.as_deref(), Some("+254712345678"));
@@ -165,7 +166,7 @@ fn own_profile_fields_update_and_are_audited() {
     // Empty strings clear a field rather than storing blanks.
     commands::update_own_profile(ctx.state(), admin.id.clone(), Some("  ".to_string()), None, Some(true))
         .expect("clear phone");
-    let again = commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), ctx.company_id())
+    let again = commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), ctx.company_id(), String::new(), String::new())
         .expect("login")
         .user;
     assert_eq!(again.phone_number, None);

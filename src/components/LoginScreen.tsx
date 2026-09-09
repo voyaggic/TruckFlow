@@ -9,6 +9,8 @@ const LOGGED_OUT_KEY = "tf.logged-out";
 interface SavedLogin {
   username: string;
   password: string;
+  supabaseUrl?: string;
+  apiKey?: string;
 }
 
 function loadSaved(): SavedLogin | null {
@@ -25,19 +27,11 @@ function loadSaved(): SavedLogin | null {
   }
 }
 
-function saveLogin(username: string, password: string) {
+function saveLogin(username: string, password: string, supabaseUrl?: string, apiKey?: string) {
   try {
-    localStorage.setItem(SAVED_KEY, JSON.stringify({ username, password }));
+    localStorage.setItem(SAVED_KEY, JSON.stringify({ username, password, supabaseUrl, apiKey }));
   } catch {
     /* storage unavailable — ignore */
-  }
-}
-
-function clearSaved() {
-  try {
-    localStorage.removeItem(SAVED_KEY);
-  } catch {
-    /* ignore */
   }
 }
 
@@ -79,7 +73,7 @@ export default function LoginScreen({
   const [busy, setBusy] = useState(false);
   const [auto, setAuto] = useState(false);
 
-  // Supabase connection fields
+  // Supabase connection fields (shared between login and signup)
   const [supabaseUrl, setSupabaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
 
@@ -92,8 +86,6 @@ export default function LoginScreen({
   useEffect(() => {
     const saved = loadSaved();
     if (!saved) return;
-    setUsername(saved.username);
-    setPassword(saved.password);
 
     const loggedOut = (() => {
       try {
@@ -102,11 +94,18 @@ export default function LoginScreen({
         return false;
       }
     })();
+
+    // Always prefill fields regardless of loggedOut status
+    setUsername(saved.username);
+    setPassword(saved.password);
+    if (saved.supabaseUrl) setSupabaseUrl(saved.supabaseUrl);
+    if (saved.apiKey) setApiKey(saved.apiKey);
+
     if (loggedOut) return;
     setAuto(true);
     setBusy(true);
     api
-      .loginPassword(saved.username, saved.password, supabaseUrl, apiKey)
+      .loginPassword(saved.username, saved.password, saved.supabaseUrl || "", saved.apiKey || "")
       .then((res) => onLogin(res.user))
       .catch((e) => {
         setError(String(e));
@@ -142,10 +141,12 @@ export default function LoginScreen({
       }
 
       const res = await api.loginPassword(username.trim(), password, supabaseUrl.trim(), apiKey.trim());
+      // Always save supabase credentials - needed for cloud auth
+      // Only save password if "remember me" is checked
       if (remember) {
-        saveLogin(username.trim(), password);
+        saveLogin(username.trim(), password, supabaseUrl.trim(), apiKey.trim());
       } else {
-        clearSaved();
+        saveLogin(username.trim(), "", supabaseUrl.trim(), apiKey.trim());
       }
       clearLoggedOut();
       onLogin(res.user);
@@ -177,13 +178,8 @@ export default function LoginScreen({
 
     setBusy(true);
     try {
-      const res = await api.createCompanyAndAdminCloud(
-        companyName.trim(),
-        username.trim(),
-        password,
-        supabaseUrl.trim(),
-        apiKey.trim()
-      );
+      // Local-only signup — cloud connection is configured later via the Sync panel
+      const res = await api.createCompanyAndAdmin(companyName.trim(), username.trim(), password);
       if (remember) {
         saveLogin(username.trim(), password);
       }
@@ -370,6 +366,9 @@ export default function LoginScreen({
                 autoComplete="new-password"
               />
             </div>
+            <p className="small muted" style={{ marginTop: 12 }}>
+              Cloud connection is configured later in the Sync panel.
+            </p>
 
             <label className="row" style={{ gap: 8, alignItems: "center", cursor: "pointer", marginBottom: 14, marginTop: 14 }}>
               <input

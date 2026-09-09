@@ -27,33 +27,12 @@ fn token_file_path() -> std::path::PathBuf {
     dir.join(SESSION_TOKEN_FILE)
 }
 
-fn hash_token(token: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // SHA-256 would be ideal but we avoid adding a crypto dependency.
-    // We use two rounds of hashing with different seeds for basic
-    // preimage resistance — sufficient for a local session file.
-    let mut h1 = DefaultHasher::new();
-    token.hash(&mut h1);
-    let mut h2 = DefaultHasher::new();
-    format!("{:x}", h1.finish()).hash(&mut h2);
-    format!("{:x}", h2.finish())
-}
 
-/// Generate a random hex token.
-fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    // Combine with PID and thread ID for more entropy
-    let pid = std::process::id();
-    let tid = std::thread::current().id();
-    format!("{:016x}{:08x}{:016x}", seed, pid, format!("{:?}", tid).len() as u64)
-}
 
 /// Save a session token to the DB and to a file. Returns the raw token.
 fn save_session_token(conn: &Connection, user_id: &str) -> Result<String, String> {
-    let token = generate_token();
-    let token_hash = hash_token(&token);
+    let token = crate::db::generate_session_token();
+    let token_hash = crate::db::hash_session_token(&token);
     let now = now_iso();
     let expires = crate::db::now_iso_offset(SESSION_TTL_DAYS * 24 * 3600);
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -90,7 +69,7 @@ fn validate_session_token(conn: &Connection) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let token_hash = hash_token(&token);
+    let token_hash = crate::db::hash_session_token(&token);
     let now = now_iso();
 
     let result: Option<String> = conn
@@ -219,10 +198,13 @@ fn set_credential(conn: &Connection, user_id: &str, credential: &str) -> Result<
     }
     let hash = crate::auth::hash_credential(credential)?;
     conn.execute(
-        "UPDATE users SET credential_hash = ?1, auth_type = 'password', updated_at = ?2 WHERE id = ?3",
+        "UPDATE users SET credential_hash = ?1, auth_type = 'password', updated_at = ?2, synced = 0 WHERE id = ?3",
         params![hash, now_iso(), user_id],
     )
     .map_err(|e| format!("credential update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "users", user_id, "UPDATE", Some(&serde_json::json!({
+        "id": user_id, "updated_at": now_iso()
+    })));
     Ok(())
 }
 
@@ -305,7 +287,10 @@ pub fn app_status(state: State<AppState>) -> Result<AppStatus, String> {
         .map_err(|e| format!("user count failed: {e}"))?;
 
     // Try to restore session from persistent token file
-    let mut session = state.session.lock().map_err(|e| e.to_string())?;
+    let mut session = match state.session.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     if session.is_none() {
         if let Ok(Some(user_id)) = validate_session_token(&conn) {
             if let Ok(user) = load_session_user(&conn, &user_id) {
@@ -388,7 +373,7 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
     // Save persistent session token
     save_session_token(&conn, &id)?;
 
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now_iso(),
         auth_type: "password".to_string(),
@@ -469,7 +454,7 @@ pub fn create_first_admin_for_company(
 
     save_session_token(&conn, &id)?;
 
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now_iso(),
         auth_type: "password".to_string(),
@@ -514,21 +499,27 @@ pub fn create_company_and_admin(
 
     let now = now_iso();
 
-    // Create company
-    let company_id = uuid::Uuid::new_v4().to_string();
+    // Create the ORGANIZATION (the account owner). Deliberately NOT inserted
+    // into `companies` — that table is exclusively for client companies whose
+    // trucks discharge trips; the org must never appear in the admin's
+    // Companies tab or be deletable from it.
+    let organization_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO companies (id, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)",
-        params![company_id, company_name, now],
+        "INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![organization_id, company_name, now],
     )
-    .map_err(|e| format!("company creation failed: {e}"))?;
+    .map_err(|e| format!("organization creation failed: {e}"))?;
+    let _ = crate::sync::write_to_sync_log(&conn, "organizations", &organization_id, "INSERT", Some(&serde_json::json!({
+        "id": organization_id, "name": company_name, "created_at": now, "updated_at": now
+    })));
 
     // Create admin user
     let user_id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, company_id, created_at, updated_at)
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
          VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
-        params![user_id, admin_name, hash, company_id, now],
+        params![user_id, admin_name, hash, organization_id, now, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -547,8 +538,8 @@ pub fn create_company_and_admin(
         .map_err(|e| format!("permission grant failed: {e}"))?;
     }
 
-    append_audit(&conn, &user_id, "created_user", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "preset": "Admin", "company": company_name })))?;
-    append_audit(&conn, &user_id, "first_admin_created", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "company": company_name })))?;
+    append_audit(&conn, &user_id, "created_user", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "preset": "Admin", "organization": company_name })))?;
+    append_audit(&conn, &user_id, "first_admin_created", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "organization": company_name })))?;
 
     // One-time recovery code for the single-admin "forgot password" scenario.
     let recovery_code = generate_recovery_code();
@@ -560,7 +551,7 @@ pub fn create_company_and_admin(
     // Save persistent session token
     save_session_token(&conn, &user_id)?;
 
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: user_id.clone(),
         logged_in_at: now,
         auth_type: "password".to_string(),
@@ -611,8 +602,9 @@ pub fn create_company_and_admin_cloud(
     let user_id = uuid::Uuid::new_v4().to_string();
     let hash = hash_credential(&password)?;
 
-    // Build connection string
-    let conn_string = format!("REST|{}|{}", supabase_url.trim_end_matches('/'), api_key);
+    // Build connection string — normalize so the saved URL carries /rest/v1
+    let normalized_base = crate::sync::normalize_supabase_rest_url(&supabase_url);
+    let conn_string = format!("REST|{}|{}", normalized_base, api_key);
 
     // Create HTTP client
     let client = reqwest::blocking::Client::builder()
@@ -621,58 +613,143 @@ pub fn create_company_and_admin_cloud(
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
     // First, create all tables in Supabase if they don't exist
-    create_cloud_tables(&client, &supabase_url, &api_key)?;
+    // No PAT available at signup, so table creation is best-effort
+    let _ = create_cloud_tables(&client, &supabase_url, &api_key, "");
 
-    // Create company in Supabase
-    let company_data = serde_json::json!({
-        "id": company_id,
-        "name": company_name,
-        "status": "active",
-        "created_at": now,
-        "updated_at": now
-    });
-
-    let url = format!("{}/companies", supabase_url.trim_end_matches('/'));
-    let response = client.post(&url)
-        .header("apikey", &api_key)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates")
-        .json(&company_data)
-        .send()
-        .map_err(|e| format!("Failed to create company in Supabase: {}", e))?;
-
-    if !response.status().is_success() {
-        let err = response.text().unwrap_or_default();
-        return Err(format!("Failed to create company: {}", err));
+    // Push company to Supabase (best-effort — local data is always created)
+    let base_url = normalized_base.clone();
+    {
+        let company_data = serde_json::json!({
+            "id": company_id,
+            "name": company_name,
+            "created_at": now,
+            "updated_at": now
+        });
+        let url = format!("{}/organizations", base_url);
+        let resp = client.post(&url)
+            .header("apikey", &api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&company_data)
+            .send();
+        match resp {
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status();
+                let err = r.text().unwrap_or_default();
+                crate::log::log(&format!("[setup] Warning: company not pushed to Supabase: {} {}", status, err));
+            }
+            Err(e) => crate::log::log(&format!("[setup] Warning: company push failed: {}", e)),
+            _ => crate::log::log("[setup] Company pushed to Supabase"),
+        }
     }
 
-    // Create admin user in Supabase
-    let user_data = serde_json::json!({
-        "id": user_id,
-        "name": admin_name,
-        "auth_type": "password",
-        "credential_hash": hash,
-        "status": "active",
-        "role": "admin",
-        "company_id": company_id,
-        "created_at": now,
-        "updated_at": now
-    });
+    // Push admin user to Supabase (best-effort)
+    {
+        let user_data = serde_json::json!({
+            "id": user_id,
+            "name": admin_name,
+            "auth_type": "password",
+            "credential_hash": hash,
+            "status": "active",
+            "organization_id": company_id,
+            "created_at": now,
+            "updated_at": now
+        });
+        let url = format!("{}/users", base_url);
+        let resp = client.post(&url)
+            .header("apikey", &api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&user_data)
+            .send();
+        match resp {
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status();
+                let err = r.text().unwrap_or_default();
+                crate::log::log(&format!("[setup] Warning: user not pushed to Supabase: {} {}", status, err));
+            }
+            Err(e) => crate::log::log(&format!("[setup] Warning: user push failed: {}", e)),
+            _ => crate::log::log("[setup] User pushed to Supabase"),
+        }
+    }
 
-    let url = format!("{}/users", supabase_url.trim_end_matches('/'));
-    let response = client.post(&url)
-        .header("apikey", &api_key)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates")
-        .json(&user_data)
-        .send()
-        .map_err(|e| format!("Failed to create user in Supabase: {}", e))?;
+    // Push permissions to cloud (best-effort)
+    for (perm_id, key, min_auth, desc) in PERMISSION_CATALOG {
+        let perm_data = serde_json::json!({
+            "id": perm_id,
+            "key": key,
+            "description": desc,
+            "min_auth_level": min_auth
+        });
+        let url = format!("{}/permissions", base_url);
+        let resp = client.post(&url)
+            .header("apikey", &api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&perm_data)
+            .send();
+        if let Ok(r) = resp {
+            if !r.status().is_success() {
+                crate::log::log(&format!("[setup] Warning: permission {} not synced: {}", key, r.status()));
+            }
+        }
+    }
 
-    if !response.status().is_success() {
-        let err = response.text().unwrap_or_default();
-        return Err(format!("Failed to create user: {}", err));
+    // Get admin_keys for local permission grant
+    let admin_keys: Vec<&str> = ROLE_PRESETS
+        .iter()
+        .find(|(_, n, _)| *n == "Admin")
+        .map(|(_, _, keys)| keys.to_vec())
+        .unwrap_or_default();
+
+    // Push role presets to cloud (best-effort)
+    for (preset_id, name, keys) in ROLE_PRESETS {
+        let preset_data = serde_json::json!({
+            "id": preset_id,
+            "name": name,
+            "permission_ids": keys.join(",")
+        });
+        let url = format!("{}/role_presets", base_url);
+        let resp = client.post(&url)
+            .header("apikey", &api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&preset_data)
+            .send();
+        if let Ok(r) = resp {
+            if !r.status().is_success() {
+                crate::log::log(&format!("[setup] Warning: role preset {} not synced: {}", name, r.status()));
+            }
+        }
+    }
+
+    // Push admin user_permissions to cloud (best-effort)
+    for key in &admin_keys {
+        if let Some((perm_id, _, _, _)) = PERMISSION_CATALOG.iter().find(|(id, k, _, _)| *k == *key) {
+            let up_data = serde_json::json!({
+                "user_id": user_id,
+                "permission_id": perm_id,
+                "granted_by": user_id,
+                "granted_at": now
+            });
+            let url = format!("{}/user_permissions", base_url);
+            let resp = client.post(&url)
+                .header("apikey", &api_key)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .header("Prefer", "resolution=merge-duplicates")
+                .json(&up_data)
+                .send();
+            if let Ok(r) = resp {
+                if !r.status().is_success() {
+                    crate::log::log(&format!("[setup] Warning: user_permission {} not synced", key));
+                }
+            }
+        }
     }
 
     // Now create everything locally
@@ -681,35 +758,45 @@ pub fn create_company_and_admin_cloud(
     // Save Supabase connection string
     crate::db::set_setting(&conn, "pg_connection_string", &conn_string);
 
-    // Create company locally
+    // Create the ORGANIZATION locally (synced=0 default → background sync pushes
+    // to cloud). NOT inserted into `companies` — that table holds client
+    // companies only; the account owner org must never be editable/deletable
+    // from the admin Companies tab.
     conn.execute(
-        "INSERT INTO companies (id, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)",
+        "INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
         params![company_id, company_name, now],
-    ).map_err(|e| format!("company creation failed: {}", e))?;
+    ).map_err(|e| format!("organization creation failed: {}", e))?;
+    let _ = crate::sync::write_to_sync_log(&conn, "organizations", &company_id, "INSERT", Some(&serde_json::json!({
+        "id": company_id, "name": company_name, "created_at": now, "updated_at": now
+    })));
+    let _ = sync::write_to_sync_log(&conn, "companies", &company_id, "INSERT", Some(&serde_json::json!({
+        "id": company_id, "name": company_name, "status": "active", "created_at": now, "updated_at": now
+    })));
 
-    // Create admin user locally
+    // Create admin user locally (synced=0 default → background sync pushes to cloud)
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, role, company_id, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', 'admin', ?4, ?5, ?5)",
-        params![user_id, admin_name, hash, company_id, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![user_id, admin_name, hash, company_id, now, now],
     ).map_err(|e| format!("admin creation failed: {}", e))?;
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "INSERT", Some(&serde_json::json!({
+        "id": user_id, "name": admin_name, "status": "active", "created_at": now, "updated_at": now
+    })));
 
-    // Grant admin permissions locally
-    let admin_keys: &[&str] = ROLE_PRESETS
-        .iter()
-        .find(|(_, n, _)| *n == "Admin")
-        .map(|(_, _, keys)| *keys)
-        .unwrap();
-    for key in admin_keys {
+    // Grant admin permissions locally (synced=0 default → background sync pushes to cloud)
+    for key in &admin_keys {
         let pid = crate::db::permission_id_for_key(&conn, key)?;
         conn.execute(
             "INSERT INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
             params![user_id, pid, now],
         ).map_err(|e| format!("permission grant failed: {}", e))?;
+        let _ = sync::write_to_sync_log(&conn, "user_permissions", &format!("{}:{}", user_id, pid), "INSERT", Some(&serde_json::json!({
+            "user_id": user_id, "permission_id": pid, "granted_by": user_id
+        })));
     }
 
-    append_audit(&conn, &user_id, "created_user", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "preset": "Admin", "company": company_name })))?;
-    append_audit(&conn, &user_id, "first_admin_created", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "company": company_name })))?;
+    append_audit(&conn, &user_id, "created_user", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "preset": "Admin", "organization": company_name })))?;
+    append_audit(&conn, &user_id, "first_admin_created", Some(&user_id), Some(serde_json::json!({ "name": admin_name, "organization": company_name })))?;
 
     // Generate recovery code
     let recovery_code = generate_recovery_code();
@@ -721,7 +808,7 @@ pub fn create_company_and_admin_cloud(
     // Save session
     save_session_token(&conn, &user_id)?;
 
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: user_id.clone(),
         logged_in_at: now.clone(),
         auth_type: "password".to_string(),
@@ -736,332 +823,116 @@ pub fn create_company_and_admin_cloud(
     })
 }
 
-/// Create all required tables in Supabase if they don't exist
-fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, api_key: &str) -> Result<(), String> {
+/// Create all required tables in Supabase via the Management API.
+/// Requires a Personal Access Token (PAT). If no PAT is available, returns Ok(())
+/// and logs a warning — the tables can be created later via the "Create Tables" button.
+fn create_cloud_tables(client: &reqwest::blocking::Client, supabase_url: &str, _api_key: &str, pat: &str) -> Result<(), String> {
     let base_url = supabase_url.trim_end_matches('/');
-    
-    // SQL to create all tables
-    let create_sqls = vec![
-        // Companies
-        r#"CREATE TABLE IF NOT EXISTS public.companies (
-            synced INTEGER DEFAULT 0,
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            extra_fields TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#,
-        // Users
-        r#"CREATE TABLE IF NOT EXISTS public.users (
-            synced INTEGER DEFAULT 0,
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            auth_type TEXT NOT NULL DEFAULT 'password',
-            credential_hash TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            role TEXT NOT NULL DEFAULT 'staff',
-            permissions TEXT,
-            revoked_by TEXT,
-            revoked_at TEXT,
-            revoked_reason TEXT,
-            last_login_at TEXT,
-            failed_login_attempts INTEGER DEFAULT 0,
-            locked_until TEXT,
-            must_change_password INTEGER DEFAULT 0,
-            company_id TEXT,
-            updated_at TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )"#,
-        // Drivers
-        r#"CREATE TABLE IF NOT EXISTS public.drivers (
-            synced INTEGER DEFAULT 0,
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            phone TEXT,
-            license_number TEXT,
-            company_id TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
-            extra_fields TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#,
-        // Vehicles
-        r#"CREATE TABLE IF NOT EXISTS public.vehicles (
-            synced INTEGER DEFAULT 0,
-            id TEXT PRIMARY KEY,
-            plate_number TEXT NOT NULL,
-            company_id TEXT,
-            registered_capacity REAL,
-            default_driver_id TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
-            extra_fields TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#,
-        // Trips
-        r#"CREATE TABLE IF NOT EXISTS public.trips (
-            id TEXT PRIMARY KEY,
-            vehicle_id TEXT,
-            driver_id TEXT,
-            company_id TEXT,
-            capacity_at_trip REAL,
-            time_in TEXT NOT NULL,
-            receipt_no TEXT,
-            officer_id TEXT,
-            capture_method TEXT NOT NULL DEFAULT 'auto',
-            confidence_score REAL,
-            photo_refs TEXT,
-            status TEXT NOT NULL DEFAULT 'logged',
-            resolution_notes TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            synced INTEGER DEFAULT 0,
-            pushed_to_sheets INTEGER DEFAULT 0,
-            sheet_row INTEGER,
-            sheet_exit_pushed INTEGER DEFAULT 0,
-            is_discharge_trip INTEGER DEFAULT 0,
-            model_version TEXT,
-            ocr_engine TEXT,
-            archived INTEGER DEFAULT 0,
-            exit_time TEXT,
-            exit_photo_refs TEXT
-        )"#,
-        // Permissions
-        r#"CREATE TABLE IF NOT EXISTS public.permissions (
-            id TEXT PRIMARY KEY,
-            key TEXT NOT NULL UNIQUE,
-            display_name TEXT NOT NULL,
-            description TEXT,
-            min_role TEXT NOT NULL DEFAULT 'staff'
-        )"#,
-        // User Permissions
-        r#"CREATE TABLE IF NOT EXISTS public.user_permissions (
-            user_id TEXT,
-            permission_id TEXT,
-            granted_by TEXT,
-            granted_at TEXT NOT NULL DEFAULT (now()::text),
-            PRIMARY KEY (user_id, permission_id)
-        )"#,
-        // Role Presets
-        r#"CREATE TABLE IF NOT EXISTS public.role_presets (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            permission_ids TEXT NOT NULL,
-            is_system INTEGER DEFAULT 0
-        )"#,
-        // Audit Log
-        r#"CREATE TABLE IF NOT EXISTS public.audit_log (
-            id TEXT PRIMARY KEY,
-            actor_id TEXT,
-            action TEXT NOT NULL,
-            target_id TEXT,
-            details TEXT,
-            ip_address TEXT,
-            created_at TEXT NOT NULL DEFAULT (now()::text)
-        )"#,
-        // Integrations
-        r#"CREATE TABLE IF NOT EXISTS public.integrations (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            connected_by TEXT,
-            target_sheet_id TEXT,
-            shared_group TEXT,
-            sync_frequency TEXT DEFAULT 'realtime',
-            service_account_email TEXT,
-            service_account_key TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
-            last_synced_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#,
-        // App Settings
-        r#"CREATE TABLE IF NOT EXISTS public.app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )"#,
-        // ANPR Config
-        r#"CREATE TABLE IF NOT EXISTS public.anpr_config (
-            id TEXT PRIMARY KEY,
-            camera_id TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            min_confidence REAL DEFAULT 0.7,
-            cooldown_seconds INTEGER DEFAULT 30,
-            detection_method TEXT DEFAULT 'contour',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )"#,
-        // Field Definitions
-        r#"CREATE TABLE IF NOT EXISTS public.field_definitions (
-            id TEXT PRIMARY KEY,
-            entity_type TEXT NOT NULL,
-            field_key TEXT NOT NULL,
-            display_label TEXT NOT NULL,
-            field_type TEXT NOT NULL,
-            required INTEGER NOT NULL DEFAULT 0,
-            options TEXT,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            is_standard INTEGER DEFAULT 0,
-            is_hidden INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )"#,
-    ];
 
-    for sql in create_sqls {
-        let sql_url = format!("{}/sql", base_url);
-        let response = client.post(&sql_url)
-            .header("apikey", api_key)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "query": sql }).to_string())
-            .send()
-            .map_err(|e| format!("Failed to create table: {}", e))?;
-        
-        if !response.status().is_success() {
-            let err = response.text().unwrap_or_default();
-            crate::log::log(&format!("[setup] Table creation warning: {}", err));
-            // Continue anyway - table might already exist
+    // Extract project_ref from Supabase URL (https://xxx.supabase.co/rest/v1 → xxx)
+    let project_ref = if let Some(start) = base_url.find("://") {
+        let after_proto = &base_url[start + 3..];
+        if let Some(dot_pos) = after_proto.find(".supabase.co") {
+            after_proto[..dot_pos].to_string()
+        } else {
+            crate::log::log("[setup] Could not extract project_ref from URL, skipping table creation");
+            return Ok(());
         }
-    }
+    } else {
+        crate::log::log("[setup] Invalid Supabase URL format, skipping table creation");
+        return Ok(());
+    };
 
-    // Create notify function
-    let notify_sql = r#"
-        CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()
-        RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
-        BEGIN
-          NOTIFY pgrst, 'reload schema cache';
-        END;
-        $$;
-        GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
-    "#;
-    
-    let sql_url = format!("{}/sql", base_url);
-    let _ = client.post(&sql_url)
-        .header("apikey", api_key)
-        .header("Authorization", format!("Bearer {}", api_key))
+    // Read the authoritative SQL from the setup file (embedded at compile time)
+    let sql = include_str!("../../docs/SUPABASE_SETUP.sql");
+
+    // Use the Management API (api.supabase.com) which requires a PAT.
+    // The service_role key does NOT work with the Management API.
+    // During signup we don't have a PAT, so table creation is best-effort.
+    // Tables will be created properly when the user connects via the Sync panel
+    // and provides a PAT through create_postgres_tables().
+    let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+    crate::log::log(&format!("[setup] Attempting table creation via Management API: {}", mgmt_url));
+
+    let auth_token = if !pat.is_empty() { pat } else { _api_key };
+    crate::log::log(&format!("[setup] Using {} for Management API auth", if !pat.is_empty() { "PAT" } else { "api_key (may fail)" }));
+
+    let response = match client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", auth_token))
         .header("Content-Type", "application/json")
-        .body(serde_json::json!({ "query": notify_sql }).to_string())
-        .send();
+        .body(serde_json::json!({ "query": sql }).to_string())
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log::log(&format!("[setup] Management API request failed: {}. Tables will be created when PAT is provided via Sync panel.", e));
+            return Ok(());
+        }
+    };
 
-    // Grant permissions
-    let grant_sql = r#"
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO anon;
-        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
-    "#;
-    
-    let _ = client.post(&sql_url)
-        .header("apikey", api_key)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .body(serde_json::json!({ "query": grant_sql }).to_string())
-        .send();
-
-    // Create indexes for company_id columns (performance)
-    let index_sqls = vec![
-        "CREATE INDEX IF NOT EXISTS idx_drivers_company_id ON public.drivers(company_id)",
-        "CREATE INDEX IF NOT EXISTS idx_vehicles_company_id ON public.vehicles(company_id)",
-        "CREATE INDEX IF NOT EXISTS idx_trips_company_id ON public.trips(company_id)",
-        "CREATE INDEX IF NOT EXISTS idx_users_company_id ON public.users(company_id)",
-    ];
-
-    for idx_sql in index_sqls {
-        let _ = client.post(&sql_url)
-            .header("apikey", api_key)
-            .header("Authorization", format!("Bearer {}", api_key))
+    let status = response.status();
+    if status.is_success() {
+        crate::log::log("[setup] Tables created successfully via Management API");
+        // Notify PostgREST to refresh its schema cache
+        let notify_url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+        let _ = client.post(&notify_url)
+            .header("Authorization", format!("Bearer {}", auth_token))
             .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "query": idx_sql }).to_string())
+            .body(serde_json::json!({ "query": "NOTIFY pgrst, 'reload schema cache';" }).to_string())
             .send();
+        Ok(())
+    } else {
+        let err = response.text().unwrap_or_default();
+        crate::log::log(&format!("[setup] Management API returned {}: {}. Tables will be created when PAT is provided via Sync panel.", status, err));
+        // Non-fatal: tables will be created later via create_postgres_tables()
+        Ok(())
     }
-
-    // Enable RLS and create policies for company isolation
-    let rls_sqls = vec![
-        // Enable RLS on company-specific tables
-        "ALTER TABLE public.drivers ENABLE ROW LEVEL SECURITY",
-        "ALTER TABLE public.vehicles ENABLE ROW LEVEL SECURITY",
-        "ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY",
-        "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY",
-        // RLS policies - users can only see data from their own company
-        // Note: These use a service_role key which bypasses RLS, so this is for additional protection
-        "CREATE POLICY company_isolation_drivers ON public.drivers FOR ALL USING (true)",
-        "CREATE POLICY company_isolation_vehicles ON public.vehicles FOR ALL USING (true)",
-        "CREATE POLICY company_isolation_trips ON public.trips FOR ALL USING (true)",
-        "CREATE POLICY company_isolation_users ON public.users FOR ALL USING (true)",
-    ];
-
-    for rls_sql in rls_sqls {
-        let _ = client.post(&sql_url)
-            .header("apikey", api_key)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "query": rls_sql }).to_string())
-            .send();
-    }
-
-    // Insert default permissions
-    let default_perms = vec![
-        (r#"("perm_manage_users", 'manage_users', 'Manage Users', 'Create, edit, disable users', 'admin')"#),
-        (r#"("perm_view_reports", 'view_reports', 'View Reports', 'Access trip reports and analytics', 'staff')"#),
-        (r#"("perm_create_trips", 'create_trips', 'Create Trips', 'Log new trips at gate', 'staff')"#),
-        (r#"("perm_edit_trips", 'edit_trips', 'Edit Trips', 'Modify existing trip records', 'staff')"#),
-        (r#"("perm_delete_trips", 'delete_trips', 'Delete Trips', 'Delete trip records', 'admin')"#),
-        (r#"("perm_manage_vehicles", 'manage_vehicles', 'Manage Vehicles', 'Add, edit, remove vehicles', 'admin')"#),
-        (r#"("perm_manage_drivers", 'manage_drivers', 'Manage Drivers', 'Add, edit, remove drivers', 'admin')"#),
-        (r#"("perm_configure_sync", 'configure_sync', 'Configure Sync', 'Setup Supabase and Sheets sync', 'admin')"#),
-        (r#"("perm_view_audit", 'view_audit', 'View Audit Log', 'See audit trail of all actions', 'admin')"#),
-        (r#"("perm_anpr", 'anpr', 'ANPR Access', 'Use ANPR plate recognition', 'staff')"#),
-    ];
-
-    for perm in default_perms {
-        let insert_sql = format!(
-            "INSERT INTO public.permissions (id, key, display_name, description, min_role) VALUES {} ON CONFLICT (key) DO NOTHING",
-            perm
-        );
-        let _ = client.post(&sql_url)
-            .header("apikey", api_key)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "query": insert_sql }).to_string())
-            .send();
-    }
-
-    crate::log::log("[setup] Cloud tables created successfully");
-    Ok(())
 }
 
-/// Check if the required tables exist in Supabase
-fn check_tables_exist(client: &reqwest::blocking::Client, supabase_url: &str, api_key: &str) -> Result<bool, String> {
+/// Check if the required tables exist in Supabase using Management API (bypasses PostgREST cache)
+fn check_tables_exist(client: &reqwest::blocking::Client, supabase_url: &str, _api_key: &str, pat: &str) -> Result<bool, String> {
     let base_url = supabase_url.trim_end_matches('/');
 
-    // Try to query the companies table - if it exists, tables are set up
-    let url = format!("{}/companies?select=id&limit=1", base_url);
+    // Extract project_ref from Supabase URL
+    let project_ref = if let Some(start) = base_url.find("://") {
+        let after_proto = &base_url[start + 3..];
+        if let Some(dot_pos) = after_proto.find(".supabase.co") {
+            after_proto[..dot_pos].to_string()
+        } else {
+            return Err("Invalid Supabase URL format".to_string());
+        }
+    } else {
+        return Err("Invalid Supabase URL format".to_string());
+    };
 
-    match client.get(&url)
-        .header("apikey", api_key)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send() {
-        Ok(response) => {
-            // If we get 200 or 404, we can determine if table exists
-            if response.status() == 200 {
-                Ok(true) // Table exists
-            } else if response.status() == 404 {
-                // Table might not exist or no data - check if it's a schema issue
-                let text = response.text().unwrap_or_default();
-                if text.contains("does not exist") {
-                    Ok(false) // Table definitely doesn't exist
-                } else {
-                    Ok(true) // Table exists but returned no rows (which is fine)
-                }
-            } else {
-                // Other error - assume tables might exist
-                Ok(true)
-            }
-        }
-        Err(_) => {
-            // Network error or timeout - assume tables exist to avoid blocking login
+    // Use Management API to check if users table exists in information_schema
+    // This bypasses PostgREST's schema cache completely
+    let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+    let auth_token = if !pat.is_empty() { pat } else { _api_key };
+
+    let check_sql = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users' LIMIT 1";
+
+    let response = client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({ "query": check_sql }).to_string())
+        .send()
+        .map_err(|e| format!("Failed to check tables: {}", e))?;
+
+    if response.status().is_success() {
+        let body = response.text().unwrap_or_default();
+        // If we get rows back, users table exists
+        if body.contains("\"users\"") || body.starts_with('[') && body != "[]" {
+            crate::log::log("[check_tables] Users table exists in PostgreSQL");
             Ok(true)
+        } else {
+            crate::log::log("[check_tables] Users table does NOT exist in PostgreSQL");
+            Ok(false)
         }
+    } else {
+        // Management API failed - be conservative and assume tables exist to avoid blocking login
+        crate::log::log(&format!("[check_tables] Management API error: {}", response.status()));
+        Ok(true)
     }
 }
 
@@ -1072,13 +943,37 @@ pub fn login_password(
     password: String,
     supabase_url: String,
     api_key: String,
+    pat: String,
 ) -> Result<LoginResult, String> {
+    // Store PAT in settings if provided (for Management API access during login)
+    if !pat.is_empty() {
+        if let Ok(conn) = state.db.lock() {
+            let _ = crate::db::set_setting(&conn, "supabase_pat", &pat);
+        }
+    }
+    
+    // Check if this is a first-time login (no local data at all)
+    // First-time = users table is completely empty
+    let is_first_time_login = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap_or(0);
+        count == 0
+    };
+    
     // If Supabase URL provided, try cloud authentication first
     if !supabase_url.is_empty() && !api_key.is_empty() {
-        // Save Supabase connection to local settings
+        // Save Supabase connection to local settings.
+        // normalize_supabase_rest_url guarantees the saved URL carries /rest/v1 —
+        // a bare project URL here was the root cause of the sync 404s.
         {
             let conn = state.db.lock().map_err(|e| e.to_string())?;
-            let conn_string = format!("REST|{}|{}", supabase_url.trim_end_matches('/'), api_key);
+            let conn_string = format!(
+                "REST|{}|{}",
+                crate::sync::normalize_supabase_rest_url(&supabase_url),
+                api_key
+            );
             crate::db::set_setting(&conn, "pg_connection_string", &conn_string);
         }
 
@@ -1088,14 +983,14 @@ pub fn login_password(
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
 
-        match check_tables_exist(&client, &supabase_url, &api_key) {
+        match check_tables_exist(&client, &supabase_url, &api_key, &pat) {
             Ok(true) => {
                 // Tables exist, try cloud login
             }
             Ok(false) => {
                 // Tables don't exist - auto-create them
                 crate::log::log("[login] Tables not found in Supabase, auto-creating...");
-                create_cloud_tables(&client, &supabase_url, &api_key)?;
+                create_cloud_tables(&client, &supabase_url, &api_key, &pat)?;
                 crate::log::log("[login] Tables created successfully");
             }
             Err(e) => {
@@ -1103,20 +998,128 @@ pub fn login_password(
             }
         }
 
-        // Try to validate against Supabase
-        match query_user_from_supabase(&supabase_url, &api_key, &username) {
-            Ok(cloud_user) => {
-                // User found in Supabase - sync to local and validate password
-                return validate_cloud_user(state, username, password, cloud_user);
-            }
-            Err(e) => {
-                crate::log::log(&format!("[login] Cloud user not found or error: {}", e));
-                // Fall through to local check
+        // First-time login: MUST use cloud, no local fallback allowed
+        let normalized_url = crate::sync::normalize_supabase_rest_url(&supabase_url);
+        if is_first_time_login {
+            match query_user_from_supabase(&normalized_url, &api_key, &username) {
+                Ok(cloud_user) => {
+                    return validate_cloud_user(state, username, password, cloud_user, &supabase_url, &api_key, &pat);
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[login] First-time login - cloud user not found: {}", e));
+                    // Distinguish connectivity failures from a genuinely missing
+                    // account: with no local data there is no offline fallback,
+                    // so the user must know WHY the login failed.
+                    if e.starts_with("Failed to connect") {
+                        return Err(format!(
+                            "No local account found and the cloud is unreachable. Check your Internet connection and try again. ({})",
+                            e
+                        ));
+                    }
+                    return Err("No account found with this username. Please check your Supabase credentials.".to_string());
+                }
             }
         }
+
+        // Returning user: try cloud first, fall back to local only if offline
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let local_user_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE name = ?1",
+                params![username.trim()],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        drop(conn);
+
+        if local_user_exists {
+            // User exists locally - try cloud auth first
+            match query_user_from_supabase(&normalized_url, &api_key, &username) {
+                Ok(cloud_user) => {
+                    // Cloud auth successful - validate with cloud data
+                    return validate_cloud_user(state, username, password, cloud_user, &supabase_url, &api_key, &pat);
+                }
+                Err(e) => {
+                    // Offline fallback ONLY for connectivity failures. While the
+                    // Internet is up, the cloud is authoritative: a deleted/disabled
+                    // account or a changed password must NOT authenticate from the
+                    // stale local copy. 401/403 (bad key) and 404 (no such user)
+                    // surface their own specific errors instead.
+                    if !e.starts_with("Failed to connect") {
+                        crate::log::log(&format!("[login] Cloud auth rejected (not a connectivity failure): {}", e));
+                        return Err(e);
+                    }
+                    crate::log::log(&format!("[login] Cloud unreachable, falling back to local: {}", e));
+                    // Cloud unreachable but user has local data - allow offline login
+                }
+            }
+        } else {
+            // User doesn't exist locally but is a returning install (other users exist)
+            // Must be in cloud to login
+            match query_user_from_supabase(&normalized_url, &api_key, &username) {
+                Ok(cloud_user) => {
+                    return validate_cloud_user(state, username, password, cloud_user, &supabase_url, &api_key, &pat);
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[login] Cloud user not found: {}", e));
+                    if e.starts_with("Failed to connect") {
+                        return Err(format!(
+                            "This account is not on this PC and the cloud is unreachable. Check your Internet connection and try again. ({})",
+                            e
+                        ));
+                    }
+                    return Err("No account found with this username.".to_string());
+                }
+            }
+        }
+    } else {
+        // No Supabase credentials - local-only auth
+        // Only allowed for returning users with local data
+        if is_first_time_login {
+            return Err("No Supabase credentials provided. This appears to be a first-time login. Please enter your Supabase URL and API Key.".to_string());
+        }
+        
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT id, name, auth_type, credential_hash, status, revoked_by, must_change_password, failed_login_attempts, locked_until
+                 FROM users WHERE name = ?1",
+                params![username.trim()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .map_err(|_| "No account found with this username.".to_string())?;
+
+        let row_data = (
+            row.0.clone(),
+            row.1.clone(),
+            row.2.clone(),
+            row.3.clone(),
+            row.4.clone(),
+            row.5.clone(),
+            row.6,
+            row.7,
+            row.8.clone(),
+        );
+        let username_owned = username.clone();
+
+        drop(conn);
+
+        return validate_local_user(state, row_data, username_owned, password);
     }
-    
-    // Try local authentication
+
+    // Returning user with local data - try local authentication (offline mode)
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let row = conn
         .query_row(
@@ -1164,6 +1167,9 @@ fn validate_cloud_user(
     username: String,
     password: String,
     cloud_user: CloudUserData,
+    supabase_url: &str,
+    api_key: &str,
+    pat: &str,
 ) -> Result<LoginResult, String> {
     // Check if user is active
     if cloud_user.status != "active" {
@@ -1173,15 +1179,91 @@ fn validate_cloud_user(
             _ => format!("Account is not active (status: {})", cloud_user.status),
         });
     }
-    
-    // Verify password against cloud hash
-    if !crate::auth::verify_credential(&cloud_user.credential_hash, &password) {
-        return Err("Incorrect password. Please try again.".to_string());
-    }
-    
-    // Now sync user to local database
+
+    // Fetch actual permissions from cloud for this user (needs db conn for pg_connection_string).
+    // The lock is held for the whole validation so the brute-force counters
+    // below are consistent.
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    
+
+    // Brute-force lockout, mirroring the offline path: because auth goes
+    // through the service_role key (bypassing Supabase Auth's built-in rate
+    // limiting), THIS code is the only rate limiter for cloud logins.
+    {
+        let lock_row: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT failed_login_attempts, locked_until FROM users WHERE id = ?1",
+                params![cloud_user.id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .ok();
+        if let Some((attempts, locked_until)) = lock_row {
+            let now_ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            if let Some(ref lu) = locked_until {
+                if lu.as_str() > now_ts.as_str() {
+                    append_audit(&conn, &cloud_user.id, "login_blocked_lockout", None,
+                        Some(serde_json::json!({ "name": &cloud_user.name })))?;
+                    return Err(format!(
+                        "Account temporarily locked due to too many failed attempts. Try again after {}.",
+                        lu[..16].replace('T', " ")));
+                }
+            }
+            // Verify password against cloud hash
+            if !crate::auth::verify_credential(&cloud_user.credential_hash, &password) {
+                let new_attempts = attempts + 1;
+                if new_attempts >= 5 {
+                    let lockout_until = (chrono::Utc::now() + chrono::Duration::minutes(15))
+                        .format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    conn.execute(
+                        "UPDATE users SET failed_login_attempts = ?1, locked_until = ?2 WHERE id = ?3",
+                        params![new_attempts, lockout_until, cloud_user.id],
+                    ).map_err(|e| format!("lockout update failed: {e}"))?;
+                    append_audit(&conn, &cloud_user.id, "login_locked", None,
+                        Some(serde_json::json!({ "name": &cloud_user.name, "attempts": new_attempts })))?;
+                    return Err("Account temporarily locked due to too many failed attempts. Try again in 15 minutes.".to_string());
+                }
+                conn.execute(
+                    "UPDATE users SET failed_login_attempts = ?1 WHERE id = ?2",
+                    params![new_attempts, cloud_user.id],
+                ).map_err(|e| format!("attempt update failed: {e}"))?;
+                append_audit(&conn, &cloud_user.id, "login_failed", None,
+                    Some(serde_json::json!({ "name": &cloud_user.name, "attempts": new_attempts })))?;
+                return Err("Incorrect password. Please try again.".to_string());
+            }
+        } else if !crate::auth::verify_credential(&cloud_user.credential_hash, &password) {
+            // Fresh machine: no local row to count against yet.
+            return Err("Incorrect password. Please try again.".to_string());
+        }
+    }
+
+    let cloud_permission_keys = fetch_cloud_permissions_for_user(&conn, supabase_url, api_key, &cloud_user.id, pat)?;
+    crate::log::log(&format!("[validate_cloud_user] Cloud permissions for {}: {:?}", cloud_user.id, cloud_permission_keys));
+
+    // Empty cloud permission list must not silently strip a working account:
+    // PostgREST schema-cache misses and missing PATs both yield []. In that
+    // case keep the local set (it was pushed by the admin's PC and pulled here)
+    // instead of replacing it with nothing.
+    let permissions_authoritative = !cloud_permission_keys.is_empty();
+    let effective_permission_keys = if permissions_authoritative {
+        cloud_permission_keys
+    } else {
+        let local_keys = list_user_permission_keys(&conn, &cloud_user.id).unwrap_or_default();
+        crate::log::log(&format!(
+            "[validate_cloud_user] Cloud returned no permissions for {} — keeping local set ({})",
+            cloud_user.id,
+            local_keys.len()
+        ));
+        local_keys
+    };
+
+    // Now sync user to local database
+    // conn is already locked from above
+
+    // Successful cloud login — clear any brute-force lockout state.
+    let _ = conn.execute(
+        "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?1",
+        params![cloud_user.id],
+    );
+
     // Check if user already exists locally
     let local_exists: bool = conn
         .query_row(
@@ -1190,62 +1272,92 @@ fn validate_cloud_user(
             |_| Ok(true),
         )
         .unwrap_or(false);
-    
+
     if local_exists {
         // Update local user with cloud data
+        let now = crate::db::now_iso();
         conn.execute(
             "UPDATE users SET name = ?1, status = ?2, credential_hash = ?3, updated_at = ?4 WHERE id = ?5",
-            params![cloud_user.name, cloud_user.status, cloud_user.credential_hash, cloud_user.updated_at, cloud_user.id],
+            params![cloud_user.name, cloud_user.status, cloud_user.credential_hash, now, cloud_user.id],
         ).map_err(|e| format!("Failed to update local user: {}", e))?;
     } else {
-        // Insert new local user
+        // Insert new local user (only use columns that exist in local schema)
+        let now = crate::db::now_iso();
         conn.execute(
-            "INSERT INTO users (id, name, auth_type, credential_hash, status, company_id, created_at, updated_at)
-             VALUES (?1, ?2, 'password', ?3, ?4, ?5, ?6, ?7)",
-            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, cloud_user.company_id, cloud_user.created_at, cloud_user.updated_at],
+            "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
+             VALUES (?1, ?2, 'password', ?3, ?4, ?5, ?6)",
+            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, now, now],
         ).map_err(|e| format!("Failed to create local user: {}", e))?;
-        
-        // Grant default permissions (Admin preset for first user, Staff for others)
-        let default_keys: Vec<&str> = if cloud_user.role == "admin" {
-            vec!["manage_users", "view_reports", "create_trips", "edit_trips", "delete_trips", 
-                 "manage_vehicles", "manage_drivers", "configure_sync", "view_audit", "anpr"]
-        } else {
-            vec!["view_reports", "create_trips", "anpr"]
-        };
-        
-        for key in default_keys {
+    }
+
+    // Sync permissions so the CLOUD set is authoritative at login:
+    // grants apply, and REVOCATIONS made by the admin on another PC take
+    // effect here too (previously only additions propagated — downgrades and
+    // role changes never reached other machines).
+    // When the cloud list is empty (schema cache miss / no PAT) the local set
+    // is kept — see `effective_permission_keys` above.
+    {
+        let now = crate::db::now_iso();
+        let mut desired_pids: Vec<String> = Vec::new();
+        for key in &effective_permission_keys {
             if let Ok(pid) = crate::db::permission_id_for_key(&conn, key) {
-                let _ = conn.execute(
+                conn.execute(
                     "INSERT OR IGNORE INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
-                    params![cloud_user.id, pid, cloud_user.created_at],
-                );
+                    params![cloud_user.id, pid, now],
+                ).map_err(|e| format!("Failed to grant permission {}: {}", key, e))?;
+                desired_pids.push(pid);
+            }
+        }
+        if permissions_authoritative {
+            // Remove local grants the cloud no longer has.
+            let existing_pids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT permission_id FROM user_permissions WHERE user_id = ?1",
+                ).map_err(|e| format!("permission read failed: {e}"))?;
+                let rows = stmt.query_map(params![cloud_user.id], |r| r.get::<_, String>(0))
+                    .map_err(|e| format!("permission read failed: {e}"))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            for pid in existing_pids {
+                if !desired_pids.contains(&pid) {
+                    conn.execute(
+                        "DELETE FROM user_permissions WHERE user_id = ?1 AND permission_id = ?2",
+                        params![cloud_user.id, pid],
+                    ).map_err(|e| format!("Failed to revoke permission {}: {}", pid, e))?;
+                }
             }
         }
     }
-    
-    let now = now_iso();
+
+    // Sync cloud settings (pg_connection_string, sheets_webhook_url, etc.) to local
+    // Only fills in empty values — does not overwrite manually set values
+    if let Err(e) = sync_cloud_settings_to_local(&conn, supabase_url, api_key) {
+        crate::log::log(&format!("[validate_cloud_user] Failed to sync cloud settings: {}", e));
+    }
+
+    let now = crate::db::now_iso();
     let id = cloud_user.id.clone();
-    
+
     // Save persistent session token
     save_session_token(&conn, &id)?;
-    
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now.clone(),
         auth_type: "password".to_string(),
     });
-    
+
     let user = load_session_user(&conn, &id)?;
-    
+
     drop(conn);
-    
+
     // Trigger background sync in a separate thread
     let db = state.db.clone();
     std::thread::spawn(move || {
         // Pull all company data from cloud
         let _ = pull_all_cloud_data(&db);
     });
-    
+
     Ok(LoginResult {
         must_change_password: false,
         recovery_code: None,
@@ -1338,7 +1450,7 @@ fn validate_local_user(
     
     save_session_token(&conn, &id)?;
 
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now_iso(),
         auth_type: "password".to_string(),
@@ -1346,15 +1458,17 @@ fn validate_local_user(
     let user = load_session_user(&conn, &id)?;
     append_audit(&conn, &id, "login", Some(&id), Some(serde_json::json!({ "method": "password", "name": &name })))?;
     
+    // Company config is keyed by organization for org-owned settings;
+    // fall back to the legacy client-company link for older rows.
     let company_id = conn.query_row(
-        "SELECT company_id FROM users WHERE id = ?1",
+        "SELECT COALESCE(organization_id, company_id) FROM users WHERE id = ?1",
         params![id],
         |r| r.get::<_, String>(0),
     ).ok();
     drop(conn);
     
     if let Some(company_id) = company_id {
-        let pg = state.pg.clone();
+        let pg = state.pg.get();
         let db = state.db.clone();
         let user_id = id.clone();
         std::thread::spawn(move || {
@@ -1376,10 +1490,12 @@ struct CloudUserData {
     name: String,
     credential_hash: String,
     status: String,
-    role: String,
-    company_id: String,
-    created_at: String,
-    updated_at: String,
+}
+
+/// Cloud permission entry from Supabase
+#[derive(serde::Deserialize)]
+struct CloudPermissionRow {
+    key: String,
 }
 
 /// Query user from Supabase REST API
@@ -1388,28 +1504,51 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
-    
-    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status,role,company_id,created_at,updated_at", 
-        supabase_url.trim_end_matches('/'), username.replace('%', "%25").replace('=', "%3D").replace('&', "%26"));
-    
+
+    // Accept raw or /rest/v1-normalized URLs: callers mix both shapes, so
+    // normalize here to guarantee exactly one /rest/v1 prefix.
+    let base_url = crate::sync::normalize_supabase_rest_url(supabase_url);
+    let encoded_username = username.replace('%', "%25").replace('=', "%3D").replace('&', "%26");
+    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status",
+        base_url, encoded_username);
+
+    crate::log::log(&format!("[query_user_from_supabase] URL: {}", url));
+
     let response = client.get(&url)
         .header("apikey", api_key)
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
         .map_err(|e| format!("Failed to connect to Supabase: {}", e))?;
-    
+
+    crate::log::log(&format!("[query_user_from_supabase] Status: {}", response.status()));
+
     if response.status() == 401 || response.status() == 403 {
         return Err("Invalid Supabase credentials. Check your API key.".to_string());
     }
-    
+
     if response.status() == 404 {
+        let body = response.text().unwrap_or_default();
+        crate::log::log(&format!("[query_user_from_supabase] 404 body: {}", body));
+        // Check if this is a PostgREST schema cache issue (PGRST205)
+        if body.contains("PGRST205") || body.contains("Could not find the table") {
+            return Err("Cloud tables not yet available. Please connect via the Sync panel first to create tables and sync data.".to_string());
+        }
         return Err("No account found with this username.".to_string());
     }
-    
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        crate::log::log(&format!("[query_user_from_supabase] Error body: {}", body));
+        return Err(format!("Supabase error ({}): {}", status, body));
+    }
+
     let users: Vec<serde_json::Value> = response
         .json()
         .map_err(|e| format!("Failed to parse response: {}", e))?;
-    
+
+    crate::log::log(&format!("[query_user_from_supabase] Found {} users", users.len()));
+
     let user = users.into_iter().next()
         .ok_or("No account found with this username.")?;
     
@@ -1418,11 +1557,297 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
         name: user.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         credential_hash: user.get("credential_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         status: user.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
-        role: user.get("role").and_then(|v| v.as_str()).unwrap_or("staff").to_string(),
-        company_id: user.get("company_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        created_at: user.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        updated_at: user.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     })
+}
+
+/// Notify PostgREST to reload its schema cache via Management API
+fn notify_postgrest_reload(client: &reqwest::blocking::Client, project_ref: &str, pat: &str) -> Result<(), String> {
+    if pat.is_empty() {
+        return Err("PAT required for PostgREST reload".to_string());
+    }
+
+    let mgmt_url = format!(
+        "https://api.supabase.com/v1/projects/{}/database/query",
+        project_ref
+    );
+
+    let response = client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", pat))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({ "query": "NOTIFY pgrst, 'reload schema cache';" }).to_string())
+        .send()
+        .map_err(|e| format!("Failed to notify PostgREST: {}", e))?;
+
+    let status = response.status();
+    if status.is_success() {
+        crate::log::log("[notify_postgrest] PostgREST schema reload triggered");
+        Ok(())
+    } else {
+        let body = response.text().unwrap_or_default();
+        Err(format!("PostgREST notify failed ({}): {}", status, body))
+    }
+}
+
+/// Fetch permission keys for a user from Supabase cloud.
+/// Uses the Management API SQL endpoint to bypass PostgREST entirely.
+/// PostgREST may not have user_permissions/permissions tables in its schema cache,
+/// so we query the database directly via api.supabase.com.
+/// Returns a list of permission keys like ["manage_users", "view_reports"].
+fn fetch_cloud_permissions_for_user(
+    conn: &rusqlite::Connection,
+    _supabase_url: &str,
+    _api_key: &str,
+    user_id: &str,
+    pat_param: &str,
+) -> Result<Vec<String>, String> {
+    // Use PAT from login parameter, falling back to stored setting
+    let pat = if !pat_param.is_empty() {
+        pat_param.to_string()
+    } else {
+        crate::db::get_setting(conn, "supabase_pat")
+            .unwrap_or_default()
+    };
+    let conn_string = crate::db::get_setting(conn, "pg_connection_string")
+        .ok_or("pg_connection_string not set")?;
+
+    let config = crate::sync::RestConfig::parse(&conn_string)
+        .map_err(|e| format!("Invalid connection string: {}", e))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // Strategy 1: Try PostgREST directly (fast, works when schema cache is fresh)
+    let rest_url = format!(
+        "{}/user_permissions?user_id=eq.{}&select=permission_id",
+        config.url.trim_end_matches('/'), user_id
+    );
+    crate::log::log(&format!("[fetch_cloud_permissions] Trying PostgREST: {}", rest_url));
+
+    let postgrest_result = client.get(&rest_url)
+        .header("apikey", &config.service_role_key)
+        .header("Authorization", format!("Bearer {}", config.service_role_key))
+        .send();
+
+    let postgrest_ok = match postgrest_result {
+        Ok(resp) if resp.status().is_success() => {
+            // PostgREST works — parse permission_ids and resolve to keys via local permissions table
+            let body = resp.text().unwrap_or_default();
+            #[derive(serde::Deserialize)]
+            struct UpRow { permission_id: String }
+            if let Ok(rows) = serde_json::from_str::<Vec<UpRow>>(&body) {
+                let perm_conn = conn;
+                let mut keys = Vec::new();
+                for row in rows {
+                    if let Ok(key) = perm_conn.query_row(
+                        "SELECT key FROM permissions WHERE id = ?1",
+                        params![row.permission_id],
+                        |r| r.get::<_, String>(0),
+                    ) {
+                        keys.push(key);
+                    }
+                }
+                crate::log::log(&format!("[fetch_cloud_permissions] PostgREST OK, {} keys: {:?}", keys.len(), keys));
+                return Ok(keys);
+            }
+            false
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            crate::log::log(&format!("[fetch_cloud_permissions] PostgREST failed ({}): {}", status, &body[..body.len().min(200)]));
+            
+            // If 404, try to notify PostgREST to reload schema and retry once
+            if status == 404 {
+                crate::log::log("[fetch_cloud_permissions] PostgREST 404 - attempting schema reload...");
+                if let Ok(()) = notify_postgrest_reload(&client, &config.project_ref, &pat) {
+                    crate::log::log("[fetch_cloud_permissions] PostgREST notified, retrying...");
+                    // Retry the query once after notify
+                    if let Ok(retry_resp) = client.get(&rest_url)
+                        .header("apikey", &config.service_role_key)
+                        .header("Authorization", format!("Bearer {}", config.service_role_key))
+                        .send()
+                    {
+                        if retry_resp.status().is_success() {
+                            let body = retry_resp.text().unwrap_or_default();
+                            #[derive(serde::Deserialize)]
+                            struct UpRow { permission_id: String }
+                            if let Ok(rows) = serde_json::from_str::<Vec<UpRow>>(&body) {
+                                let perm_conn = conn;
+                                let mut keys = Vec::new();
+                                for row in rows {
+                                    if let Ok(key) = perm_conn.query_row(
+                                        "SELECT key FROM permissions WHERE id = ?1",
+                                        params![row.permission_id],
+                                        |r| r.get::<_, String>(0),
+                                    ) {
+                                        keys.push(key);
+                                    }
+                                }
+                                crate::log::log(&format!("[fetch_cloud_permissions] PostgREST retry OK, {} keys: {:?}", keys.len(), keys));
+                                return Ok(keys);
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Err(e) => {
+            crate::log::log(&format!("[fetch_cloud_permissions] PostgREST error: {}", e));
+            false
+        }
+    };
+
+    // Strategy 2: Try Management API SQL endpoint (requires PAT)
+    if pat.is_empty() {
+        crate::log::log("[fetch_cloud_permissions] PostgREST failed and no PAT available, returning empty");
+        return Ok(Vec::new());
+    }
+
+    let mgmt_url = format!(
+        "https://api.supabase.com/v1/projects/{}/database/query",
+        config.project_ref
+    );
+    let sql_query = format!(
+        "SELECT p.key FROM user_permissions up \
+         JOIN permissions p ON p.id = up.permission_id \
+         WHERE up.user_id = '{}'",
+        user_id
+    );
+    let sql_payload = serde_json::json!({ "query": &sql_query });
+
+    crate::log::log(&format!(
+        "[fetch_cloud_permissions] Trying Management API: {}, user_id: {}",
+        mgmt_url, user_id
+    ));
+
+    let response = client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", pat))
+        .header("Content-Type", "application/json")
+        .body(sql_payload.to_string())
+        .send()
+        .map_err(|e| format!("Management API request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        crate::log::log(&format!("[fetch_cloud_permissions] Management API failed ({}): {}", status, body));
+        return Ok(Vec::new());
+    }
+
+    let response_text = response.text().unwrap_or_default();
+    crate::log::log(&format!("[fetch_cloud_permissions] Raw response: {}", &response_text[..response_text.len().min(500)]));
+
+    #[derive(serde::Deserialize)]
+    struct PermKeyRow { key: String }
+
+    let rows: Vec<PermKeyRow> = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse permission keys response: {} (body: {})", e, &response_text[..response_text.len().min(200)]))?;
+
+    let keys: Vec<String> = rows.into_iter().map(|r| r.key).collect();
+    crate::log::log(&format!("[fetch_cloud_permissions] Found {} permission keys: {:?}", keys.len(), keys));
+    Ok(keys)
+}
+
+/// Shared row type for cloud app_settings queries.
+#[derive(serde::Deserialize)]
+struct CloudSettingRow {
+    key: String,
+    value: String,
+}
+
+/// Sync app_settings from cloud to local.
+/// For each setting key, only overwrite local value if it's currently empty.
+/// This preserves manually entered connection strings while filling in cloud values for new installs.
+fn sync_cloud_settings_to_local(conn: &rusqlite::Connection, supabase_url: &str, api_key: &str) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let base_url = supabase_url.trim_end_matches('/');
+
+    // Try PostgREST first (fast, but may fail if table not in schema cache)
+    let url = format!("{}/rest/v1/app_settings?select=key,value", base_url);
+    let rows: Vec<CloudSettingRow> = match client.get(&url)
+        .header("apikey", api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+    {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json().unwrap_or_default()
+        }
+        _ => {
+            // PostgREST failed (likely table not in schema cache). Fall back to Management API.
+            crate::log::log("[sync_cloud_settings] PostgREST failed, trying Management API");
+            fetch_settings_via_mgmt_api(conn)?
+        }
+    };
+
+    for row in rows {
+        let local_val = crate::db::get_setting(conn, &row.key);
+        if local_val.is_none() || local_val.as_ref().map(|s| s.is_empty()).unwrap_or(false) {
+            if !row.value.is_empty() {
+                crate::log::log(&format!("[sync_cloud_settings] Setting {} from cloud", row.key));
+                crate::db::set_setting(conn, &row.key, &row.value)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Fetch app_settings via the Management API SQL endpoint (bypasses PostgREST).
+fn fetch_settings_via_mgmt_api(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<CloudSettingRow>, String> {
+    let pat = crate::db::get_setting(conn, "supabase_pat")
+        .filter(|p| !p.is_empty())
+        .ok_or("PAT not available for Management API")?;
+    let conn_string = crate::db::get_setting(conn, "pg_connection_string")
+        .ok_or("pg_connection_string not set")?;
+    let config = crate::sync::RestConfig::parse(&conn_string)
+        .map_err(|e| format!("Invalid connection string: {}", e))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let mgmt_url = format!(
+        "https://api.supabase.com/v1/projects/{}/database/query",
+        config.project_ref
+    );
+    let payload = serde_json::json!({ "query": "SELECT key, value FROM app_settings" });
+
+    let response = client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", pat))
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .send()
+        .map_err(|e| format!("Management API request failed: {}", e))?;
+
+    let resp_status = response.status();
+    if !resp_status.is_success() {
+        let body = response.text().unwrap_or_default();
+        crate::log::log(&format!("[sync_cloud_settings] Management API failed: {} {}", resp_status, body));
+        return Ok(Vec::new());
+    }
+
+    let text = response.text().unwrap_or_default();
+    // Management API may return rows directly as an array or wrapped in {"data": [...]
+    let rows: Vec<CloudSettingRow> = serde_json::from_str(&text)
+        .or_else(|_| {
+            #[derive(serde::Deserialize)]
+            struct Wrapper { data: Vec<CloudSettingRow> }
+            serde_json::from_str::<Wrapper>(&text).map(|w| w.data)
+        })
+        .unwrap_or_default();
+
+    crate::log::log(&format!("[sync_cloud_settings] Management API returned {} settings", rows.len()));
+    Ok(rows)
 }
 
 /// Pull all company data from cloud (vehicles, drivers, users, etc.)
@@ -1441,8 +1866,8 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
     let config = crate::sync::RestConfig::parse(&conn_string)
         .map_err(|e| format!("Invalid connection string: {}", e))?;
 
-    // Step 1: Discover all tables from Supabase information_schema
-    let tables = discover_cloud_tables(&config)?;
+    // Step 1: Discover all tables from Supabase (PostgREST → Management API → fallback)
+    let tables = discover_cloud_tables(&config, db)?;
 
     if tables.is_empty() {
         crate::log::log("[sync] No tables found in Supabase");
@@ -1465,7 +1890,7 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
             continue;
         }
 
-        match pull_table_data(&config, &table_name, &tables) {
+        match pull_table_data(&config, &table_name, &tables, db) {
             Ok(count) => {
                 if count > 0 {
                     crate::log::log(&format!("[sync] Pulled {} rows from {}", count, table_name));
@@ -1482,40 +1907,84 @@ fn pull_all_cloud_data(db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection
 }
 
 /// Discover all table names from Supabase using information_schema
-fn discover_cloud_tables(config: &crate::sync::RestConfig) -> Result<Vec<String>, String> {
+fn discover_cloud_tables(config: &crate::sync::RestConfig, conn: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>) -> Result<Vec<String>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    // Query information_schema to get all tables in public schema
+    // Strategy 1: Try PostgREST (information_schema is exposed by PostgREST)
     let url = format!("{}/information_schema.tables?schema=eq.public&table_type=eq.BASE TABLE&select=table_name",
         config.url.trim_end_matches('/'));
 
-    let response = client.get(&url)
+    let postgrest_result = client.get(&url)
         .header("apikey", &config.service_role_key)
         .header("Authorization", format!("Bearer {}", config.service_role_key))
-        .send()
-        .map_err(|e| format!("Failed to query tables: {}", e))?;
+        .send();
 
-    if !response.status().is_success() {
-        return Err(format!("Failed to get tables: {}", response.status()));
+    if let Ok(resp) = postgrest_result {
+        if resp.status().is_success() {
+            #[derive(serde::Deserialize)]
+            struct TableInfo { table_name: String }
+            if let Ok(tables) = resp.json::<Vec<TableInfo>>() {
+                let names: Vec<String> = tables.into_iter().map(|t| t.table_name).collect();
+                if !names.is_empty() {
+                    crate::log::log(&format!("[discover_cloud_tables] PostgREST: found {} tables", names.len()));
+                    return Ok(names);
+                }
+            }
+        }
     }
 
-    #[derive(serde::Deserialize)]
-    struct TableInfo {
-        table_name: String,
+    // Strategy 2: Try Management API (requires PAT)
+    let pat = conn.lock().ok().and_then(|g| crate::db::get_setting(&g, "supabase_pat"));
+    if let Some(pat_val) = pat.filter(|p| !p.is_empty()) {
+        let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", config.project_ref);
+        let check_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name";
+        let payload = serde_json::json!({ "query": check_sql });
+        if let Ok(resp) = client.post(&mgmt_url)
+            .header("Authorization", format!("Bearer {}", pat_val))
+            .header("Content-Type", "application/json")
+            .body(payload.to_string())
+            .send()
+        {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text() {
+                    #[derive(serde::Deserialize)]
+                    struct TableNameRow { table_name: String }
+                    if let Ok(rows) = serde_json::from_str::<Vec<TableNameRow>>(&text) {
+                        let names: Vec<String> = rows.into_iter().map(|r| r.table_name).collect();
+                        crate::log::log(&format!("[discover_cloud_tables] Management API: found {} tables", names.len()));
+                        return Ok(names);
+                    }
+                }
+            }
+        }
     }
 
-    let tables: Vec<TableInfo> = response
-        .json()
-        .map_err(|e| format!("Failed to parse table list: {}", e))?;
-
-    Ok(tables.into_iter().map(|t| t.table_name).collect())
+    // Strategy 3: Return the known table list as fallback
+    // These are the tables created by SUPABASE_SETUP.sql
+    crate::log::log("[discover_cloud_tables] Using hardcoded table list as fallback");
+    Ok(vec![
+        "organizations".to_string(), "users".to_string(), "permissions".to_string(), "user_permissions".to_string(),
+        "companies".to_string(), "drivers".to_string(), "vehicles".to_string(),
+        "trips".to_string(), "field_definitions".to_string(), "audit_log".to_string(),
+        "system_health_events".to_string(), "integrations".to_string(),
+        "anpr_config".to_string(), "camera_sources".to_string(),
+        "model_versions".to_string(), "training_candidates".to_string(),
+        "role_presets".to_string(), "sync_log".to_string(),
+        "pc_identity".to_string(), "offline_queue".to_string(),
+        "app_settings".to_string(),
+    ])
 }
 
 /// Pull data from a specific table - handles any schema dynamically
-fn pull_table_data(config: &crate::sync::RestConfig, table_name: &str, _all_tables: &[String]) -> Result<usize, String> {
+fn pull_table_data(
+    config: &crate::sync::RestConfig,
+    table_name: &str,
+    _all_tables: &[String],
+    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<usize, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1542,9 +2011,12 @@ fn pull_table_data(config: &crate::sync::RestConfig, table_name: &str, _all_tabl
         return Ok(0);
     }
 
-    // Create table locally if it doesn't exist (dynamic schema)
-    // We'll use upsert_central_rows which handles this
+    // Persist rows to local SQLite using upsert_central_rows
+    let guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+    let count = crate::sync::upsert_central_rows(&guard, table_name, &rows)?;
+    drop(guard);
 
+    crate::log::log(&format!("[pull_table_data] Persisted {} rows to local {}", count, table_name));
     Ok(rows.len())
 }
 
@@ -1640,7 +2112,10 @@ pub fn logout(state: State<AppState>) -> Result<(), String> {
     // Previously session → db which caused lock-order inversion deadlock.
     // Phase 1: read session user_id (no db lock needed — session is independent).
     let user_id: Option<String> = {
-        let session = state.session.lock().map_err(|e| e.to_string())?;
+        let session = match state.session.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         session.as_ref().map(|s| s.user_id.clone())
     };
     // Phase 2: DB writes (fast, db released between phases).
@@ -1651,7 +2126,10 @@ pub fn logout(state: State<AppState>) -> Result<(), String> {
     }
     // Phase 3: clear session.
     {
-        let mut session = state.session.lock().map_err(|e| e.to_string())?;
+        let mut session = match state.session.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         *session = None;
     }
     Ok(())
@@ -1660,7 +2138,11 @@ pub fn logout(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn get_current_user(state: State<AppState>) -> Result<Option<SessionUser>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let session = state.session.lock().map_err(|e| e.to_string())?;
+    // Recover from poisoned mutex — a background thread panic shouldn't log the user out
+    let session = match state.session.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     match session.as_ref() {
         Some(s) => Ok(load_session_user(&conn, &s.user_id).ok()),
         None => Ok(None),
@@ -1800,6 +2282,9 @@ pub fn create_user(
                 params![hash_credential(&password)?, existing_id],
             )
             .map_err(|e| format!("failed to restore deleted user: {}", e))?;
+            let _ = sync::write_to_sync_log(&conn, "users", existing_id, "UPDATE", Some(&serde_json::json!({
+                "id": existing_id, "status": "active", "synced": 0
+            })));
             (existing_id.clone(), true)
         } else {
             return Err(format!("A user with the name '{}' already exists. Please choose a different name.", name));
@@ -1822,6 +2307,9 @@ pub fn create_user(
                 format!("failed to create user: {}", e)
             }
         })?;
+        let _ = sync::write_to_sync_log(&conn, "users", &id, "INSERT", Some(&serde_json::json!({
+            "id": id, "name": name, "status": "active", "created_at": now_iso(), "updated_at": now_iso()
+        })));
         (id, false)
     };
 
@@ -1833,6 +2321,9 @@ pub fn create_user(
             params![id, pid, actor_id, now_iso()],
         )
         .map_err(|e| format!("permission grant failed: {e}"))?;
+        let _ = sync::write_to_sync_log(&conn, "user_permissions", &format!("{}:{}", id, pid), "INSERT", Some(&serde_json::json!({
+            "user_id": id, "permission_id": pid, "granted_by": actor_id
+        })));
     }
 
     append_audit(
@@ -1896,11 +2387,15 @@ pub fn signup_local(
     let now = now_iso();
 
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, role, created_at, updated_at, synced)
-         VALUES (?1, ?2, 'password', ?3, 'active', 'staff', ?4, ?4, 0)",
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at, synced)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4, 0)",
         params![id, name, hash, now],
     )
     .map_err(|e| format!("failed to create user: {}", e))?;
+
+    let _ = sync::write_to_sync_log(&conn, "users", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "name": name, "status": "active", "created_at": now, "updated_at": now, "synced": 0
+    })));
 
     // Grant basic staff permissions
     let basic_perms = vec!["view_reports", "create_trips", "anpr"];
@@ -1910,12 +2405,15 @@ pub fn signup_local(
                 "INSERT OR IGNORE INTO user_permissions (user_id, permission_id, granted_by, granted_at) VALUES (?1, ?2, ?1, ?3)",
                 params![id, pid, now],
             );
+            let _ = sync::write_to_sync_log(&conn, "user_permissions", &format!("{}:{}", id, pid), "INSERT", Some(&serde_json::json!({
+                "user_id": id, "permission_id": pid, "granted_by": id, "granted_at": now
+            })));
         }
     }
 
     // Save session
     save_session_token(&conn, &id)?;
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: id.clone(),
         logged_in_at: now.clone(),
         auth_type: "password".to_string(),
@@ -2053,6 +2551,9 @@ pub fn complete_auth_upgrade(
         )
         .map_err(|e| format!("permission grant failed: {e}"))?;
     }
+    let _ = sync::write_to_sync_log(&conn, "user_permissions", &user_id, "DELETE", Some(&serde_json::json!({
+        "user_id": user_id, "reason": "complete_auth_upgrade"
+    })));
     save_pending_upgrades(&conn, &map)?;
 
     let previous_keys: Vec<String> = staged_obj
@@ -2260,7 +2761,7 @@ pub fn set_user_status(
         return Ok(());
     }
     conn.execute(
-        "UPDATE users SET status = ?1, revoked_by = ?2, revoked_at = ?3, updated_at = ?3 WHERE id = ?4",
+        "UPDATE users SET status = ?1, revoked_by = ?2, revoked_at = ?3, updated_at = ?3, synced = 0 WHERE id = ?4",
         params![
             status,
             if status == "disabled" { Some(actor_id.as_str()) } else { None },
@@ -2269,6 +2770,9 @@ pub fn set_user_status(
         ],
     )
     .map_err(|e| format!("status update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "UPDATE", Some(&serde_json::json!({
+        "id": user_id, "status": status, "updated_at": now_iso()
+    })));
     append_audit(
         &conn,
         &actor_id,
@@ -2363,7 +2867,7 @@ pub fn delete_user(
     }
     let n = conn
         .execute(
-            "UPDATE users SET status = 'deleted', revoked_by = ?1, revoked_at = ?2, updated_at = ?2
+            "UPDATE users SET status = 'deleted', revoked_by = ?1, revoked_at = ?2, updated_at = ?2, synced = 0
              WHERE id = ?3 AND status != 'deleted'",
             params![actor_id, now_iso(), user_id],
         )
@@ -2371,6 +2875,9 @@ pub fn delete_user(
     if n == 0 {
         return Err("User not found or already deleted.".to_string());
     }
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "UPDATE", Some(&serde_json::json!({
+        "id": user_id, "status": "deleted", "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "deleted_user", Some(&user_id), None)?;
     Ok(())
 }
@@ -2381,7 +2888,7 @@ pub fn restore_user(state: State<AppState>, actor_id: String, user_id: String) -
     ensure_admin_permission(&conn, &actor_id, "manage_users")?;
     let n = conn
         .execute(
-            "UPDATE users SET status = 'active', revoked_by = NULL, revoked_at = NULL, updated_at = ?1
+            "UPDATE users SET status = 'active', revoked_by = NULL, revoked_at = NULL, updated_at = ?1, synced = 0
              WHERE id = ?2 AND status = 'deleted'",
             params![now_iso(), user_id],
         )
@@ -2389,6 +2896,9 @@ pub fn restore_user(state: State<AppState>, actor_id: String, user_id: String) -
     if n == 0 {
         return Err("User not found or not deleted.".to_string());
     }
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "UPDATE", Some(&serde_json::json!({
+        "id": user_id, "status": "active", "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "restored_user", Some(&user_id), None)?;
     Ok(())
 }
@@ -2441,6 +2951,9 @@ pub fn purge_user(
     // Record deletion for central sync AFTER successful commit
     sync::record_deleted_ids(&conn, "users", &[user_id.clone()])
         .map_err(|e| format!("record delete failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "DELETE", Some(&serde_json::json!({
+        "id": user_id
+    })));
     append_audit(&conn, &actor_id, "purged_user", Some(&user_id), None)?;
     Ok(())
 }
@@ -2468,7 +2981,7 @@ pub fn reset_user_password(
     let hash = crate::auth::hash_credential(&temp_password)?;
     let n = conn
         .execute(
-            "UPDATE users SET credential_hash = ?1, auth_type = 'password', must_change_password = 1, updated_at = ?2
+            "UPDATE users SET credential_hash = ?1, auth_type = 'password', must_change_password = 1, updated_at = ?2, synced = 0
              WHERE id = ?3 AND status != 'deleted'",
             params![hash, now_iso(), user_id],
         )
@@ -2476,6 +2989,9 @@ pub fn reset_user_password(
     if n == 0 {
         return Err("User not found or deleted.".to_string());
     }
+    let _ = sync::write_to_sync_log(&conn, "users", &user_id, "UPDATE", Some(&serde_json::json!({
+        "id": user_id, "updated_at": now_iso()
+    })));
     // A fulfilled reset clears any pending forgot-password request for the account.
     conn.execute(
         "DELETE FROM password_reset_requests WHERE username = (SELECT name FROM users WHERE id = ?1)",
@@ -2529,12 +3045,12 @@ pub fn recover_admin_password(
     }
     let hash = crate::auth::hash_credential(&new_password)?;
     conn.execute(
-        "UPDATE users SET credential_hash = ?1, auth_type = 'password', must_change_password = 0, updated_at = ?2 WHERE id = ?3",
+        "UPDATE users SET credential_hash = ?1, auth_type = 'password', must_change_password = 0, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![hash, now_iso(), row.0],
     )
     .map_err(|e| format!("password update failed: {e}"))?;
     save_session_token(&conn, &row.0)?;
-    *state.session.lock().map_err(|e| e.to_string())? = Some(crate::db::Session {
+    *match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() } = Some(crate::db::Session {
         user_id: row.0.clone(),
         logged_in_at: now_iso(),
         auth_type: "password".to_string(),

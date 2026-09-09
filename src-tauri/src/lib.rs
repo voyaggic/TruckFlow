@@ -12,7 +12,12 @@ pub mod reference;
 pub mod reporting;
 pub mod sync;
 
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
+
+/// Consecutive cloud confirmations that the current user is disabled/deleted/
+/// missing before the app emits user-kicked-out. Reset on any healthy response
+/// or connectivity error — a single flaky 404 must never log anyone out.
+static CLOUD_KICK_STRIKES: AtomicU64 = AtomicU64::new(0);
 
 use rusqlite::{params, Connection};
 use tauri::{Emitter, Manager, State};
@@ -71,6 +76,13 @@ pub fn run() {
                 });
             }
             spawn_anpr_poller(app.handle(), &state);
+            // Initialize PC identity for two-way sync
+            if let Ok(conn) = state.db.lock() {
+                match sync::ensure_pc_identity(&conn) {
+                    Ok(pc_id) => crate::log::log(&format!("[sync] PC identity: {pc_id}")),
+                    Err(e) => crate::log::log(&format!("[sync] PC identity init failed: {e}")),
+                }
+            }
             spawn_sync_poller(app.handle(), &state, sync_rx);
             spawn_keepalive_pinger(&state);
             spawn_heartbeat(&state);
@@ -221,6 +233,7 @@ pub fn run() {
             sync::configure_postgres,
             sync::disconnect_postgres,
             sync::create_postgres_tables,
+            sync::generate_cloud_schema,
             sync::configure_google_sheets,
             sync::set_sheets_retention,
             sync::set_trip_retention,
@@ -625,7 +638,10 @@ fn spawn_anpr_poller(app: &tauri::AppHandle, state: &AppState) {
             if let Ok(mut last) = st.anpr_last.try_lock() {
                 *last = Some((read.timestamp.clone(), read.plate.clone()));
             }
-            let officer = st.session.lock().ok().and_then(|s| s.as_ref().map(|s| s.user_id.clone()));
+            let officer = {
+                let s = match st.session.lock() { Ok(s) => s, Err(p) => p.into_inner() };
+                s.as_ref().map(|s| s.user_id.clone())
+            };
             let conn = match anpr_db.try_lock() {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -694,7 +710,7 @@ fn spawn_heartbeat(state: &AppState) {
 
 /// Update this machine's heartbeat. Call on login and periodically.
 pub fn update_machine_heartbeat(state: &AppState, user_id: &str, company_id: &str, role: &str) {
-    update_machine_heartbeat_raw(&state.db, &state.pg, user_id, company_id, role);
+    update_machine_heartbeat_raw(&state.db, &state.pg.get(), user_id, company_id, role);
 }
 
 /// Raw version for use in background threads (takes individual parameters).
@@ -829,31 +845,63 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                     };
                     match crate::db::get_setting(&conn, "pg_connection_string") {
                         Some(conn_str) => {
-                            let parts: Vec<&str> = conn_str.split('|').collect();
-                            if parts.len() >= 3 {
-                                (Some(parts[1].to_string()), Some(parts[2].to_string()))
-                            } else {
-                                (None, None)
+                            // Parse (and normalize) through RestConfig so the
+                            // status check always hits /rest/v1 — a bare project
+                            // URL 404s and used to log every user out.
+                            match crate::sync::RestConfig::parse(&conn_str) {
+                                Ok(cfg) => (Some(cfg.url), Some(cfg.service_role_key)),
+                                Err(_) => (None, None),
                             }
                         }
                         None => (None, None),
                     }
                 };
                 if let (Some(url), Some(key)) = (supabase_url, api_key) {
-                    match check_user_status_in_cloud(&url, &key, &user_id) {
+                    // Only check cloud status if user has been synced to cloud
+                    // Users with synced=0 are pending sync and should not be checked against cloud
+                    let user_synced_to_cloud = {
+                        if let Ok(conn) = db.lock() {
+                            let synced: Option<i64> = conn.query_row(
+                                "SELECT COALESCE(synced, 0) FROM users WHERE id = ?1",
+                                rusqlite::params![user_id],
+                                |r| r.get::<_, Option<i64>>(0),
+                            ).ok().flatten().map(|v: i64| v);
+                            synced.unwrap_or(0) == 1
+                        } else {
+                            false
+                        }
+                    };
+
+                    // Only check cloud if user is known to be synced to cloud
+                    if !user_synced_to_cloud {
+                        crate::log::log(&format!("[sync] User {} not yet synced to cloud, skipping status check", user_id));
+                    } else {
+                        match check_user_status_in_cloud(&url, &key, &user_id) {
                         Ok(Some(status)) if status == "disabled" || status == "deleted" => {
-                            crate::log::log(&format!("[sync] User {} status changed to {}", user_id, status));
-                            if let Ok(conn) = db.lock() {
-                                let _ = conn.execute(
-                                    "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                                    rusqlite::params![status, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
-                                );
+                            // Require TWO consecutive confirmations before kicking:
+                            // a single flaky response (stale PostgREST schema cache,
+                            // replication lag right after an admin edit) must never
+                            // log the user out of a working offline-capable PC.
+                            let prior = CLOUD_KICK_STRIKES.load(Ordering::SeqCst);
+                            if prior + 1 >= 2 {
+                                crate::log::log(&format!("[sync] User {} status changed to {} (confirmed twice), kicking out", user_id, status));
+                                CLOUD_KICK_STRIKES.store(0, Ordering::SeqCst);
+                                if let Ok(conn) = db.lock() {
+                                    let _ = conn.execute(
+                                        "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                                        rusqlite::params![status, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
+                                    );
+                                }
+                                let _ = handle.emit("user-kicked-out", serde_json::json!({
+                                    "reason": format!("Account has been {}", status)
+                                }));
+                            } else {
+                                CLOUD_KICK_STRIKES.store(prior + 1, Ordering::SeqCst);
+                                crate::log::log(&format!("[sync] User {} cloud status {} (strike {}/2, waiting for confirmation)", user_id, status, prior + 1));
                             }
-                            let _ = handle.emit("user-kicked-out", serde_json::json!({
-                                "reason": format!("Account has been {}", status)
-                            }));
                         }
                         Ok(Some(_)) => {
+                            CLOUD_KICK_STRIKES.store(0, Ordering::SeqCst);
                             if let Ok(conn) = db.lock() {
                                 let local_status: Option<String> = conn.query_row(
                                     "SELECT status FROM users WHERE id = ?1",
@@ -872,23 +920,36 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                             }
                         }
                         Ok(None) => {
-                            crate::log::log(&format!("[sync] User {} not found in cloud", user_id));
-                            if let Ok(conn) = db.lock() {
-                                let _ = conn.execute(
-                                    "UPDATE users SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
-                                    rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
-                                );
+                            // "Not found" needs the same double-confirmation: a
+                            // 404 from a stale schema cache is NOT a deletion.
+                            let prior = CLOUD_KICK_STRIKES.load(Ordering::SeqCst);
+                            if prior + 1 >= 2 {
+                                crate::log::log(&format!("[sync] User {} not found in cloud (confirmed twice), kicking out", user_id));
+                                CLOUD_KICK_STRIKES.store(0, Ordering::SeqCst);
+                                if let Ok(conn) = db.lock() {
+                                    let _ = conn.execute(
+                                        "UPDATE users SET status = 'deleted', updated_at = ?1 WHERE id = ?2",
+                                        rusqlite::params![chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), user_id],
+                                    );
+                                }
+                                let _ = handle.emit("user-kicked-out", serde_json::json!({
+                                    "reason": "Account not found in cloud. Please contact admin."
+                                }));
+                            } else {
+                                CLOUD_KICK_STRIKES.store(prior + 1, Ordering::SeqCst);
+                                crate::log::log(&format!("[sync] User {} not found in cloud (strike {}/2, waiting for confirmation)", user_id, prior + 1));
                             }
-                            let _ = handle.emit("user-kicked-out", serde_json::json!({
-                                "reason": "Account not found in cloud. Please contact admin."
-                            }));
                         }
                         Err(e) => {
+                            // Cloud unreachable — never count connectivity failures
+                            // as strikes; offline mode must keep the user signed in.
+                            CLOUD_KICK_STRIKES.store(0, Ordering::SeqCst);
                             crate::log::log(&format!("[sync] Cloud unreachable: {}. Continuing offline.", e));
                         }
                     }
-                }
-            }
+                    }  // closes if let (Some(url), Some(key))
+                }  // closes if let (Some(user_id), true)
+            }  // closes while running loop
 
             // ── Drain pending mark-synced from previous cycles ─────────
             if let Ok(mut marks) = pending_marks.try_lock() {
@@ -952,6 +1013,107 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                 if any_pushed {
                     if let Ok(conn) = sync_db_pg.lock() {
                         let _ = crate::db::set_setting(&conn, "pg_last_synced_at", &crate::db::now_iso());
+                    }
+                }
+
+                // ── Replay offline queue (pending mutations) ───────────
+                if pg_handle.connected() {
+                    let entries = match sync_db_pg.lock() {
+                        Ok(conn) => {
+                            match sync::pending_offline_entries(&conn, 100) {
+                                Ok(e) => e,
+                                Err(e) => { crate::log::log(&format!("[sync] offline_queue read: {e}")); vec![] }
+                            }
+                        }
+                        Err(_) => vec![],
+                    };
+                    for entry in &entries {
+                        let queue_id = entry["id"].as_str().unwrap_or("");
+                        let table_name = entry["table_name"].as_str().unwrap_or("");
+                        let record_id = entry["record_id"].as_str().unwrap_or("");
+                        let operation = entry["operation"].as_str().unwrap_or("");
+                        let payload_str = entry["payload"].as_str().unwrap_or("");
+
+                        if table_name.is_empty() || record_id.is_empty() { continue; }
+
+                        // Skip sync infrastructure tables (they push via the normal path)
+                        if table_name == "sync_log" || table_name == "pc_identity" || table_name == "offline_queue" {
+                            if let Ok(conn) = sync_db_pg.lock() {
+                                let _ = sync::mark_offline_queue_sent(&conn, table_name, &[record_id.to_string()]);
+                            }
+                            continue;
+                        }
+
+                        match operation {
+                            "INSERT" | "UPDATE" => {
+                                // Prefer the CURRENT full local row over the stored queue
+                                // payload: the payload may be partial (e.g. user_permissions
+                                // entries lack granted_at, which the central table requires).
+                                let payload_opt: Option<serde_json::Value> = match sync_db_pg.lock() {
+                                    Ok(conn) => match sync::load_row_by_record_id(&conn, table_name, record_id) {
+                                        Ok(row) => row,
+                                        Err(e) => {
+                                            crate::log::log(&format!("[sync] offline replay {table_name} {record_id}: row lookup failed: {e}"));
+                                            None
+                                        }
+                                    },
+                                    Err(e) => {
+                                        crate::log::log(&format!("[sync] offline replay {table_name} {record_id}: sync_db lock: {e}"));
+                                        None
+                                    }
+                                };
+                                let payload = match payload_opt {
+                                    Some(p) => p,
+                                    None => match serde_json::from_str::<serde_json::Value>(payload_str) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            crate::log::log(&format!("[sync] offline replay {table_name} {record_id}: bad payload: {e}"));
+                                            if let Ok(conn) = sync_db_pg.lock() {
+                                                let _ = sync::mark_offline_queue_error(&conn, queue_id, &format!("bad payload: {e}"));
+                                            }
+                                            continue;
+                                        }
+                                    },
+                                };
+                                match pg_handle.push_rows(table_name, &[payload]) {
+                                    Ok(ids) => {
+                                        if let Ok(conn) = sync_db_pg.lock() {
+                                            let _ = sync::mark_offline_queue_sent(&conn, table_name, &ids);
+                                            let _ = sync::mark_rows_synced(&conn, table_name, &ids);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        crate::log::log(&format!("[sync] offline replay {table_name} {record_id}: {e}"));
+                                        if let Ok(conn) = sync_db_pg.lock() {
+                                            let _ = sync::mark_offline_queue_error(&conn, queue_id, &e);
+                                        }
+                                    }
+                                }
+                            }
+                            "DELETE" => {
+                                if let Err(e) = pg_handle.delete_rows(table_name, &[record_id.to_string()]) {
+                                    crate::log::log(&format!("[sync] offline replay delete {table_name} {record_id}: {e}"));
+                                    if let Ok(conn) = sync_db_pg.lock() {
+                                        let _ = sync::mark_offline_queue_error(&conn, queue_id, &e);
+                                    }
+                                } else {
+                                    if let Ok(conn) = sync_db_pg.lock() {
+                                        let _ = sync::mark_offline_queue_sent(&conn, table_name, &[record_id.to_string()]);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Update connection status
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let _ = crate::db::set_setting(&conn, "pg_is_online", "1");
+                        let _ = crate::db::set_setting(&conn, "pg_last_connected_at", &crate::db::now_iso());
+                    }
+                } else {
+                    // Mark offline
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let _ = crate::db::set_setting(&conn, "pg_is_online", "0");
                     }
                 }
 
@@ -1022,11 +1184,19 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                 }
             });
 
+            // Wait for PG (push + offline replay + central pull) to fully finish
+            // BEFORE the Sheets scan. Without this, the Sheets block raced the
+            // trips pull: gate-PC trips pulled this cycle were only exported on
+            // the NEXT cycle (~30s later). Joining here guarantees the local DB
+            // already contains every cloud trip when the Sheets scan runs.
+            let _ = pg_thread.join();
+
             // ── Google Sheets sync (runs on poller thread) ─────────────
             {
                 let conn = match sync_db.lock() {
                     Ok(c) => c,
-                    Err(_) => { let _ = pg_thread.join(); continue; }
+                    // pg_thread already joined above — just skip this cycle.
+                    Err(_) => { continue; }
                 };
                 let timer_due = sync::sheets_due(&conn, &*sheets);
                 let pending_count: i64 = conn.query_row(
@@ -1043,7 +1213,8 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                 if timer_due || has_pending {
                     let data = match sync::prepare_sheets_data(&conn, &*sheets) {
                         Ok(d) => d,
-                        Err(e) => { crate::log::log(&format!("[sync] sheets prepare: {e}")); let _ = pg_thread.join(); continue; }
+                        // pg_thread already joined above — just skip this cycle.
+                        Err(e) => { crate::log::log(&format!("[sync] sheets prepare: {e}")); continue; }
                     };
                     drop(conn);
                     crate::log::log(&format!("[sync] sheets data: pending={} new_rows={} update_rows={}", data.pending, data.new_rows.len(), data.update_rows.len()));
@@ -1069,8 +1240,8 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                 }
             }
 
-            // Wait for PG to finish before next cycle.
-            let _ = pg_thread.join();
+            // (PG thread is joined before the Sheets block above — no second
+            // join here; JoinHandle is consumed by join().)
         }
     });
 }
@@ -1126,7 +1297,7 @@ fn check_user_status_in_cloud(supabase_url: &str, api_key: &str, user_id: &str) 
 
     let url = format!(
         "{}/users?id=eq.{}&select=status",
-        supabase_url.trim_end_matches('/'),
+        crate::sync::normalize_supabase_rest_url(supabase_url),
         encoded_id
     );
 
@@ -1141,7 +1312,14 @@ fn check_user_status_in_cloud(supabase_url: &str, api_key: &str, user_id: &str) 
     }
 
     if response.status() == 404 {
-        return Ok(None); // User not found
+        // Distinguish "table missing because PostgREST schema cache is stale"
+        // (PGRST205) from a genuine empty result. A stale cache is a transient
+        // infra state — treating it as "user deleted" logged people out randomly.
+        let body = response.text().unwrap_or_default();
+        if body.contains("PGRST205") || body.contains("Could not find the table") || body.contains("requested path is invalid") {
+            return Err("schema cache not ready".to_string());
+        }
+        return Ok(None); // User genuinely not found
     }
 
     #[derive(serde::Deserialize)]
