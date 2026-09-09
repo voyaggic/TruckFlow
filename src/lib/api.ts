@@ -670,6 +670,11 @@ export const api = {
 
   syncStatus: () => invoke<SyncStatusView>("sync_status"),
 
+  getCloudConfig: () =>
+    invoke<{ pg_connection_string: string; sheets_id: string; sheets_frequency: string; sheets_service_account_json: string }>(
+      "get_cloud_config"
+    ),
+
   syncNowPg: (actorId: string) => invoke<string>("sync_now_pg", { actorId }),
 
   connectGoogleSheets: (

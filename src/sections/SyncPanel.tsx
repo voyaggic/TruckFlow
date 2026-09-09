@@ -4,14 +4,35 @@ import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
 import { listen } from "@tauri-apps/api/event";
 
+interface CloudConfig {
+  pg_connection_string: string;
+  sheets_id: string;
+  sheets_frequency: string;
+  sheets_service_account_json: string;
+}
+
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
+  const [cloudConfig, setCloudConfig] = useState<CloudConfig | null>(null);
   const { fire, isPending, getError, getSuccess } = useAsyncAction();
 
   const refresh = useCallback(() => {
     api
       .syncStatus()
       .then(setStatus)
+      .catch(() => {});
+  }, []);
+
+  // Fetch cloud config on mount (only if local fields are empty)
+  useEffect(() => {
+    api
+      .getCloudConfig()
+      .then((cfg) => {
+        // Only use cloud config if it has actual values
+        if (cfg.pg_connection_string || cfg.sheets_id || cfg.sheets_service_account_json) {
+          setCloudConfig(cfg);
+        }
+      })
       .catch(() => {});
   }, []);
 
@@ -53,8 +74,8 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
       {getError("pg-connect") && <div className="error-banner">{getError("pg-connect")}</div>}
       {getSuccess("pg-connect") && <div className="success-banner">{getSuccess("pg-connect")}</div>}
 
-      <PostgresPanel status={status} totalPending={totalPending} actor={user} run={run} isPending={isPending} getError={getError} />
-      <SheetsPanel status={status} actor={user} run={run} isPending={isPending} getError={getError} />
+      <PostgresPanel status={status} totalPending={totalPending} actor={user} run={run} isPending={isPending} getError={getError} cloudConfig={cloudConfig} />
+      <SheetsPanel status={status} actor={user} run={run} isPending={isPending} getError={getError} cloudConfig={cloudConfig} />
       {status?.sheets?.configured && <ColumnMappingPanel actor={user} run={run} isPending={isPending} />}
     </div>
   );
@@ -80,6 +101,7 @@ function PostgresPanel({
   run,
   isPending,
   getError,
+  cloudConfig,
 }: {
   status: SyncStatusView | null;
   totalPending: number;
@@ -87,6 +109,7 @@ function PostgresPanel({
   run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
+  cloudConfig: CloudConfig | null;
 }) {
   const [connString, setConnString] = useState("");
   const [pat, setPat] = useState("");
@@ -97,6 +120,13 @@ function PostgresPanel({
   const [schemaLoading, setSchemaLoading] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const pg = status?.pg;
+
+  // Pre-populate connection string from cloud config if local is empty
+  useEffect(() => {
+    if (cloudConfig?.pg_connection_string && !connString) {
+      setConnString(cloudConfig.pg_connection_string);
+    }
+  }, [cloudConfig, connString]);
 
   // Track the pending count when sync starts so we can show incremental
   // progress ("3 of 120 rows synced") as the background poller pushes.
@@ -628,12 +658,14 @@ function SheetsPanel({
   run,
   isPending,
   getError,
+  cloudConfig,
 }: {
   status: SyncStatusView | null;
   actor: SessionUser;
   run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
+  cloudConfig: CloudConfig | null;
 }) {
   const sheets = status?.sheets;
   const [saJson, setSaJson] = useState("");
@@ -642,18 +674,18 @@ function SheetsPanel({
   const [frequency, setFrequency] = useState<string>("realtime");
   const [retention, setRetention] = useState<string>("");
 
-  // Track the pending count when export starts so we can show incremental
-  // progress as the background poller pushes trips to the sheet.
-  const sheetsPending = sheets?.pending ?? 0;
-  const [sheetsBaseline, setSheetsBaseline] = useState(0);
+  // Pre-populate from cloud config if local is empty
   useEffect(() => {
-    if (sheetsPending > 0) {
-      setSheetsBaseline((prev) => (prev === 0 || sheetsPending > prev ? sheetsPending : prev));
-    } else {
-      setSheetsBaseline(0);
+    if (cloudConfig?.sheets_service_account_json && !saJson) {
+      setSaJson(cloudConfig.sheets_service_account_json);
     }
-  }, [sheetsPending]);
-  const sheetsSynced = sheetsBaseline > 0 ? sheetsBaseline - sheetsPending : 0;
+    if (cloudConfig?.sheets_id && !sheetId) {
+      setSheetId(cloudConfig.sheets_id);
+    }
+    if (cloudConfig?.sheets_frequency && frequency === "realtime") {
+      setFrequency(cloudConfig.sheets_frequency);
+    }
+  }, [cloudConfig, saJson, sheetId, frequency]);
 
   const saveRetention = () => {
     const v = retention.trim();

@@ -2114,16 +2114,24 @@ pub fn pull_company_config(state: &AppState, company_id: &str) -> Result<(), Str
         if let Some(enabled) = row.get("anpr_enabled").and_then(|v| v.as_bool()) {
             let _ = crate::db::set_setting(&conn, "anpr_enabled", if enabled { "true" } else { "false" });
         }
+
+        // Save service account JSON (Google Sheets credentials from cloud)
+        if let Some(sa_json) = row.get("sheets_service_account_json").and_then(|v| v.as_str()) {
+            if !sa_json.is_empty() {
+                let _ = crate::db::set_setting(&conn, "sheets_service_account_json", sa_json);
+            }
+        }
         
         // Save to company_config table
         let _ = conn.execute(
-            "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(company_id) DO UPDATE SET 
                  pg_connection_string = excluded.pg_connection_string,
                  sheets_id = excluded.sheets_id,
                  sheets_frequency = excluded.sheets_frequency,
                  anpr_enabled = excluded.anpr_enabled,
+                 sheets_service_account_json = excluded.sheets_service_account_json,
                  updated_at = excluded.updated_at",
             rusqlite::params![
                 company_id,
@@ -2131,6 +2139,7 @@ pub fn pull_company_config(state: &AppState, company_id: &str) -> Result<(), Str
                 row.get("sheets_id").and_then(|v| v.as_str()).unwrap_or(""),
                 row.get("sheets_frequency").and_then(|v| v.as_str()).unwrap_or("realtime"),
                 row.get("anpr_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                row.get("sheets_service_account_json").and_then(|v| v.as_str()).unwrap_or(""),
                 crate::db::now_iso(),
             ],
         );
@@ -2153,22 +2162,25 @@ pub fn push_company_config(state: &AppState, company_id: &str) -> Result<(), Str
     let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
     let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
     let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
+    let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
 
     // Push to PostgreSQL
     let sql = format!(
-        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
-         VALUES ('{}', '{}', '{}', '{}', {}, '{}')
+        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
          ON CONFLICT (company_id) DO UPDATE SET
              pg_connection_string = EXCLUDED.pg_connection_string,
              sheets_id = EXCLUDED.sheets_id,
              sheets_frequency = EXCLUDED.sheets_frequency,
              anpr_enabled = EXCLUDED.anpr_enabled,
+             sheets_service_account_json = EXCLUDED.sheets_service_account_json,
              updated_at = EXCLUDED.updated_at",
         pg_literal_string(company_id),
         pg_literal_string(&pg_conn_str),
         pg_literal_string(&sheets_id),
         pg_literal_string(&sheets_freq),
         anpr_enabled,
+        pg_literal_string(&sheets_sa_json),
         pg_literal_string(&crate::db::now_iso()),
     );
 
@@ -2191,22 +2203,25 @@ pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
     let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
     let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
     let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
+    let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
 
     // Push to PostgreSQL
     let sql = format!(
-        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
-         VALUES ('{}', '{}', '{}', '{}', {}, '{}')
+        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
          ON CONFLICT (company_id) DO UPDATE SET
              pg_connection_string = EXCLUDED.pg_connection_string,
              sheets_id = EXCLUDED.sheets_id,
              sheets_frequency = EXCLUDED.sheets_frequency,
              anpr_enabled = EXCLUDED.anpr_enabled,
+             sheets_service_account_json = EXCLUDED.sheets_service_account_json,
              updated_at = EXCLUDED.updated_at",
         pg_literal_string(company_id),
         pg_literal_string(&pg_conn_str),
         pg_literal_string(&sheets_id),
         pg_literal_string(&sheets_freq),
         anpr_enabled,
+        pg_literal_string(&sheets_sa_json),
         pg_literal_string(&crate::db::now_iso()),
     );
 
@@ -2215,7 +2230,6 @@ pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
 
     Ok(())
 }
-
 /// Raw version for use in background threads (takes individual parameters).
 pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Connection>>, company_id: &str) -> Result<(), String> {
     // NOTE: callers holding Arc<SharedPg> must pass .get() — see configure_postgres.
@@ -2241,6 +2255,7 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
             let _ = crate::db::set_setting(&conn, "sheets_id", sheets_id);
         }
         
+
         // Save other config
         if let Some(freq) = row.get("sheets_frequency").and_then(|v| v.as_str()) {
             let _ = crate::db::set_setting(&conn, "sheets_frequency", freq);
@@ -2249,16 +2264,24 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
         if let Some(enabled) = row.get("anpr_enabled").and_then(|v| v.as_bool()) {
             let _ = crate::db::set_setting(&conn, "anpr_enabled", if enabled { "true" } else { "false" });
         }
+
+        // Save service account JSON (Google Sheets credentials from cloud)
+        if let Some(sa_json) = row.get("sheets_service_account_json").and_then(|v| v.as_str()) {
+            if !sa_json.is_empty() {
+                let _ = crate::db::set_setting(&conn, "sheets_service_account_json", sa_json);
+            }
+        }
         
         // Save to company_config table
         let _ = conn.execute(
-            "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(company_id) DO UPDATE SET 
                  pg_connection_string = excluded.pg_connection_string,
                  sheets_id = excluded.sheets_id,
                  sheets_frequency = excluded.sheets_frequency,
                  anpr_enabled = excluded.anpr_enabled,
+                 sheets_service_account_json = excluded.sheets_service_account_json,
                  updated_at = excluded.updated_at",
             rusqlite::params![
                 company_id,
@@ -2266,6 +2289,7 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
                 row.get("sheets_id").and_then(|v| v.as_str()).unwrap_or(""),
                 row.get("sheets_frequency").and_then(|v| v.as_str()).unwrap_or("realtime"),
                 row.get("anpr_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                row.get("sheets_service_account_json").and_then(|v| v.as_str()).unwrap_or(""),
                 crate::db::now_iso(),
             ],
         );

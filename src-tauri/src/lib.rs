@@ -241,6 +241,7 @@ pub fn run() {
             sync::get_sheet_column_mapping,
             sync::set_sheet_column_mapping,
             commands::configure_sheets_webhook,
+            commands::get_cloud_config,
             reporting::report_dashboard,
             reporting::report_trips_drill,
             reporting::report_export,

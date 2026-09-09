@@ -431,6 +431,15 @@ pub struct SyncStatusView {
     pub sheets: SheetsStateView,
 }
 
+#[derive(Clone, Debug, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct CloudConfigView {
+    pub pg_connection_string: String,
+    pub sheets_id: String,
+    pub sheets_frequency: String,
+    pub sheets_service_account_json: String,
+}
+
 // ---------------------------------------------------------------------------
 // Phase 5 — Reporting & oversight (05-ui-screens.md §5, §6c, §6g)
 // ---------------------------------------------------------------------------

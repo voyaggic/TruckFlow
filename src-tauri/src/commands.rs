@@ -5,8 +5,8 @@ use tauri::State;
 use crate::auth::{hash_credential, validate_password, verify_credential};
 use crate::db::{append_audit, now_iso, AppState, PERMISSION_CATALOG, ROLE_PRESETS};
 use crate::models::{
-    AppStatus, LoginResult, PasswordStrength, PermissionChangeResult, PermissionView, RolePresetView,
-    SessionUser, UserView,
+    AppStatus, CloudConfigView, LoginResult, PasswordStrength, PermissionChangeResult, PermissionView,
+    RolePresetView, SessionUser, UserView,
 };
 use crate::sync;
 
@@ -1797,6 +1797,78 @@ fn sync_cloud_settings_to_local(conn: &rusqlite::Connection, supabase_url: &str,
     }
 
     Ok(())
+}
+
+/// Return cloud-stored company config (PG connection, Sheets ID, etc.) so the
+/// frontend can pre-populate SyncPanel fields without re-entering credentials.
+#[tauri::command]
+pub fn get_cloud_config(
+    state: State<AppState>,
+) -> Result<CloudConfigView, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    // Read Supabase credentials from pg_connection_string in local settings
+    let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
+    
+    let (supabase_url, api_key) = if pg_conn_str.starts_with("REST|") {
+        let parts: Vec<&str> = pg_conn_str.split('|').collect();
+        if parts.len() >= 3 {
+            (parts[1].to_string(), parts[2].to_string())
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        (String::new(), String::new())
+    };
+
+    let company_id = crate::db::get_setting(&conn, "company_id").unwrap_or_default();
+    if company_id.is_empty() {
+        return Ok(CloudConfigView::default());
+    }
+
+    drop(conn);
+
+    if supabase_url.is_empty() || api_key.is_empty() {
+        return Ok(CloudConfigView::default());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let base_url = supabase_url.trim_end_matches('/');
+
+    // Query company_config from Supabase
+    let url = format!(
+        "{}/rest/v1/company_config?select=*&company_id=eq.{}",
+        base_url, company_id
+    );
+    let resp = client.get(&url)
+        .header("apikey", &api_key)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .map_err(|e| format!("Cloud config request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Ok(CloudConfigView::default());
+    }
+
+    let rows: Vec<serde_json::Value> = resp.json().unwrap_or_default();
+    if let Some(row) = rows.first() {
+        Ok(CloudConfigView {
+            pg_connection_string: row.get("pg_connection_string")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            sheets_id: row.get("sheets_id")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            sheets_frequency: row.get("sheets_frequency")
+                .and_then(|v| v.as_str()).unwrap_or("realtime").to_string(),
+            sheets_service_account_json: row.get("sheets_service_account_json")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        })
+    } else {
+        Ok(CloudConfigView::default())
+    }
 }
 
 /// Fetch app_settings via the Management API SQL endpoint (bypasses PostgREST).

@@ -1362,6 +1362,19 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
+    // Migration 39: Add sheets_service_account_json to company_config
+    if current < 39 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE company_config ADD COLUMN sheets_service_account_json TEXT;
+            "#,
+        )
+        .map_err(|e| format!("migration 39 failed: {e}"))?;
+        crate::log::log("[DB] Migration 39: added sheets_service_account_json to company_config");
+        conn.execute_batch("PRAGMA user_version = 39;")
+            .map_err(|e| format!("version bump failed: {e}"))?;
+    }
+
     Ok(())
 }
 
