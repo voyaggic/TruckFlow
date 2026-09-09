@@ -424,9 +424,9 @@ pub fn create_first_admin_for_company(
     let id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, company_id, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
-        params![id, name, hash, company_id, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
+        params![id, name, hash, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -517,9 +517,9 @@ pub fn create_company_and_admin(
     let user_id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
-        params![user_id, admin_name, hash, organization_id, now, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
+        params![user_id, admin_name, hash, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
