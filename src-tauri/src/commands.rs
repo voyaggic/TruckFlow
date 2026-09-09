@@ -775,9 +775,9 @@ pub fn create_company_and_admin_cloud(
 
     // Create admin user locally (synced=0 default → background sync pushes to cloud)
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
-        params![user_id, admin_name, hash, company_id, now, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
+        params![user_id, admin_name, hash, now],
     ).map_err(|e| format!("admin creation failed: {}", e))?;
     let _ = sync::write_to_sync_log(&conn, "users", &user_id, "INSERT", Some(&serde_json::json!({
         "id": user_id, "name": admin_name, "status": "active", "created_at": now, "updated_at": now
