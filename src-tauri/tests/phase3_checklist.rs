@@ -68,7 +68,7 @@ impl TestCtx {
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
             anpr_processes: Arc::new(Mutex::new(Vec::new())),
             pending_sync_marks: Arc::new(Mutex::new(Vec::new())),

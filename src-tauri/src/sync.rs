@@ -29,9 +29,118 @@ use crate::models::{PgSyncStateView, SheetsStateView, SyncRunResult, SyncStatusV
 
 const INTEGRATION_PERM: &str = "manage_integrations";
 
+/// Push the app's permission catalog (id, key, min_auth_level, description) to
+/// the central DB. Called after a successful connect so stale/drifted cloud
+/// rows (e.g. min_auth_level still 'pin' from an old schema) are overwritten
+/// with the local, authoritative catalog. Best-effort — failures only log.
+pub fn push_permission_catalog(pg: &dyn PostgresAdapter) {
+    let rows: Vec<serde_json::Value> = crate::db::PERMISSION_CATALOG
+        .iter()
+        .map(|(id, key, min_auth, desc)| {
+            serde_json::json!({
+                "id": id,
+                "key": key,
+                "min_auth_level": min_auth,
+                "description": desc,
+                "updated_at": crate::db::now_iso(),
+            })
+        })
+        .collect();
+    match pg.push_rows("permissions", &rows) {
+        Ok(_) => crate::log::log("[sync] permission catalog pushed to central"),
+        Err(e) => crate::log::log(&format!("[sync] permission catalog push failed (non-fatal): {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adapters — mock in dev, real drivers swappable behind the same traits
 // ---------------------------------------------------------------------------
+
+/// Runtime-swappable Postgres adapter holder. `configure_postgres` may need to
+/// switch adapter TYPE (e.g. pgbouncer → REST when the user first connects to
+/// Supabase); AppState.pg previously kept pointing at the old adapter until
+/// restart, so connects appeared dead until relaunch. Every consumer — UI
+/// commands, the sync poller, the poller's spawned threads — reads through
+/// this wrapper, so a swap takes effect immediately everywhere.
+pub struct SharedPg {
+    inner: std::sync::RwLock<Arc<dyn PostgresAdapter>>,
+}
+
+impl SharedPg {
+    pub fn new(initial: Arc<dyn PostgresAdapter>) -> Self {
+        Self { inner: std::sync::RwLock::new(initial) }
+    }
+    /// Snapshot the current adapter. Cheap (Arc clone under a short read lock).
+    pub fn get(&self) -> Arc<dyn PostgresAdapter> {
+        self.inner.read().map(|g| g.clone()).unwrap_or_else(|p| p.into_inner().clone())
+    }
+    /// Install a new adapter; takes effect for ALL consumers immediately.
+    pub fn swap(&self, next: Arc<dyn PostgresAdapter>) {
+        match self.inner.write() {
+            Ok(mut w) => *w = next,
+            Err(p) => *p.into_inner() = next,
+        }
+    }
+    /// Delegate the trait so `&*state.pg` call sites keep working unchanged.
+    fn current(&self) -> Arc<dyn PostgresAdapter> {
+        self.get()
+    }
+}
+
+impl PostgresAdapter for SharedPg {
+    fn label(&self) -> &str {
+        // All built-in adapters use 'static label strings, so forward via the
+        // object-safe label_of() to avoid borrowing from a temporary Arc.
+        self.current().label_of()
+    }
+    fn connected(&self) -> bool {
+        self.current().connected()
+    }
+    fn configured(&self) -> bool {
+        self.current().configured()
+    }
+    fn last_error(&self) -> Option<String> {
+        self.current().last_error()
+    }
+    fn push_rows(&self, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
+        self.current().push_rows(table, rows)
+    }
+    fn delete_rows(&self, table: &str, ids: &[String]) -> Result<(), String> {
+        self.current().delete_rows(table, ids)
+    }
+    fn query_rows(&self, sql: &str, params: &[String]) -> Result<Vec<serde_json::Value>, String> {
+        self.current().query_rows(sql, params)
+    }
+    fn add_missing_column(&self, table: &str, column_name: &str) -> Result<(), String> {
+        self.current().add_missing_column(table, column_name)
+    }
+    fn configure(&self, conn_string: Option<String>) -> Result<(), String> {
+        self.current().configure(conn_string)
+    }
+    fn set_pat(&self, pat: &str) {
+        self.current().set_pat(pat)
+    }
+    fn simulate_connectivity(&self, online: bool) -> Result<(), String> {
+        self.current().simulate_connectivity(online)
+    }
+}
+
+/// Object-safe label accessor used by SharedPg::label (returns &'static str
+/// for every built-in adapter, avoiding lifetime issues on delegation).
+pub trait PostgresAdapterLabel {
+    fn label_of(&self) -> &'static str;
+}
+impl PostgresAdapterLabel for dyn PostgresAdapter {
+    fn label_of(&self) -> &'static str {
+        // Match by label string; all built-in labels are 'static.
+        match self.label() {
+            "rest-postgres" => "rest-postgres",
+            "postgres" => "postgres",
+            "mock-postgres" => "mock-postgres",
+            _ => "postgres",
+        }
+    }
+}
 
 /// A PostgreSQL sink. The real implementation (Rust `postgres` crate, future
 /// feature) will connect to the central DB; the mock records pushes and can be
@@ -77,6 +186,9 @@ pub trait PostgresAdapter: Send + Sync {
     fn add_missing_column(&self, _table: &str, _column_name: &str) -> Result<(), String> {
         Err("adding columns is not supported by this adapter".to_string())
     }
+    /// Store the Supabase Personal Access Token for Management API calls
+    /// (table creation, DDL). No-op for adapters that don't need it.
+    fn set_pat(&self, _pat: &str) {}
 }
 
 #[derive(Default)]
@@ -120,7 +232,21 @@ impl PostgresAdapter for MockPostgres {
         let mut acked = Vec::with_capacity(rows.len());
         let mut held = self.pushed.lock().unwrap_or_else(|e| e.into_inner());
         for row in rows {
-            let id = row["id"].as_str().unwrap_or_default().to_string();
+            // Mirror the real REST adapter's acking: plain id when present,
+            // "user_id:permission_id" for the composite-key table. Without the
+            // composite ack, mark_rows_synced can never flip those rows and
+            // they are re-pushed on every cycle.
+            let id = match row.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                Some(id) => id.to_string(),
+                None => {
+                    let uid = row.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let pid = row.get("permission_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if uid.is_empty() || pid.is_empty() {
+                        continue; // invalid row — same skip rule as the real adapter
+                    }
+                    format!("{uid}:{pid}")
+                }
+            };
             held.push((table.to_string(), id.clone(), row.clone()));
             acked.push(id);
         }
@@ -273,18 +399,312 @@ pub fn mock_sheets() -> Arc<dyn SheetsProvider> {
 }
 
 // ---------------------------------------------------------------------------
+// Two-way sync: change tracking
+// ---------------------------------------------------------------------------
+
+/// Get or create the PC identity for this machine. Returns the pc_id.
+pub fn ensure_pc_identity(conn: &Connection) -> Result<String, String> {
+    // Check if we already have a pc_id stored in app_settings
+    let existing: Option<String> = conn
+        .query_row("SELECT value FROM app_settings WHERE key = 'pc_id'", [], |r| r.get(0))
+        .ok();
+    if let Some(pc_id) = existing {
+        // Update last_seen_at
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO pc_identity (pc_id, hostname, first_seen_at, last_seen_at)
+             VALUES (?1, ?2,
+                COALESCE((SELECT first_seen_at FROM pc_identity WHERE pc_id = ?1), ?3),
+                ?3)",
+            params![pc_id, hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default(), now_iso()],
+        );
+        return Ok(pc_id);
+    }
+    // Generate new PC identity
+    let pc_id = uuid::Uuid::new_v4().to_string();
+    let hostname = hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO pc_identity (pc_id, hostname, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?3)",
+        params![pc_id, hostname, now],
+    )
+    .map_err(|e| format!("pc_identity insert failed: {e}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('pc_id', ?1)",
+        params![pc_id],
+    )
+    .map_err(|e| format!("pc_id setting failed: {e}"))?;
+    Ok(pc_id)
+}
+
+/// Get the current PC's identity. Panics if called before `ensure_pc_identity`.
+pub fn get_pc_id(conn: &Connection) -> String {
+    conn.query_row("SELECT value FROM app_settings WHERE key = 'pc_id'", [], |r| r.get(0))
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+}
+
+/// Record a mutation in the sync_log and (optionally) the offline_queue.
+///
+/// Call this AFTER every INSERT/UPDATE/DELETE on a synced table. The caller
+/// is responsible for passing the correct `record_id` — for DELETEs it's the
+/// id of the deleted row, for INSERTs/UPDATEs it's the id of the new/existing
+/// row.
+///
+/// Returns the sync_log entry id for the caller to reference.
+pub fn write_to_sync_log(
+    conn: &Connection,
+    table_name: &str,
+    record_id: &str,
+    operation: &str,
+    payload: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let log_id = uuid::Uuid::new_v4().to_string();
+    let pc_id = get_pc_id(conn);
+    let now = now_iso();
+    let payload_str = payload.map(|p| p.to_string());
+
+    conn.execute(
+        "INSERT INTO sync_log (id, table_name, record_id, operation, payload, pc_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![log_id, table_name, record_id, operation, payload_str, pc_id, now],
+    )
+    .map_err(|e| format!("sync_log insert failed: {e}"))?;
+
+    // Also add to offline_queue so the background poller will push it
+    if operation != "PULL" {
+        let payload_json = payload.map(|p| p.to_string()).unwrap_or_default();
+        let queue_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO offline_queue (id, sync_log_id, operation, table_name, record_id, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![queue_id, log_id, operation, table_name, record_id, payload_json, now],
+        )
+        .map_err(|e| format!("offline_queue insert failed: {e}"))?;
+    }
+
+    Ok(log_id)
+}
+
+/// Mark sync_log entries as pushed to cloud (called after successful push).
+pub fn mark_sync_log_pushed(conn: &Connection, table_name: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        let _ = conn.execute(
+            "UPDATE sync_log SET synced_to_cloud = 1 WHERE table_name = ?1 AND record_id = ?2",
+            params![table_name, id],
+        );
+    }
+    Ok(())
+}
+
+/// Mark offline_queue entries as sent (called after successful push).
+pub fn mark_offline_queue_sent(conn: &Connection, table_name: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        let _ = conn.execute(
+            "UPDATE offline_queue SET status = 'sent' WHERE table_name = ?1 AND record_id = ?2 AND status = 'pending'",
+            params![table_name, id],
+        );
+    }
+    Ok(())
+}
+
+/// Get pending offline_queue entries for push, ordered oldest first.
+pub fn pending_offline_entries(conn: &Connection, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT oq.id, oq.operation, oq.table_name, oq.record_id, oq.payload, oq.created_at, oq.retry_count
+             FROM offline_queue oq
+             WHERE oq.status = 'pending' AND oq.table_name NOT IN ('sync_log', 'pc_identity', 'offline_queue')
+             ORDER BY oq.created_at ASC LIMIT ?1",
+        )
+        .map_err(|e| format!("offline_queue query failed: {e}"))?;
+    let mut rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "operation": row.get::<_, String>(1)?,
+                "table_name": row.get::<_, String>(2)?,
+                "record_id": row.get::<_, String>(3)?,
+                "payload": row.get::<_, String>(4).unwrap_or_default(),
+                "created_at": row.get::<_, String>(5)?,
+                "retry_count": row.get::<_, i64>(6)?,
+            }))
+        })
+        .map_err(|e| format!("offline_queue query failed: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().transpose().map_err(|e| format!("offline_queue iter failed: {e}"))? {
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Record a failed push attempt in the offline_queue.
+pub fn mark_offline_queue_error(conn: &Connection, queue_id: &str, error: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE offline_queue SET retry_count = retry_count + 1, last_error = ?1,
+         status = CASE WHEN retry_count >= 10 THEN 'failed' ELSE 'pending' END
+         WHERE id = ?2",
+        params![error, queue_id],
+    )
+    .map_err(|e| format!("offline_queue error update failed: {e}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pull protocol helpers
+// ---------------------------------------------------------------------------
+
+/// Get the last pull timestamp for a table (stored in app_settings).
+pub fn get_last_pull_timestamp(conn: &Connection, table_name: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![format!("pg_last_pull_{table_name}")],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Set the last pull timestamp for a table.
+pub fn set_last_pull_timestamp(conn: &Connection, table_name: &str, ts: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
+        params![format!("pg_last_pull_{table_name}"), ts],
+    )
+    .map_err(|e| format!("set last pull timestamp failed: {e}"))?;
+    Ok(())
+}
+
+/// Apply a pulled row from cloud to local DB with conflict resolution.
+/// Returns Ok(true) if the row was applied, Ok(false) if skipped (local is newer).
+pub fn apply_pulled_row(
+    conn: &Connection,
+    table_name: &str,
+    row: &serde_json::Value,
+) -> Result<bool, String> {
+    let record_id = row["id"].as_str().unwrap_or_default();
+    if record_id.is_empty() {
+        return Ok(false);
+    }
+    let remote_updated = row["updated_at"].as_str().unwrap_or("");
+
+    // Check if record exists locally and get local updated_at
+    let local_updated: Option<String> = conn
+        .query_row(
+            &format!("SELECT updated_at FROM {table_name} WHERE id = ?1"),
+            params![record_id],
+            |r| r.get(0),
+        )
+        .ok();
+
+    match local_updated {
+        Some(ref local_ts) if local_ts.as_str() >= remote_updated => {
+            // Local is same age or newer — skip (local wins)
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    // Apply the row — upsert
+    let cols: Vec<String> = row
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    if cols.is_empty() {
+        return Ok(false);
+    }
+    let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+    let col_names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+    let sql = format!(
+        "INSERT INTO {table_name} ({}) VALUES ({}) ON CONFLICT(id) DO UPDATE SET {}",
+        col_names.join(", "),
+        placeholders.join(", "),
+        col_names
+            .iter()
+            .skip(1) // skip id
+            .map(|c| format!("{c} = excluded.{c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for c in &col_names {
+        match row.get(*c) {
+            Some(serde_json::Value::String(s)) => values.push(Box::new(s.clone())),
+            Some(serde_json::Value::Number(n)) => {
+                if let Some(i) = n.as_i64() {
+                    values.push(Box::new(i));
+                } else if let Some(f) = n.as_f64() {
+                    values.push(Box::new(f));
+                } else {
+                    values.push(Box::new(0i64));
+                }
+            }
+            Some(serde_json::Value::Bool(b)) => values.push(Box::new(*b as i64)),
+            _ => values.push(Box::new(None::<String>)),
+        }
+    }
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+    conn.execute(&sql, params_refs.as_slice())
+        .map_err(|e| format!("pull upsert {table_name} failed: {e}"))?;
+    // Mark as synced locally
+    let _ = conn.execute(
+        &format!("UPDATE {table_name} SET synced = 1 WHERE id = ?1"),
+        params![record_id],
+    );
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Postgres sync engine
 // ---------------------------------------------------------------------------
 
 /// Syncable tables (all carry the `synced` flag). Order matters: reference data
 /// first, trips last, so central never receives a trip before its vehicle.
+/// Tables are split into tiers: core entities first, then config/permissions,
+/// then audit/logging last.
 pub const PG_SYNC_TABLES: &[(&str, &str)] = &[
+    // ── Tier 1: core reference data ──
+    ("organizations", "Organization"),
     ("companies", "Companies"),
     ("drivers", "Drivers"),
     ("vehicles", "Vehicles"),
     ("users", "Users"),
+    // ── Tier 2: permissions & role config ──
+    ("permissions", "Permissions"),
+    ("user_permissions", "User Permissions"),
+    ("role_presets", "Role Presets"),
+    // ── Tier 3: org config (field definitions, integrations, ANPR, cameras, ML) ──
+    ("field_definitions", "Field Definitions"),
+    ("integrations", "Integrations"),
+    ("anpr_config", "ANPR Config"),
+    ("camera_sources", "Camera Sources"),
+    ("model_versions", "Model Versions"),
+    ("training_candidates", "Training Candidates"),
+    // ── Tier 4: trips (depends on vehicles, drivers, users) ──
     ("trips", "Trips"),
+    // ── Tier 5: audit & health (append-only, no FK dependencies) ──
+    ("audit_log", "Audit Log"),
+    ("system_health_events", "System Health Events"),
 ];
+
+/// Pick a valid ORDER BY column for the table. Not all sync tables have
+/// `created_at` (permissions, user_permissions, role_presets, audit_log and
+/// system_health_events were migrated with `updated_at`/`timestamp` only),
+/// and a hard-coded `ORDER BY created_at` made collect fail with
+/// "no such column: created_at" — leaving those tables pending forever.
+fn order_clause_for(conn: &Connection, table: &str) -> String {
+    let columns: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    for candidate in ["created_at", "updated_at", "timestamp", "granted_at", "detected_at"] {
+        if columns.iter().any(|c| c == candidate) {
+            return format!(" ORDER BY {candidate} ASC");
+        }
+    }
+    String::new()
+}
 
 fn rows_where_not_synced(conn: &Connection, table: &str) -> Result<Vec<serde_json::Value>, String> {
     // Trips must have BOTH entry AND exit before pushing to Supabase.
@@ -294,7 +714,8 @@ fn rows_where_not_synced(conn: &Connection, table: &str) -> Result<Vec<serde_jso
     } else {
         "synced = 0"
     };
-    let sql = format!("SELECT * FROM {table} WHERE {where_clause} ORDER BY created_at ASC");
+    let order_clause = order_clause_for(conn, table);
+    let sql = format!("SELECT * FROM {table} WHERE {where_clause}{order_clause}");
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("{table} scan failed: {e}"))?;
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query([]).map_err(|e| format!("{table} scan failed: {e}"))?;
@@ -337,9 +758,10 @@ pub fn run_pg_sync_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<S
             if !rows.is_empty() {
                 // Push failure is non-fatal — skip this table, rows stay pending for next cycle.
                 if let Ok(ids) = pg.push_rows(name, &rows) {
-                    for id in &ids {
-                        conn.execute(&format!("UPDATE {name} SET synced = 1 WHERE id = ?1"), params![id])
-                            .map_err(|e| format!("{name} flag flip failed: {e}"))?;
+                    // Reuse mark_rows_synced (handles user_permissions composite key).
+                    // Errors are non-fatal here — rows stay pending and retry next cycle.
+                    if let Err(e) = mark_rows_synced(conn, name, &ids) {
+                        crate::log::log(&format!("[sync] {name} flag flip failed: {e}"));
                     }
                     acked = ids.len() as i64;
                 }
@@ -441,12 +863,78 @@ pub fn push_rows_to_central(pg: &dyn PostgresAdapter, table: &str, rows: &[serde
 }
 
 /// Phase 3 (lock): mark rows as synced after successful push.
+/// Handles the composite-key table user_permissions (no id column) whose
+/// acked ids are "user_id:permission_id" — without this, the flag flip
+/// failed with "no such column: id" and rows were re-pushed forever.
 pub fn mark_rows_synced(conn: &Connection, table: &str, ids: &[String]) -> Result<(), String> {
     for id in ids {
-        conn.execute(&format!("UPDATE {table} SET synced = 1 WHERE id = ?1"), params![id])
-            .map_err(|e| format!("{table} flag flip failed: {e}"))?;
+        if table == "user_permissions" {
+            let parts: Vec<&str> = id.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                conn.execute(
+                    "UPDATE user_permissions SET synced = 1 WHERE user_id = ?1 AND permission_id = ?2",
+                    params![parts[0], parts[1]],
+                )
+                .map_err(|e| format!("user_permissions flag flip failed: {e}"))?;
+            }
+        } else {
+            conn.execute(&format!("UPDATE {table} SET synced = 1 WHERE id = ?1"), params![id])
+                .map_err(|e| format!("{table} flag flip failed: {e}"))?;
+        }
     }
     Ok(())
+}
+
+/// Load the CURRENT full row for a sync-log/offline-queue record id.
+/// The stored queue payload may be stale or partial (e.g. user_permissions
+/// entries carry only user_id/permission_id/granted_by and are missing
+/// granted_at, which the central table requires NOT NULL) — so the replay
+/// path should push the authoritative local row instead.
+/// Returns None when the row no longer exists locally.
+pub fn load_row_by_record_id(conn: &Connection, table: &str, record_id: &str) -> Result<Option<serde_json::Value>, String> {
+    let (sql, key_params): (String, Vec<String>) = if table == "user_permissions" {
+        let parts: Vec<&str> = record_id.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Ok(None);
+        }
+        (
+            "SELECT * FROM user_permissions WHERE user_id = ?1 AND permission_id = ?2".to_string(),
+            vec![parts[0].to_string(), parts[1].to_string()],
+        )
+    } else {
+        (
+            format!("SELECT * FROM {table} WHERE id = ?1"),
+            vec![record_id.to_string()],
+        )
+    };
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("{table} lookup failed: {e}"))?;
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(key_params.iter()))
+        .map_err(|e| format!("{table} lookup failed: {e}"))?;
+    match rows.next().map_err(|e| format!("{table} lookup failed: {e}"))? {
+        None => Ok(None),
+        Some(row) => {
+            let mut obj = serde_json::Map::new();
+            for (i, name) in names.iter().enumerate() {
+                match row.get_ref(i).map_err(|e| format!("{table} read failed: {e}"))? {
+                    ValueRef::Null => {
+                        obj.insert(name.clone(), serde_json::Value::Null);
+                    }
+                    ValueRef::Integer(n) => {
+                        obj.insert(name.clone(), serde_json::json!(n));
+                    }
+                    ValueRef::Real(f) => {
+                        obj.insert(name.clone(), serde_json::json!(f));
+                    }
+                    ValueRef::Text(t) => {
+                        obj.insert(name.clone(), serde_json::Value::String(String::from_utf8_lossy(t).into_owned()));
+                    }
+                    ValueRef::Blob(_) => {}
+                }
+            }
+            Ok(Some(serde_json::Value::Object(obj)))
+        }
+    }
 }
 
 /// Phase 1 (NO lock): fetch rows from central DB via network.
@@ -533,9 +1021,17 @@ pub fn get_date_range_presets() -> Vec<DateRangePreset> {
 
 /// Pull reference data (companies, vehicles, drivers) from central DB.
 /// Uses last-edit-wins-by-timestamp: if the central row is newer than the
-/// local row, the central version wins. Local edits that haven't been pushed
-/// yet are preserved (they'll push on next sync).
-pub const REFERENCE_TABLES: &[&str] = &["companies", "drivers", "vehicles"];
+/// Tables that are pulled from central. Every sync table that carries an
+/// `updated_at` column is included here — the pull protocol queries central
+/// for rows newer than the last pull timestamp and upserts them locally.
+/// Order doesn't matter for pulls (upserts are idempotent).
+pub const REFERENCE_TABLES: &[&str] = &[
+    "organizations", "companies", "drivers", "vehicles", "users",
+    "permissions", "user_permissions", "role_presets",
+    "field_definitions", "integrations",
+    "anpr_config", "camera_sources", "model_versions", "training_candidates",
+    "trips", "audit_log", "system_health_events",
+];
 
 pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<PullResult, String> {
     if !pg.connected() {
@@ -865,7 +1361,7 @@ fn pending_sheets_trips(conn: &Connection) -> Result<i64, String> {
          WHERE status = 'logged'
            AND (capture_method = 'auto' OR is_discharge_trip = 1)
            AND (
-             (sheet_row IS NULL)
+             (sheet_row IS NULL AND pushed_to_sheets = 0)
              OR (sheet_row IS NOT NULL AND sheet_exit_pushed = 0 AND exit_time IS NOT NULL)
            )",
         [],
@@ -876,10 +1372,16 @@ fn pending_sheets_trips(conn: &Connection) -> Result<i64, String> {
 
 fn sheet_trip_rows_filtered(conn: &Connection, has_sheet_row: bool) -> Result<Vec<serde_json::Value>, String> {
     let row_filter = if has_sheet_row {
-        // Exit updates: trip is already in the sheet but exit hasn't been pushed yet.
-        "t.sheet_row IS NOT NULL AND t.sheet_exit_pushed = 0"
+        // Exit updates: trip is already in the sheet, its exit has been
+        // recorded locally, but the exit hasn't been pushed yet. Open trips
+        // (no exit yet) must NOT match — otherwise every cycle re-pushes the
+        // still-open trip as a bogus "exit update" with a NULL exit_time.
+        "t.sheet_row IS NOT NULL AND t.sheet_exit_pushed = 0 AND t.exit_time IS NOT NULL"
     } else {
-        "t.sheet_row IS NULL"
+        // New rows: never pushed before. The pushed_to_sheets guard is what
+        // stops re-appending a trip whose sheet_row stayed NULL (row number
+        // not parsed from the ack) — the infinite-duplication bug.
+        "t.sheet_row IS NULL AND t.pushed_to_sheets = 0"
     };
     let sql = format!(
         "SELECT t.id, COALESCE(v.plate_number, json_extract(t.resolution_notes, '$.plate'), '') AS plate,
@@ -1643,20 +2145,20 @@ pub fn push_company_config(state: &AppState, company_id: &str) -> Result<(), Str
     if !state.pg.configured() || !state.pg.connected() {
         return Ok(()); // Not connected, skip
     }
-    
+
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    
+
     // Read local config
     let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
     let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
     let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
     let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
-    
+
     // Push to PostgreSQL
     let sql = format!(
         "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
          VALUES ('{}', '{}', '{}', '{}', {}, '{}')
-         ON CONFLICT (company_id) DO UPDATE SET 
+         ON CONFLICT (company_id) DO UPDATE SET
              pg_connection_string = EXCLUDED.pg_connection_string,
              sheets_id = EXCLUDED.sheets_id,
              sheets_frequency = EXCLUDED.sheets_frequency,
@@ -1669,15 +2171,54 @@ pub fn push_company_config(state: &AppState, company_id: &str) -> Result<(), Str
         anpr_enabled,
         pg_literal_string(&crate::db::now_iso()),
     );
-    
+
     drop(conn);
     state.pg.query_rows(&sql, &[]).map_err(|e| format!("Failed to push config: {e}"))?;
-    
+
+    Ok(())
+}
+
+/// Raw version for pushing company config from background threads (takes pg adapter directly).
+pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Connection>>, company_id: &str) -> Result<(), String> {
+    if !pg.configured() || !pg.connected() {
+        return Ok(()); // Not connected, skip
+    }
+
+    let conn = db.lock().map_err(|e| e.to_string())?;
+
+    // Read local config
+    let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
+    let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
+    let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
+    let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
+
+    // Push to PostgreSQL
+    let sql = format!(
+        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, updated_at)
+         VALUES ('{}', '{}', '{}', '{}', {}, '{}')
+         ON CONFLICT (company_id) DO UPDATE SET
+             pg_connection_string = EXCLUDED.pg_connection_string,
+             sheets_id = EXCLUDED.sheets_id,
+             sheets_frequency = EXCLUDED.sheets_frequency,
+             anpr_enabled = EXCLUDED.anpr_enabled,
+             updated_at = EXCLUDED.updated_at",
+        pg_literal_string(company_id),
+        pg_literal_string(&pg_conn_str),
+        pg_literal_string(&sheets_id),
+        pg_literal_string(&sheets_freq),
+        anpr_enabled,
+        pg_literal_string(&crate::db::now_iso()),
+    );
+
+    drop(conn);
+    pg.query_rows(&sql, &[]).map_err(|e| format!("Failed to push config: {e}"))?;
+
     Ok(())
 }
 
 /// Raw version for use in background threads (takes individual parameters).
 pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Connection>>, company_id: &str) -> Result<(), String> {
+    // NOTE: callers holding Arc<SharedPg> must pass .get() — see configure_postgres.
     if !pg.configured() || !pg.connected() {
         return Ok(()); // Not connected, skip
     }
@@ -1742,6 +2283,10 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
 /// types are chosen so numbers/booleans stay queryable for Phase 5 reporting.
 fn pg_column_type(table: &str, col: &str) -> &'static str {
     match table {
+        "organizations" => match col {
+            "synced" => "INTEGER",
+            _ => "TEXT",
+        },
         "companies" | "drivers" => match col {
             "synced" => "INTEGER",
             _ => "TEXT",
@@ -1787,6 +2332,9 @@ pub fn pg_literal_string(s: &str) -> String {
 
 fn base_columns(table: &str) -> Vec<&'static str> {
     match table {
+        "organizations" => {
+            vec!["id", "name", "created_at", "updated_at", "synced"]
+        }
         "companies" | "drivers" => {
             vec!["id", "name", "status", "extra_fields", "created_at", "updated_at", "synced"]
         }
@@ -2008,6 +2556,23 @@ fn push_rows_impl(
     // "column does not exist", which is non-fatal - the error is logged
     // and the next sync cycle retries. Missing columns can be added
     // manually via Supabase SQL Editor if needed.
+
+    // Filter out rows with null/empty id — PostgreSQL NOT NULL constraint would reject them.
+    let valid_rows: Vec<&serde_json::Value> = rows.iter()
+        .filter(|r| {
+            r.get("id")
+                .map(|v| !v.is_null() && !v.as_str().map_or(false, |s| s.is_empty()))
+                .unwrap_or(false)
+        })
+        .collect();
+    let skipped = rows.len() - valid_rows.len();
+    if skipped > 0 {
+        crate::log::log(&format!("[sync] push_rows_impl {table}: skipped {skipped} rows with null/empty id"));
+    }
+    if valid_rows.is_empty() {
+        return Ok(vec![]);
+    }
+
     let base = base_columns(table);
     // Phase 2: batch upsert — multi-row INSERT for speed.
     // Collect the union of ALL column names across all rows, then
@@ -2059,10 +2624,10 @@ fn push_rows_impl(
     // 2. Process rows in batches.
     let mut all_acked: Vec<String> = Vec::new();
     let mut error_count = 0u32;
-    let total_rows = rows.len();
+    let total_rows = valid_rows.len();
     for batch_start in (0..total_rows).step_by(BATCH_SIZE) {
         let batch_end = (batch_start + BATCH_SIZE).min(total_rows);
-        let batch = &rows[batch_start..batch_end];
+        let batch = &valid_rows[batch_start..batch_end];
         let batch_len = batch.len();
 
         // Build placeholders: ($1, $2, ...$C), ($C+1, ..., $(2*C)), ...
@@ -3532,13 +4097,51 @@ impl SheetsProvider for RealSheets {
 // This is faster and more resilient than PgBouncer for unstable connections
 // ---------------------------------------------------------------------------
 
-/// Introspect local SQLite schema and generate CREATE TABLE statements for Supabase.
-/// This dynamically creates tables that match each company's actual data structure -
-/// no hardcoded schema, so different companies with different fields are supported.
-/// DEPRECATED: Tables are pre-created by running SUPABASE_SETUP.sql. Kept for future use.
-#[allow(dead_code)]
-fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
+/// Introspect local SQLite schema and generate PostgreSQL CREATE TABLE statements
+/// for Supabase. Dynamically creates tables that match the actual local data structure.
+///
+/// This generates the full cloud schema including:
+/// - CREATE TABLE with correct types, NOT NULL, DEFAULT, PRIMARY KEY
+/// - FOREIGN KEY constraints (DEFERRABLE for sync ordering)
+/// - UNIQUE INDEXes (from SQLite UNIQUE constraints)
+/// - Secondary INDEXes
+/// - GRANT statements for anon/authenticated roles
+/// - RLS lockdown (the app authenticates with the service_role key, which
+///   bypasses RLS, so enabling RLS with no policies blocks anonymous access
+///   without affecting the app)
+///
+/// Tables are filtered to only syncable tables (PG_SYNC_TABLES + sync infrastructure).
+
+/// RLS hardening appended to every generated schema. The app talks to Supabase
+/// exclusively with the service_role key (bypasses RLS), so enabling RLS with
+/// zero policies denies the anon/public key while leaving the app unaffected.
+pub const RLS_LOCKDOWN_SQL: &str = r#"
+
+-- ============================================================
+-- ROW LEVEL SECURITY (lockdown)
+-- The app uses the service_role key, which bypasses RLS.
+-- Enabling RLS with no policies denies the public `anon` key
+-- so your data is not readable by anyone holding the project URL.
+-- ============================================================
+DO $$
+DECLARE t text;
+BEGIN
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', t);
+  END LOOP;
+END $$;
+"#;
+
+pub fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
     let mut sql = String::new();
+    sql.push_str("-- TruckFlow Cloud Schema (auto-generated from local SQLite)\n");
+    sql.push_str("-- Run in Supabase Dashboard → SQL Editor → New Query\n\n");
+
+    // Collect syncable table names for filtering
+    let syncable: std::collections::HashSet<&str> = PG_SYNC_TABLES.iter().map(|(t, _)| *t).collect();
+    // Include sync infrastructure tables
+    let infra_tables = ["sync_log", "pc_identity", "offline_queue", "app_settings"];
 
     // Get all tables from local SQLite
     let mut tables_stmt = conn
@@ -3551,22 +4154,28 @@ fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
         .filter_map(|r| r.ok())
         .collect();
 
-    for table_name in table_names {
+    for table_name in &table_names {
+        // Only include syncable tables and infrastructure tables
+        if !syncable.contains(table_name.as_str()) && !infra_tables.contains(&table_name.as_str()) {
+            continue;
+        }
+
         // Get columns for this table
         let pragma_sql = format!("PRAGMA table_info(\"{}\")", table_name);
         let mut col_stmt = conn.prepare(&pragma_sql)
             .map_err(|e| format!("Failed to query columns for {table_name}: {e}"))?;
 
-        let columns: Vec<(String, String, bool, Option<String>)> = col_stmt
+        let columns: Vec<(String, String, bool, Option<String>, bool)> = col_stmt
             .query_map([], |r| {
                 Ok((
-                    r.get::<_, String>(1)?,  // name
-                    r.get::<_, String>(2)?,  // type
-                    r.get::<_, bool>(3)?,    // notnull
-                    r.get::<_, Option<String>>(4)?,  // dflt_value
+                    r.get::<_, String>(1)?,      // name
+                    r.get::<_, String>(2)?,      // type
+                    r.get::<_, bool>(3)?,        // notnull
+                    r.get::<_, Option<String>>(4)?, // dflt_value
+                    r.get::<_, bool>(5)?,        // pk (primary key flag)
                 ))
             })
-            .map_err(|e| format!("Failed to read columns: {e}"))?
+            .map_err(|e| format!("Failed to read columns: {table_name}: {e}"))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -3576,30 +4185,80 @@ fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
 
         // Map SQLite types to PostgreSQL types
         let mut col_defs = Vec::new();
-        for (name, sql_type, notnull, default) in &columns {
+        for (name, sql_type, notnull, default, pk) in &columns {
+            // Skip PRIMARY KEY from column def — we add it at the end
             let pg_type = match sql_type.to_uppercase().as_str() {
-                "INTEGER" => "BIGINT",
-                "REAL" => "DOUBLE PRECISION",
-                "TEXT" => "TEXT",
-                "BLOB" => "BYTEA",
+                "INTEGER" | "INT" | "BIGINT" => {
+                    // Detect boolean-like INTEGER columns
+                    match name.as_str() {
+                        "synced" | "archived" | "is_discharge_trip" | "pushed_to_sheets"
+                        | "sheet_exit_pushed" | "tracked" | "is_capture_point"
+                        | "prefer_cloud" | "discharge_confirmation_required"
+                        | "save_recognition_images" | "notification_sound"
+                        | "must_change_password" | "is_live" => "INTEGER",
+                        _ => "BIGINT",
+                    }
+                }
+                "REAL" | "FLOAT" | "DOUBLE" | "DOUBLE PRECISION" => "DOUBLE PRECISION",
+                "TEXT" | "VARCHAR" | "CHAR" | "CLOB" => "TEXT",
+                "BLOB" | "BINARY" | "VARBINARY" => "BYTEA",
                 "BOOLEAN" => "BOOLEAN",
                 "DATETIME" | "TIMESTAMP" => "TIMESTAMPTZ",
-                _ => "TEXT", // Default to TEXT for unknown types
+                "NUMERIC" | "DECIMAL" => "DOUBLE PRECISION",
+                _ => "TEXT",
             };
 
             let mut col_def = format!("    \"{}\" {}", name, pg_type);
-            if *notnull && name != "id" {
+            // PRIMARY KEY columns are always NOT NULL in PostgreSQL, regardless of the
+            // SQLite notnull flag (SQLite allows NULL in TEXT PRIMARY KEY).
+            if *pk || (*notnull && !*pk) {
                 col_def.push_str(" NOT NULL");
             }
             if let Some(def) = default {
-                col_def.push_str(&format!(" DEFAULT {}", def));
+                // Quote TEXT defaults that aren't numeric or SQL functions
+                let is_sql_function = def.contains('(') && def.contains(')');
+                let is_timestamp_literal = def.starts_with('\'')
+                    && (def.contains("T") || def.contains("-") || def.contains(":"))
+                    && def.len() > 15;
+                let is_now_placeholder = def.eq_ignore_ascii_case("'{now}'");
+                let needs_quote = !def.starts_with('\'')
+                    && !def.parse::<f64>().is_ok()
+                    && !is_sql_function
+                    && !def.to_uppercase().contains("CURRENT_TIMESTAMP")
+                    && def != "0" && def != "1"
+                    && !is_now_placeholder;
+                if needs_quote {
+                    col_def.push_str(&format!(" DEFAULT '{}'", def.replace('\'', "''")));
+                } else if is_sql_function {
+                    // SQL functions like now() must be wrapped in parens for PostgreSQL DEFAULT
+                    col_def.push_str(&format!(" DEFAULT ({})", def));
+                } else if is_timestamp_literal {
+                    // Literal ISO8601 timestamps (e.g. '2026-09-07T09:09:02Z') from migrations
+                    // should become CURRENT_TIMESTAMP in PostgreSQL so rows get real insertion time.
+                    col_def.push_str(" DEFAULT (now())");
+                } else if is_now_placeholder {
+                    // The '{now}' placeholder from SQLite migrations → now() for PostgreSQL
+                    col_def.push_str(" DEFAULT (now())");
+                } else {
+                    col_def.push_str(&format!(" DEFAULT {}", def));
+                }
+            } else if name == "updated_at" {
+                // Columns named updated_at that have no explicit default (from ALTER TABLE
+                // migrations where SQLite doesn't preserve the default in PRAGMA table_info)
+                // should get now() so PostgreSQL rows always get a real insertion timestamp.
+                col_def.push_str(" DEFAULT (now())");
             }
             col_defs.push(col_def);
         }
 
-        // PRIMARY KEY on id column
-        if columns.iter().any(|(n, _, _, _)| n == "id") {
-            col_defs.push("    PRIMARY KEY (\"id\")".to_string());
+        // PRIMARY KEY
+        let pk_cols: Vec<&str> = columns.iter()
+            .filter(|(_, _, _, _, pk)| *pk)
+            .map(|(name, _, _, _, _)| name.as_str())
+            .collect();
+        if !pk_cols.is_empty() {
+            let pk_defs: Vec<String> = pk_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+            col_defs.push(format!("    PRIMARY KEY ({})", pk_defs.join(", ")));
         }
 
         let create_sql = format!(
@@ -3608,13 +4267,163 @@ fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
             col_defs.join(",\n")
         );
         sql.push_str(&create_sql);
+
+        // Collect UNIQUE constraints (from SQLite unique indexes)
+        let idx_sql = format!("PRAGMA index_list(\"{}\")", table_name);
+        let mut idx_stmt = conn.prepare(&idx_sql)
+            .map_err(|e| format!("Failed to query indexes for {table_name}: {e}"))?;
+        let indexes: Vec<(String, bool)> = idx_stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))
+            .map_err(|e| format!("Failed to read indexes: {table_name}: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (idx_name, unique) in &indexes {
+            if *unique {
+                // Get indexed columns
+                let col_sql = format!("PRAGMA index_info(\"{}\")", idx_name);
+                let mut col_stmt = conn.prepare(&col_sql)
+                    .map_err(|e| format!("Failed to query index columns: {e}"))?;
+                let idx_cols: Vec<String> = col_stmt
+                    .query_map([], |r| r.get::<_, String>(2))
+                    .map_err(|e| format!("Failed to read index columns: {e}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                if !idx_cols.is_empty() {
+                    let col_list: Vec<String> = idx_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+                    sql.push_str(&format!(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON public.\"{}\" ({});\n",
+                        idx_name, table_name, col_list.join(", ")
+                    ));
+                }
+            }
+        }
+
+        // FK constraints are generated in a separate pass below
     }
 
-    // Grant access
+    // Generate FK constraints with DEFERRABLE
+    // Query FK list again for the actual from-column names
+    let mut fk_sql_stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .map_err(|e| format!("Failed to query tables for FK: {e}"))?;
+    let all_tables: Vec<String> = fk_sql_stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| format!("Failed to read tables: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut fk_ddl = Vec::new();
+    for table_name in &all_tables {
+        if !syncable.contains(table_name.as_str()) && !infra_tables.contains(&table_name.as_str()) {
+            continue;
+        }
+        let fk_list_sql = format!("PRAGMA foreign_key_list(\"{}\")", table_name);
+        let mut fk_list_stmt = conn.prepare(&fk_list_sql)
+            .map_err(|e| format!("Failed to query FK list for {table_name}: {e}"))?;
+        let fks: Vec<(String, String, String)> = fk_list_stmt
+            .query_map([], |r| Ok((
+                r.get::<_, String>(3)?,  // from_col
+                r.get::<_, String>(2)?,  // ref_table
+                r.get::<_, String>(4)?,  // ref_col
+            )))
+            .map_err(|e| format!("Failed to read FK list: {table_name}: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (from_col, ref_table, ref_col) in fks {
+            if syncable.contains(ref_table.as_str()) || infra_tables.contains(&ref_table.as_str()) {
+                fk_ddl.push(format!(
+                    "ALTER TABLE public.\"{}\" ADD CONSTRAINT {}_{}_fkey FOREIGN KEY (\"{}\") REFERENCES public.\"{}\" (\"{}\") DEFERRABLE INITIALLY DEFERRED;",
+                    table_name, table_name, from_col, from_col, ref_table, ref_col
+                ));
+            }
+        }
+    }
+
+    if !fk_ddl.is_empty() {
+        sql.push_str("\n-- ============================================================\n");
+        sql.push_str("-- FK CONSTRAINTS (DEFERRABLE for sync ordering)\n");
+        sql.push_str("-- ============================================================\n\n");
+        sql.push_str("DO $$\nBEGIN\n");
+        for fk in &fk_ddl {
+            // Extract constraint name for DROP IF EXISTS
+            if let Some(constraint_name) = fk.split("ADD CONSTRAINT ").nth(1).and_then(|s| s.split(' ').next()) {
+                sql.push_str(&format!("  BEGIN ALTER TABLE public.\"{}\" DROP CONSTRAINT IF EXISTS {}; EXCEPTION WHEN OTHERS THEN NULL; END;\n",
+                    table_name_for_fk(fk), constraint_name));
+            }
+        }
+        sql.push_str("\n");
+        for fk in &fk_ddl {
+            sql.push_str(&format!("  {}\n", fk));
+        }
+        sql.push_str("END $$;\n\n");
+    }
+
+    // Generate secondary indexes for frequently queried columns
+    sql.push_str("-- ============================================================\n");
+    sql.push_str("-- INDEXES\n");
+    sql.push_str("-- ============================================================\n\n");
+
+    let index_statements = [
+        ("vehicles", "plate_number", "idx_vehicles_plate"),
+        ("trips", "time_in", "idx_trips_time_in"),
+        ("trips", "status", "idx_trips_status"),
+        ("trips", "entry_time", "idx_trips_entry_time"),
+        ("trips", "trip_status", "idx_trips_trip_status"),
+        ("model_versions", "component", "idx_model_versions_component"),
+        ("sync_log", "table_name", "idx_sync_log_table"),
+        ("training_candidates", "source_trip_id", "idx_training_candidates_trip"),
+    ];
+
+    for (table, column, idx_name) in &index_statements {
+        if syncable.contains(table) || infra_tables.contains(table) {
+            sql.push_str(&format!(
+                "CREATE INDEX IF NOT EXISTS {} ON public.\"{}\" (\"{}\");\n",
+                idx_name, table, column
+            ));
+        }
+    }
+
+    // GRANT statements
+    sql.push_str("\n-- ============================================================\n");
+    sql.push_str("-- ACCESS & SCHEMA RELOAD\n");
+    sql.push_str("-- ============================================================\n\n");
+
     sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n");
-    sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;\n");
+    sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;\n\n");
+
+    sql.push_str("CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()\n");
+    sql.push_str("RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$\n");
+    sql.push_str("BEGIN\n");
+    sql.push_str("  NOTIFY pgrst, 'reload schema cache';\n");
+    sql.push_str("END;\n");
+    sql.push_str("$$;\n\n");
+    sql.push_str("GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;\n");
+
+    // Per-user profile view for the Supabase dashboard: one row per user with
+    // their resolved role preset name (matched against role_presets.permission_ids),
+    // their complete permission map (key + description + who granted it and
+    // when). Change history lives in audit_log (also synced). Intentionally NO
+    // GRANT on this view: views execute with their owner's rights, so granting
+    // it to anon would bypass the RLS lockdown below. Only service_role reads it.
+    sql.push_str("\n-- ============================================================\n");
+    sql.push_str("-- USER PROFILES VIEW (read-only, service_role only — not granted to anon)\n");
+    sql.push_str("-- ============================================================\n\n");
+    sql.push_str("CREATE OR REPLACE VIEW public.user_profiles AS\nSELECT\n  u.id AS user_id,\n  u.name AS user_name,\n  u.status,\n  u.auth_type,\n  u.organization_id,\n  o.name AS organization_name,\n  u.company_id,\n  u.must_change_password,\n  u.created_at,\n  rp.name AS role_name,\n  (\n    SELECT json_agg(json_build_object(\n      'key', p.key,\n      'description', p.description,\n      'min_auth_level', p.min_auth_level,\n      'granted_at', up.granted_at,\n      'granted_by', up.granted_by\n    ) ORDER BY p.key)\n    FROM public.user_permissions up\n    LEFT JOIN public.permissions p ON p.id = up.permission_id\n    WHERE up.user_id = u.id\n  ) AS permissions\nFROM public.users u\nLEFT JOIN public.organizations o ON o.id = u.organization_id\nLEFT JOIN public.companies c ON c.id = u.company_id\nLEFT JOIN public.role_presets rp ON (\n  -- Set equality regardless of key order: normalize both sides\n  SELECT COALESCE(string_agg(DISTINCT trim(k.key), ',' ORDER BY trim(k.key)), '')\n  FROM unnest(string_to_array(rp.permission_ids, ',')) AS k(key)\n) = (\n  SELECT COALESCE(string_agg(DISTINCT p3.key, ',' ORDER BY p3.key), '')\n  FROM public.user_permissions up3\n  JOIN public.permissions p3 ON p3.id = up3.permission_id\n  WHERE up3.user_id = u.id\n);\n\n");
+
+    // RLS lockdown: deny the anon/public key entirely (the app uses service_role)
+    sql.push_str(RLS_LOCKDOWN_SQL);
 
     Ok(sql)
+}
+
+/// Helper to extract table name from a FK DDL statement for the DROP block.
+fn table_name_for_fk(fk_ddl: &str) -> &str {
+    fk_ddl.split("ALTER TABLE public.\"").nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("unknown")
 }
 
 /// REST adapter config: "REST|URL|SERVICE_ROLE_KEY"
@@ -3625,6 +4434,35 @@ pub struct RestConfig {
     pub service_role_key: String,
     pub project_ref: String,
     pub pat: Option<String>,
+}
+
+/// Normalize a Supabase base URL so PostgREST calls always hit /rest/v1.
+/// Users (and older installs) paste `https://xxx.supabase.co` while the sync
+/// engine expects `https://xxx.supabase.co/rest/v1`; a bare URL makes every
+/// push return 404 {"error":"requested path is invalid"}. Strips any trailing
+/// slash, an existing /rest/v1 suffix, or a /rest/v1/... path back to the
+/// project origin, then appends /rest/v1 exactly once.
+pub fn normalize_supabase_rest_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let origin = if let Some(pos) = trimmed.find("/rest/v1") {
+        trimmed[..pos].to_string()
+    } else if let Some(pos) = trimmed.find("/rest") {
+        trimmed[..pos].to_string()
+    } else {
+        // Also tolerate a pasted PostgREST root that is not Supabase-shaped:
+        // anything after the host is treated as a path prefix to drop.
+        match trimmed.find("://") {
+            Some(proto_end) => {
+                let after = &trimmed[proto_end + 3..];
+                match after.find('/') {
+                    Some(slash) => trimmed[..proto_end + 3 + slash].to_string(),
+                    None => trimmed.to_string(),
+                }
+            }
+            None => trimmed.to_string(),
+        }
+    };
+    format!("{origin}/rest/v1")
 }
 
 impl RestConfig {
@@ -3644,6 +4482,10 @@ impl RestConfig {
 
         let url = parts[0].trim_end_matches('/').to_string();
         let service_role_key = parts[1].to_string();
+
+        // Normalize the URL so PostgREST calls always hit /rest/v1 — whether
+        // the saved string came from login (bare project URL) or the SyncPanel.
+        let url = normalize_supabase_rest_url(&url);
 
         // Extract project ref from URL: https://[project-ref].supabase.co/rest/v1
         let project_ref = if let Some(start) = url.find("://") {
@@ -3709,19 +4551,20 @@ impl RestPostgres {
     /// Push rows using Supabase REST API with automatic retries
     /// Dynamically discovers remote columns and only sends those that match
     fn push_rows_impl(&self, table: &str, rows: &[serde_json::Value]) -> Result<Vec<String>, String> {
-        let config = self.config.lock().map_err(|e| e.to_string())?;
-        let config = config.as_ref().ok_or("REST not configured")?;
+        // CRITICAL: Extract config values and IMMEDIATELY drop the MutexGuard.
+        // We must not hold self.config.lock() when calling create_table_if_missing
+        // or notify_schema_cache_refresh, because they re-lock self.config and
+        // std::sync::Mutex is NOT reentrant — holding it causes a deadlock.
+        let (url, service_role_key) = {
+            let guard = self.config.lock().map_err(|e| e.to_string())?;
+            let cfg = guard.as_ref().ok_or("REST not configured")?;
+            (cfg.url.clone(), cfg.service_role_key.clone())
+        }; // guard dropped here — self.config is unlocked
         self.clear_error();
 
-        // Send all columns from the rows — PostgREST ignores extra columns
-        // that don't exist in the remote schema (returns 400), which is
-        // retried by the caller. No need to discover remote columns here.
         let filtered = rows.to_vec();
 
         crate::log::log(&format!("[sync] push_rows {}: {} rows, {} columns after filtering", table, filtered.len(), if filtered.is_empty() { 0 } else { filtered[0].as_object().map(|m| m.len()).unwrap_or(0) }));
-
-        // Auto-create table if it doesn't exist in Supabase
-        self.ensure_table_exists(&config.url, table, &filtered, &config.service_role_key)?;
 
         let mut all_acked = Vec::new();
         let batch_size = 100;
@@ -3731,10 +4574,10 @@ impl RestPostgres {
             let batch = &filtered[batch_start..batch_end];
 
             let mut retries = 0;
-            let max_retries = 3;
+            let max_retries = 2;
 
             loop {
-                let result = self.do_push_batch(&config.url, table, batch, &config.service_role_key);
+                let result = self.do_push_batch(&url, table, batch, &service_role_key);
 
                 match result {
                     Ok(ids) => {
@@ -3743,8 +4586,7 @@ impl RestPostgres {
                     }
                     Err(e) => {
                         // Check if this is a column-not-found error (PGRST204)
-                        if e.contains("PGRST204") || e.contains("Could not find the") {
-                            // Extract column name from error
+                        if e.contains("PGRST204") || (e.contains("Could not find the '") && e.contains("' column")) {
                             if let Some(start) = e.find("Could not find the '") {
                                 let after = &e[start + 18..];
                                 if let Some(end) = after.find("'") {
@@ -3752,13 +4594,20 @@ impl RestPostgres {
                                     crate::log::log(&format!("[sync] REST {table}: unknown column '{}' - check local vs remote schema mismatch", col_name));
                                 }
                             }
-                            // Don't retry on column errors - the schema mismatch needs to be fixed manually
                             self.set_error(&e);
                             return Err(format!("{table} column mismatch: {e}"));
                         }
+                        // Check if this is a schema cache error (PGRST205)
+                        if e.contains("PGRST205") || e.contains("schema cache") {
+                            crate::log::log(&format!("[sync] REST {table}: schema cache miss, auto-creating table..."));
+                            let _ = self.create_table_if_missing(table);
+                            self.notify_schema_cache_refresh(&url, &service_role_key);
+                            // PostgREST needs time to process the NOTIFY and reload schema cache
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                        }
                         if retries < max_retries {
                             retries += 1;
-                            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retries as u32));
+                            let delay = std::time::Duration::from_millis(500 * retries as u64);
                             std::thread::sleep(delay);
                             crate::log::log(&format!("[sync] REST {table} batch retry {}/{}: {}", retries, max_retries, e));
                         } else {
@@ -3808,8 +4657,9 @@ impl RestPostgres {
         }
     }
 
-    /// Create a table in Supabase based on the structure of the provided rows
-    fn create_table_if_not_exists(&self, base_url: &str, table: &str, rows: &[serde_json::Value], service_role_key: &str) -> Result<(), String> {
+    /// Create a table in Supabase based on the structure of the provided rows.
+    /// Uses the Management API (api.supabase.com) with PAT for reliable DDL execution.
+    fn create_table_if_not_exists(&self, base_url: &str, table: &str, rows: &[serde_json::Value], _service_role_key: &str) -> Result<(), String> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -3855,49 +4705,102 @@ impl RestPostgres {
         }
 
         let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS public.{} ({})",
+            "CREATE TABLE IF NOT EXISTS public.\"{}\" ({})",
             table,
             column_defs.join(", ")
         );
 
-        // Execute the CREATE TABLE via Supabase SQL endpoint
-        let sql_url = format!("{}/sql", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({ "query": create_sql });
+        // Get project_ref and PAT from config for Management API
+        let (project_ref, pat) = {
+            let cfg = self.config.lock().map_err(|e| e.to_string())?;
+            let cfg = cfg.as_ref().ok_or("REST not configured")?;
+            let pat = cfg.pat.as_deref().ok_or("PAT not available — cannot auto-create table")?.to_string();
+            (cfg.project_ref.clone(), pat)
+        };
 
-        let response = self.client.post(&sql_url)
-            .header("apikey", service_role_key)
-            .header("Authorization", format!("Bearer {}", service_role_key))
+        // Use the Management API endpoint (correct URL)
+        let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+        crate::log::log(&format!("[sync] create_table_if_not_exists: POST {} (table={})", mgmt_url, table));
+
+        let response = self.client.post(&mgmt_url)
+            .header("Authorization", format!("Bearer {}", pat))
             .header("Content-Type", "application/json")
-            .json(&payload)
+            .body(serde_json::json!({ "query": create_sql }).to_string())
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .map_err(|e| format!("Failed to create table: {}", e))?;
 
-        if !response.status().is_success() {
-            let text = response.text().unwrap_or_default();
-            // If table already exists (probably created by another sync), that's OK
-            if !text.contains("already exists") {
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        crate::log::log(&format!("[sync] create_table_if_not_exists {}: status={}, body={}", table, status, if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() }));
+
+        if !status.is_success() {
+            if text.contains("already exists") {
+                crate::log::log(&format!("[sync] Table {} already exists (OK)", table));
+            } else {
                 crate::log::log(&format!("[sync] Failed to create table {}: {}", table, text));
-                // Don't fail the sync - maybe it was created by another process
-                return Ok(());
+                return Ok(()); // Non-fatal: we'll retry on next push
             }
         }
 
         crate::log::log(&format!("[sync] Successfully created table {} in Supabase", table));
 
-        // Notify schema cache refresh
-        let notify_sql = r#"SELECT notify_pgrst_cache_needs_refresh()"#;
-        let _ = self.client.post(&sql_url)
-            .header("apikey", service_role_key)
-            .header("Authorization", format!("Bearer {}", service_role_key))
+        // Notify schema cache refresh via RPC
+        let rpc_url = format!("https://{}.supabase.co/rest/v1/rpc/notify_pgrst_cache_needs_refresh", project_ref);
+        let rpc_response = self.client.post(&rpc_url)
+            .header("apikey", _service_role_key)
+            .header("Authorization", format!("Bearer {}", _service_role_key))
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "query": notify_sql }))
             .send();
+        match rpc_response {
+            Ok(resp) if resp.status().is_success() => {
+                crate::log::log(&format!("[sync] Schema cache refresh notified for {}", table));
+            }
+            _ => {
+                crate::log::log(&format!("[sync] Schema cache refresh RPC returned non-success for {}", table));
+            }
+        }
+
+        // Wait for PostgREST to process the notify
+        std::thread::sleep(std::time::Duration::from_millis(1000));
 
         Ok(())
     }
 
     fn do_push_batch(&self, base_url: &str, table: &str, rows: &[serde_json::Value], service_role_key: &str) -> Result<Vec<String>, String> {
-        let url = format!("{}/{}", base_url, table);
+        // Filter out rows with null/empty id — they cannot be synced and would cause
+        // NOT NULL constraint violations on the central DB. Silent drop is safe because
+        // these rows represent corrupt local state (e.g. system_health_events with
+        // id=null from a broken record_health_event call). They are marked synced so
+        // they stop retrying; a future INSERT with a real id will create a new row.
+        // EXCEPTION: user_permissions has a composite PK (user_id, permission_id) and
+        // NO id column — such rows are valid when both key parts are present.
+        let row_is_valid = |r: &serde_json::Value| -> bool {
+            let has_id = r.get("id")
+                .map(|v| !v.is_null() && !v.as_str().map_or(false, |s| s.is_empty()))
+                .unwrap_or(false);
+            if has_id {
+                return true;
+            }
+            let uid = r.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+            let pid = r.get("permission_id").and_then(|v| v.as_str()).unwrap_or("");
+            !uid.is_empty() && !pid.is_empty()
+        };
+        let valid_rows: Vec<&serde_json::Value> = rows.iter()
+            .filter(|r| row_is_valid(r))
+            .collect();
+
+        let skipped = rows.len() - valid_rows.len();
+        if skipped > 0 {
+            crate::log::log(&format!("[sync] do_push_batch {table}: skipped {skipped} rows with null/empty id (not synced)"));
+        }
+
+        if valid_rows.is_empty() {
+            // All rows had null ids — return empty list so caller marks nothing as pending
+            return Ok(vec![]);
+        }
+
+        let url = format!("{}/{}", base_url.trim_end_matches('/'), table);
 
         let mut request = self.client.post(&url);
         request = request
@@ -3907,17 +4810,31 @@ impl RestPostgres {
             // Upsert behavior: on duplicate id, merge (update) instead of error
             .header("Prefer", "return=minimal,resolution=merge-duplicates");
 
-        // Build the actual payload with all rows
-        let payload = rows.to_vec();
+        // Build payload from filtered rows only
+        let payload: Vec<&serde_json::Value> = valid_rows.iter().map(|r| *r).collect();
         request = request.json(&payload);
 
         let response = request.send().map_err(|e| format!("HTTP request failed: {}", e))?;
 
         let status = response.status();
         if status.is_success() {
-            // Extract IDs from the input rows — all are considered acked
-            let ids: Vec<String> = rows.iter()
-                .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(String::from))
+            // Extract IDs from the filtered input rows — all are considered acked.
+            // For composite-key tables (user_permissions) the acked id is
+            // "user_id:permission_id" so mark_rows_synced can resolve it.
+            let ids: Vec<String> = valid_rows.iter()
+                .filter_map(|r| {
+                    if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                    let uid = r.get("user_id").and_then(|v| v.as_str())?;
+                    let pid = r.get("permission_id").and_then(|v| v.as_str())?;
+                    if uid.is_empty() || pid.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{uid}:{pid}"))
+                })
                 .collect();
             Ok(ids)
         } else {
@@ -3935,7 +4852,7 @@ impl RestPostgres {
 
         crate::log::log(&format!("[sync] delete_rows {table}: attempting to delete {} rows from central", ids.len()));
         for id in ids {
-            let url = format!("{}/{}/{}", config.url, table, id);
+            let url = format!("{}/{}/{}", config.url.trim_end_matches('/'), table, id);
             crate::log::log(&format!("[sync] delete_rows {table}/{id}: DELETE {}", url));
             let response = self.client.delete(&url)
                 .header("apikey", &config.service_role_key)
@@ -4085,17 +5002,16 @@ impl RestPostgres {
     fn exec_sql(&self, sql: &str) -> Result<serde_json::Value, String> {
         let config = self.config.lock().map_err(|e| e.to_string())?;
         let config = config.as_ref().ok_or("REST not configured")?;
-        // SQL API is at the project root, NOT at /rest/v1/sql
-        let sql_url = format!("https://{}.supabase.co/sql", config.project_ref);
+        let sql_url = format!("https://api.supabase.com/v1/projects/{}/database/query", config.project_ref);
         crate::log::log(&format!("[sync] exec_sql: POST {}", sql_url));
         crate::log::log(&format!("[sync] exec_sql: sql length = {}", sql.len()));
 
+        let auth_token = config.pat.as_deref().unwrap_or(&config.service_role_key);
         let resp = self.client.post(&sql_url)
-            .header("apikey", &config.service_role_key)
-            .header("Authorization", format!("Bearer {}", config.service_role_key))
+            .header("Authorization", format!("Bearer {}", auth_token))
             .header("Content-Type", "application/json")
-            .body(sql.to_string())
-            .timeout(std::time::Duration::from_secs(30))
+            .body(serde_json::json!({ "query": sql }).to_string())
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .map_err(|e| format!("SQL API request failed: {e}"))?;
 
@@ -4104,6 +5020,13 @@ impl RestPostgres {
         let text_for_log = if text.len() > 500 { format!("{}...", &text[..500]) } else { text.clone() };
         crate::log::log(&format!("[sync] exec_sql: status = {}, body = {}", status, text_for_log));
         if !status.is_success() {
+            // Management API only accepts a PAT (sbp_...) — see create_postgres_tables.
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(
+                    "SQL API error {status}: Supabase rejected the Personal Access Token (Unauthorized). Generate a fresh PAT at supabase.com/dashboard/account/tokens (starts with sbp_) and paste it in Settings → Sync. Alternatively run docs/generated_cloud_schema.sql in Supabase → SQL Editor and connect with just the URL + service_role key."
+                        .replace("{status}", &status.to_string()),
+                );
+            }
             return Err(format!("SQL API error {status}: {text}"));
         }
         serde_json::from_str(&text).map_err(|e| format!("SQL API JSON parse error: {e}: {text}"))
@@ -4153,6 +5076,8 @@ impl RestPostgres {
         sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;\n");
         sql.push_str("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO anon;\n");
         sql.push_str("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;\n");
+        // RLS lockdown: deny the anon/public key entirely (app uses service_role)
+        sql.push_str(RLS_LOCKDOWN_SQL);
 
         drop(config); // release lock before network call
         crate::log::log(&format!("[sync] ensure_schema: sending DDL via SQL API ({} bytes)", sql.len()));
@@ -4173,36 +5098,20 @@ impl RestPostgres {
         let sql = self.generate_create_table_sql(table);
         match self.exec_sql(&sql) {
             Ok(_) => {
-                crate::log::log(&format!("[sync] create_table_if_missing: {table} OK, ensuring notify function exists"));
-                // First ensure the notify function exists
-                let create_fn_sql = r#"
-                    CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()
-                    RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
-                    BEGIN
-                      NOTIFY pgrst, 'reload schema cache';
-                    END;
-                    $$;
-                    GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
-                "#;
+                crate::log::log(&format!("[sync] create_table_if_missing: {table} OK, sending NOTIFY via Management API"));
+                // Send NOTIFY directly via Management API to reload PostgREST schema cache.
+                // Cannot use PostgREST RPC because PostgREST may not know about the function yet.
                 if let Ok(config) = self.config.lock() {
                     if let Some(cfg) = config.as_ref() {
-                        // Create the function first
-                        let fn_url = format!("https://{}.supabase.co/sql", cfg.project_ref);
-                        let _ = self.client.post(&fn_url)
-                            .header("apikey", &cfg.service_role_key)
-                            .header("Authorization", format!("Bearer {}", cfg.service_role_key))
+                        let pat = cfg.pat.as_deref().unwrap_or(&cfg.service_role_key);
+                        let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", cfg.project_ref);
+                        let notify_resp = self.client.post(&mgmt_url)
+                            .header("Authorization", format!("Bearer {}", pat))
                             .header("Content-Type", "application/json")
-                            .body(create_fn_sql.to_string())
+                            .body(serde_json::json!({ "query": "NOTIFY pgrst, 'reload schema cache';" }).to_string())
+                            .timeout(std::time::Duration::from_secs(10))
                             .send();
-                        
-                        // Then call it to reload schema cache
-                        let rpc_url = format!("https://{}.supabase.co/rest/v1/rpc/notify_pgrst_cache_needs_refresh", cfg.project_ref);
-                        let _ = self.client.post(&rpc_url)
-                            .header("apikey", &cfg.service_role_key)
-                            .header("Authorization", format!("Bearer {}", cfg.service_role_key))
-                            .header("Content-Type", "application/json")
-                            .send();
-                        crate::log::log(&format!("[sync] create_table_if_missing: {table} schema cache refresh notified"));
+                        crate::log::log(&format!("[sync] create_table_if_missing: {table} NOTIFY result: {:?}", notify_resp.map(|r| r.status())));
                     }
                 }
                 Ok(())
@@ -4236,180 +5145,8 @@ impl RestPostgres {
     /// Create all sync tables in Supabase if they don't exist.
     /// Uses the EXACT schema from the working SUPABASE_SETUP.sql script.
     fn create_all_tables(&self) -> Result<(), String> {
-        let sql = r#"
--- Companies
-CREATE TABLE IF NOT EXISTS public.companies (
-    synced INTEGER DEFAULT 0,
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    extra_fields TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- Drivers
-CREATE TABLE IF NOT EXISTS public.drivers (
-    synced INTEGER DEFAULT 0,
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    extra_fields TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- Vehicles
-CREATE TABLE IF NOT EXISTS public.vehicles (
-    synced INTEGER DEFAULT 0,
-    id TEXT PRIMARY KEY,
-    plate_number TEXT NOT NULL,
-    company_id TEXT REFERENCES public.companies(id),
-    registered_capacity REAL,
-    default_driver_id TEXT REFERENCES public.drivers(id),
-    status TEXT NOT NULL DEFAULT 'active',
-    extra_fields TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_vehicles_plate ON public.vehicles(plate_number);
-
--- Users
-CREATE TABLE IF NOT EXISTS public.users (
-    synced INTEGER DEFAULT 0,
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    auth_type TEXT NOT NULL,
-    credential_hash TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    revoked_by TEXT REFERENCES public.users(id),
-    revoked_at TEXT,
-    profile_photo_ref TEXT,
-    phone_number TEXT,
-    theme_mode TEXT DEFAULT 'light',
-    theme_accent TEXT,
-    language_preference TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- Trips
-CREATE TABLE IF NOT EXISTS public.trips (
-    id TEXT PRIMARY KEY,
-    vehicle_id TEXT REFERENCES public.vehicles(id),
-    driver_id TEXT REFERENCES public.drivers(id),
-    company_id TEXT,
-    capacity_at_trip REAL,
-    time_in TEXT NOT NULL,
-    receipt_no TEXT,
-    officer_id TEXT REFERENCES public.users(id),
-    capture_method TEXT NOT NULL DEFAULT 'auto',
-    confidence_score REAL,
-    photo_refs TEXT,
-    status TEXT NOT NULL DEFAULT 'logged',
-    resolution_notes TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    synced INTEGER DEFAULT 0,
-    pushed_to_sheets INTEGER DEFAULT 0,
-    sheet_row INTEGER,
-    sheet_exit_pushed INTEGER DEFAULT 0,
-    is_discharge_trip INTEGER,
-    model_version TEXT,
-    ocr_engine TEXT,
-    archived INTEGER DEFAULT 0,
-    exit_time TEXT,
-    exit_photo_refs TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_trips_time_in ON public.trips(time_in);
-CREATE INDEX IF NOT EXISTS idx_trips_status ON public.trips(status);
-
--- Permissions
-CREATE TABLE IF NOT EXISTS public.permissions (
-    id TEXT PRIMARY KEY,
-    key TEXT NOT NULL UNIQUE,
-    min_auth_level TEXT NOT NULL,
-    description TEXT
-);
-
--- User Permissions
-CREATE TABLE IF NOT EXISTS public.user_permissions (
-    user_id TEXT REFERENCES public.users(id),
-    permission_id TEXT REFERENCES public.permissions(id),
-    granted_by TEXT REFERENCES public.users(id),
-    granted_at TEXT NOT NULL,
-    PRIMARY KEY (user_id, permission_id)
-);
-
--- Role Presets
-CREATE TABLE IF NOT EXISTS public.role_presets (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    permission_ids TEXT NOT NULL
-);
-
--- Audit Log
-CREATE TABLE IF NOT EXISTS public.audit_log (
-    id TEXT PRIMARY KEY,
-    actor_id TEXT REFERENCES public.users(id),
-    action TEXT NOT NULL,
-    target_id TEXT,
-    details TEXT,
-    created_at TEXT NOT NULL
-);
-
--- Integrations
-CREATE TABLE IF NOT EXISTS public.integrations (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    connected_by TEXT REFERENCES public.users(id),
-    target_sheet_id TEXT,
-    shared_group TEXT,
-    sync_frequency TEXT DEFAULT 'realtime',
-    status TEXT NOT NULL DEFAULT 'active',
-    last_synced_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- App Settings
-CREATE TABLE IF NOT EXISTS public.app_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
--- ANPR Config
-CREATE TABLE IF NOT EXISTS public.anpr_config (
-    id TEXT PRIMARY KEY,
-    camera_id TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    min_confidence REAL DEFAULT 0.7,
-    cooldown_seconds INTEGER DEFAULT 30,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- Field Definitions
-CREATE TABLE IF NOT EXISTS public.field_definitions (
-    id TEXT PRIMARY KEY,
-    entity_type TEXT NOT NULL,
-    field_key TEXT NOT NULL,
-    display_label TEXT NOT NULL,
-    field_type TEXT NOT NULL,
-    required INTEGER NOT NULL DEFAULT 0,
-    options TEXT,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    is_standard INTEGER DEFAULT 0,
-    is_hidden INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL
-);
-
--- Grant access
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO anon;
-GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
-"#;
+        // Use the authoritative SQL from SUPABASE_SETUP.sql as single source of truth
+        let sql = include_str!("../../docs/SUPABASE_SETUP.sql");
         crate::log::log(&format!("[sync] create_all_tables: executing {} bytes of SQL", sql.len()));
         match self.exec_sql(sql) {
             Ok(result) => {
@@ -4421,6 +5158,73 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;
                 Err(e)
             }
         }
+    }
+
+    /// Notify PostgREST to refresh its schema cache
+    fn notify_schema_cache_refresh(&self, base_url: &str, service_role_key: &str) {
+        // First ensure the notify function exists via Management API
+        let create_fn_sql = r#"
+            CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()
+            RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+            BEGIN
+              NOTIFY pgrst, 'reload schema cache';
+            END;
+            $$;
+            GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
+        "#;
+
+        // Use Management API to create the function
+        let mgmt_url = match self.config.lock() {
+            Ok(cfg) => cfg.as_ref().map(|c| {
+                let pat = c.pat.as_deref().unwrap_or(&c.service_role_key);
+                (format!("https://api.supabase.com/v1/projects/{}/database/query", c.project_ref), pat.to_string())
+            }),
+            _ => None,
+        };
+
+        if let Some((url, auth_token)) = mgmt_url {
+            // Step 1: Create the notify function via Management API
+            let fn_response = self.client.post(&url)
+                .header("Authorization", format!("Bearer {}", auth_token))
+                .header("Content-Type", "application/json")
+                .body(serde_json::json!({ "query": create_fn_sql }).to_string())
+                .timeout(std::time::Duration::from_secs(15))
+                .send();
+            match fn_response {
+                Ok(resp) if resp.status().is_success() => {
+                    crate::log::log("[sync] notify_schema_cache_refresh: function created/updated OK");
+                }
+                Ok(resp) => {
+                    let err = resp.text().unwrap_or_default();
+                    crate::log::log(&format!("[sync] notify_schema_cache_refresh: function create warning: {}", err));
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[sync] notify_schema_cache_refresh: function create error: {}", e));
+                }
+            }
+            // Step 2: Send NOTIFY directly via Management API to reload schema cache
+            let notify_sql = "NOTIFY pgrst, 'reload schema cache';";
+            let notify_resp = self.client.post(&url)
+                .header("Authorization", format!("Bearer {}", auth_token))
+                .header("Content-Type", "application/json")
+                .body(serde_json::json!({ "query": notify_sql }).to_string())
+                .timeout(std::time::Duration::from_secs(10))
+                .send();
+            match notify_resp {
+                Ok(resp) if resp.status().is_success() => {
+                    crate::log::log("[sync] NOTIFY sent via Management API");
+                }
+                Ok(resp) => {
+                    let err = resp.text().unwrap_or_default();
+                    crate::log::log(&format!("[sync] NOTIFY via Management API warning: {}", err));
+                }
+                Err(e) => {
+                    crate::log::log(&format!("[sync] NOTIFY via Management API error: {}", e));
+                }
+            }
+        }
+
+        crate::log::log(&format!("[sync] Schema cache refresh notified for {}", base_url));
     }
 }
 
@@ -4453,11 +5257,11 @@ impl PostgresAdapter for RestPostgres {
                 // Test connection
                 if self.check_connection() {
                     self.clear_error();
-                    // Auto-create tables on configure
-                    crate::log::log("[sync] configure: connected, creating tables...");
-                    if let Err(e) = self.create_all_tables() {
-                        crate::log::log(&format!("[sync] configure: create_all_tables failed: {}", e));
-                    }
+                    // NOTE: We do NOT call create_all_tables() here because the Management API
+                    // requires a PAT which is not yet stored at this point (set_pat is called
+                    // later by create_postgres_tables). Table creation is handled by
+                    // create_postgres_tables() which runs after configure and has the PAT.
+                    crate::log::log("[sync] configure: connected successfully");
                     Ok(())
                 } else {
                     Err("REST connection test failed - check URL and API key".to_string())
@@ -4485,6 +5289,9 @@ impl PostgresAdapter for RestPostgres {
                 if let Err(e) = self.create_table_if_missing(table) {
                     crate::log::log(&format!("[sync] REST push {table}: create_table_if_missing failed: {}", e));
                 }
+                // Wait for PostgREST to reload schema cache after table creation
+                crate::log::log(&format!("[sync] REST push {table}: waiting 3s for schema cache refresh before retry"));
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 self.push_rows_impl(table, rows)
             }
             Err(e) => {
@@ -4573,6 +5380,15 @@ impl PostgresAdapter for RestPostgres {
         );
         crate::log::log(&format!("[sync] add_missing_column: {}", sql));
         self.exec_sql(&sql).map(|_| ())
+    }
+
+    fn set_pat(&self, pat: &str) {
+        if let Ok(mut cfg) = self.config.lock() {
+            if let Some(ref mut c) = *cfg {
+                c.pat = Some(pat.to_string());
+                crate::log::log("[sync] RestPostgres: PAT stored in config");
+            }
+        }
     }
 }
 
@@ -4709,54 +5525,89 @@ pub fn configure_postgres<R: tauri::Runtime>(state: State<AppState>, actor_id: S
         return Err("Connection string cannot be empty.".to_string());
     }
     // Permission check (fast)
-    {
+    let company_id = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
 
-        let is_rest = connection_string.starts_with("REST|");
-        let current_is_rest = state.pg.label() == "rest-postgres";
-        let needs_adapter_switch = is_rest != current_is_rest;
+        // Get company_id for pushing config to cloud
+        let cid: Option<String> = conn.query_row(
+            "SELECT company_id FROM users WHERE id = ?1",
+            params![actor_id],
+            |r| r.get::<_, String>(0),
+        ).ok();
+        cid
+    };
 
-        // Save the connection string first (so next restart uses correct adapter)
+    let is_rest = connection_string.starts_with("REST|");
+    let current_is_rest = state.pg.label() == "rest-postgres";
+    let needs_adapter_switch = is_rest != current_is_rest;
+
+    // Save the connection string first (so next restart uses correct adapter)
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
         set_setting(&conn, "pg_connection_string", &connection_string);
-        drop(conn);
-
-        // Create new adapter if type changed
-        let pg: Arc<dyn PostgresAdapter> = if needs_adapter_switch {
-            if is_rest {
-                Arc::new(RestPostgres::new()) as Arc<dyn PostgresAdapter>
-            } else {
-                Arc::new(RealPostgres::new()) as Arc<dyn PostgresAdapter>
-            }
-        } else {
-            state.pg.clone()
-        };
-
-        let db = state.db.clone();
-        let pg_for_thread = pg.clone();
-        std::thread::spawn(move || {
-            // Configure the adapter (REST connection test happens inside)
-            match pg_for_thread.configure(Some(connection_string.clone())) {
-                Ok(()) => {
-                    let emit_payload = if let Ok(conn) = db.lock() {
-                        let _ = append_audit(&conn, &actor_id, "configured_postgres", None, Some(json!({ "connection_string": sanitize_conn_string(&connection_string) })));
-                        let view = pg_sync_state_impl(&conn, &*pg_for_thread).ok();
-                        drop(conn);
-                        view
-                    } else {
-                        None
-                    };
-                    if let Some(view) = emit_payload {
-                        let _ = handle.emit("pg-configured", view);
-                    }
-                }
-                Err(e) => {
-                    let _ = handle.emit("pg-config-error", json!({ "error": e }));
-                }
-            }
-        });
-        Ok("testing".to_string())
     }
+
+    // Create new adapter if type changed
+    let pg: Arc<dyn PostgresAdapter> = if needs_adapter_switch {
+        if is_rest {
+            Arc::new(RestPostgres::new()) as Arc<dyn PostgresAdapter>
+        } else {
+            Arc::new(RealPostgres::new()) as Arc<dyn PostgresAdapter>
+        }
+    } else {
+        state.pg.get()
+    };
+
+    // Carry over a previously stored PAT so table creation keeps working
+    // after an adapter switch without re-entering it.
+    if needs_adapter_switch {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(pat) = get_setting(&conn, "supabase_pat").filter(|p| !p.is_empty()) {
+            pg.set_pat(&pat);
+        }
+    }
+
+    let db = state.db.clone();
+    let pg_for_thread = pg.clone();
+    let shared_pg = state.pg.clone();
+    let company_id_for_push = company_id.clone();
+    std::thread::spawn(move || {
+        // Configure the adapter (REST connection test happens inside)
+        match pg_for_thread.configure(Some(connection_string.clone())) {
+            Ok(()) => {
+                // Success: install the adapter so EVERY consumer (UI commands,
+                // sync poller, poller threads) uses it immediately — previously
+                // the new adapter was configured but never installed, so the
+                // connect only "worked" after an app restart.
+                shared_pg.swap(pg_for_thread.clone());
+
+                // Push company config to cloud so new admins get the settings
+                if let Some(ref cid) = company_id_for_push {
+                    let _ = push_company_config_raw(&pg_for_thread, &db, cid);
+                }
+                // Keep the cloud permission catalog in agreement with the app's
+                // built-in catalog (fixes drifted rows like min_auth_level='pin').
+                push_permission_catalog(&*pg_for_thread);
+
+                let emit_payload = if let Ok(conn) = db.lock() {
+                    let _ = append_audit(&conn, &actor_id, "configured_postgres", None, Some(json!({ "connection_string": sanitize_conn_string(&connection_string) })));
+                    let view = pg_sync_state_impl(&conn, &*pg_for_thread).ok();
+                    drop(conn);
+                    view
+                } else {
+                    None
+                };
+                if let Some(view) = emit_payload {
+                    let _ = handle.emit("pg-configured", view);
+                }
+            }
+            Err(e) => {
+                let _ = handle.emit("pg-config-error", json!({ "error": e }));
+            }
+        }
+    });
+    Ok("testing".to_string())
 }
 
 /// Setup tables via the Supabase pooler connection (using the database password).
@@ -4776,7 +5627,7 @@ pub fn disconnect_postgres<R: tauri::Runtime>(state: State<AppState>, actor_id: 
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
     }
-    let pg = state.pg.clone();
+    let pg = state.pg.get();
     let db = state.db.clone();
     std::thread::spawn(move || {
         let _ = pg.configure(None);
@@ -4835,7 +5686,6 @@ pub fn create_postgres_tables<R: tauri::Runtime>(
             .ok_or("No REST connection configured")?
     };
 
-    let db = state.db.clone();
     let service_role_key = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         get_setting(&conn, "pg_connection_string")
@@ -4849,85 +5699,135 @@ pub fn create_postgres_tables<R: tauri::Runtime>(
                 None
             })
     };
-    std::thread::spawn(move || {
-        if let Ok(conn) = db.lock() {
-            let _ = set_setting(&conn, "supabase_pat", &pat);
+    // CRITICAL: Store PAT synchronously BEFORE any async work.
+    // Previously this was inside a spawned thread, creating a race condition
+    // where sync could run before the PAT was available for table creation.
+    state.pg.set_pat(&pat);
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let _ = set_setting(&conn, "supabase_pat", &pat);
+    }
+    crate::log::log("[sync] create_postgres_tables: PAT stored synchronously");
+
+    // Run table creation SYNCHRONOUSLY so errors reach the frontend.
+    // Previously this was in a spawned thread and errors went to pg-tables-error
+    // events that nobody listened for — tables would silently never be created.
+    let sql = include_str!("../../docs/SUPABASE_SETUP.sql");
+    let url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client failed: {}", e))?;
+
+    crate::log::log(&format!("[sync] create_postgres_tables: POST {}", url));
+
+    let resp = client.post(&url)
+        .header("Authorization", format!("Bearer {}", pat))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({ "query": sql }).to_string())
+        .send()
+        .map_err(|e| format!("Management API request failed: {}", e))?;
+
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    crate::log::log(&format!("[sync] create_postgres_tables: status = {}, body = {}", status, if text.len() > 300 { format!("{}...", &text[..300]) } else { text.clone() }));
+
+    if !status.is_success() {
+        // The Management API only accepts a Personal Access Token (sbp_...)
+        // generated at supabase.com/dashboard/account/tokens — a service_role
+        // key is rejected there by design. 401/403 almost always means the PAT
+        // is missing, expired, or revoked, so say that explicitly.
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(
+                "Failed to create tables: Supabase rejected the Personal Access Token (Unauthorized).\n\n\
+                 Table creation uses the Supabase Management API, which requires a PAT — the service_role key does not work there.\n\
+                 1. Go to supabase.com/dashboard/account/tokens (Account → Access Tokens)\n\
+                 2. Generate a new token (starts with sbp_)\n\
+                 3. Paste it in the Personal Access Token field and connect again\n\n\
+                 Alternative: run the schema SQL manually in Supabase → SQL Editor (docs/generated_cloud_schema.sql), then connect with just the URL + service_role key."
+                    .to_string(),
+            );
         }
+        return Err(format!("Failed to create tables: {}", text));
+    }
 
-        let sql = include_str!("../../docs/SUPABASE_SETUP.sql");
-        let url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
+    crate::log::log("[sync] create_postgres_tables: tables created, refreshing PostgREST schema cache...");
 
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                crate::log::log(&format!("[sync] create_postgres_tables: HTTP client failed: {}", e));
-                let _ = handle.emit("pg-tables-error", json!({ "error": format!("HTTP client failed: {}", e) }));
-                return;
-            }
-        };
-
-        crate::log::log(&format!("[sync] create_postgres_tables: POST {}", url));
-
-        let resp = match client.post(&url)
+    // Retry loop: send NOTIFY + verify PostgREST can see the tables.
+    // PostgREST may take several seconds to reload after DDL changes.
+    let mut schema_ready = false;
+    for attempt in 1..=5 {
+        // Send NOTIFY via Management API (direct SQL, bypasses PostgREST)
+        let notify_sql = "SELECT public.notify_pgrst_cache_needs_refresh();";
+        let notify_resp = client.post(&url)
             .header("Authorization", format!("Bearer {}", pat))
             .header("Content-Type", "application/json")
-            .body(serde_json::json!({ "query": sql }).to_string())
+            .body(serde_json::json!({ "query": notify_sql }).to_string())
+            .send();
+        crate::log::log(&format!("[sync] create_postgres_tables: NOTIFY attempt {}: {:?}", attempt, notify_resp.as_ref().map(|r| r.status())));
+
+        // Also send raw NOTIFY as backup (some Supabase configs use different reload paths)
+        let _ = client.post(&url)
+            .header("Authorization", format!("Bearer {}", pat))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "query": "NOTIFY pgrst, 'reload schema';" }).to_string())
+            .send();
+
+        // Wait for PostgREST to process the reload
+        let wait_secs = 2 * attempt;
+        crate::log::log(&format!("[sync] create_postgres_tables: waiting {}s for PostgREST to reload...", wait_secs));
+        std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+
+        // Verify: try querying a table via PostgREST (use PAT as bearer if service_role_key unavailable)
+        let verify_url = format!("https://{}.supabase.co/rest/v1/users?select=id&limit=1", project_ref);
+        let verify_key = service_role_key.as_deref().unwrap_or(&pat);
+        match client.get(&verify_url)
+            .header("apikey", verify_key)
+            .header("Authorization", format!("Bearer {}", verify_key))
             .send()
         {
-            Ok(r) => r,
+            Ok(resp) if resp.status().is_success() || resp.status() == 404 => {
+                // 200 = tables visible, 404 = table exists but empty (still means schema loaded)
+                let body = resp.text().unwrap_or_default();
+                if body.contains("PGRST205") {
+                    crate::log::log(&format!("[sync] create_postgres_tables: attempt {} - PostgREST still has stale cache", attempt));
+                } else {
+                    crate::log::log(&format!("[sync] create_postgres_tables: attempt {} - PostgREST schema OK!", attempt));
+                    schema_ready = true;
+                    break;
+                }
+            }
+            Ok(resp) => {
+                crate::log::log(&format!("[sync] create_postgres_tables: attempt {} - verify returned {}", attempt, resp.status()));
+            }
             Err(e) => {
-                crate::log::log(&format!("[sync] create_postgres_tables: Management API request failed: {}", e));
-                let _ = handle.emit("pg-tables-error", json!({ "error": format!("Management API request failed: {}", e) }));
-                return;
+                crate::log::log(&format!("[sync] create_postgres_tables: attempt {} - verify error: {}", attempt, e));
             }
-        };
-
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        crate::log::log(&format!("[sync] create_postgres_tables: status = {}, body = {}", status, if text.len() > 300 { format!("{}...", &text[..300]) } else { text.clone() }));
-
-        if status.is_success() {
-            crate::log::log("[sync] create_postgres_tables: tables created, ensuring notify function exists...");
-
-            // First ensure the notify function exists in public schema
-            let create_fn_sql = r#"
-                CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()
-                RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
-                BEGIN
-                  NOTIFY pgrst, 'reload schema cache';
-                END;
-                $$;
-                GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
-            "#;
-            let fn_resp = client.post(&url)
-                .header("Authorization", format!("Bearer {}", pat))
-                .header("Content-Type", "application/json")
-                .body(serde_json::json!({ "query": create_fn_sql }).to_string())
-                .send();
-            crate::log::log(&format!("[sync] create_postgres_tables: notify fn creation: {:?}", fn_resp.map(|r| r.status())));
-
-            // Then call it to reload schema cache
-            if let Some(ref svc_key) = service_role_key {
-                let rpc_url = format!("https://{}.supabase.co/rest/v1/rpc/notify_pgrst_cache_needs_refresh", project_ref);
-                let _ = client.post(&rpc_url)
-                    .header("Authorization", format!("Bearer {}", svc_key))
-                    .header("apikey", svc_key)
-                    .header("Content-Type", "application/json")
-                    .send();
-                crate::log::log("[sync] create_postgres_tables: schema cache refresh notified");
-            }
-
-            crate::log::log("[sync] create_postgres_tables: SUCCESS");
-            let _ = handle.emit("pg-tables-created", ());
-        } else {
-            let _ = handle.emit("pg-tables-error", json!({ "error": format!("Failed to create tables: {}", text) }));
-            crate::log::log(&format!("[sync] create_postgres_tables: FAILED"));
         }
-    });
-    Ok("creating".to_string())
+    }
+
+    if !schema_ready {
+        crate::log::log("[sync] create_postgres_tables: WARNING - PostgREST schema cache may not be fully refreshed. Queries may fail until cache refreshes naturally.");
+    }
+
+    crate::log::log("[sync] create_postgres_tables: SUCCESS");
+    let _ = handle.emit("pg-tables-created", ());
+    Ok("Tables created successfully".to_string())
+}
+
+/// Generate PostgreSQL schema SQL by introspecting the local SQLite database.
+/// Returns the full DDL script ready to paste into Supabase SQL Editor.
+/// The schema stays in sync with local changes — regenerate anytime the
+/// data structure evolves (add/edit/delete tables or columns).
+#[tauri::command]
+pub fn generate_cloud_schema(state: State<AppState>, actor_id: String) -> Result<String, String> {
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    generate_schema_from_local(&conn)
 }
 
 #[tauri::command]
@@ -4946,16 +5846,28 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
     if service_account_json.trim().is_empty() || target_sheet_id.trim().is_empty() {
         return Err("Service account JSON and target sheet ID are required.".to_string());
     }
-    // Phase 1: Permission check (fast)
-    {
+    // Phase 1: Permission check (fast) + get company_id
+    let company_id = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         crate::commands::ensure_admin_permission(&conn, &actor_id, INTEGRATION_PERM)?;
-    }
+
+        // Get company_id for pushing config to cloud
+        let cid: Option<String> = conn.query_row(
+            "SELECT company_id FROM users WHERE id = ?1",
+            params![actor_id],
+            |r| r.get::<_, String>(0),
+        ).ok();
+        cid
+    };
     // Phase 2: Network call on background thread — frontend receives "testing" instantly
     let sheets = state.sheets.clone();
     let db = state.db.clone();
+    let pg = state.pg.get();
+    let company_id_for_push = company_id.clone();
+    let target_sheet_id_clone = target_sheet_id.clone();
+    let sync_frequency_clone = sync_frequency.clone();
     std::thread::spawn(move || {
-        match sheets.configure(Some(service_account_json.clone()), Some(target_sheet_id.clone())) {
+        match sheets.configure(Some(service_account_json.clone()), Some(target_sheet_id_clone.clone())) {
             Ok(email) => {
                 // Persist + audit (fast) — release db BEFORE emit to avoid deadlock
                 let emit_payload = if let Ok(conn) = db.lock() {
@@ -4973,7 +5885,7 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
                                 "UPDATE integrations SET connected_by = ?1, target_sheet_id = ?2, shared_group = ?3,
                                         sync_frequency = ?4, status = 'connected', last_synced_at = NULL, updated_at = ?5
                                  WHERE id = ?6",
-                                params![actor_id, target_sheet_id, shared_group, sync_frequency, now, id],
+                                params![actor_id, target_sheet_id_clone, shared_group, sync_frequency_clone, now, id],
                             );
                         }
                         None => {
@@ -4984,16 +5896,19 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
                                 params![
                                     uuid::Uuid::new_v4().to_string(),
                                     actor_id,
-                                    target_sheet_id,
+                                    target_sheet_id_clone,
                                     shared_group,
-                                    sync_frequency,
+                                    sync_frequency_clone,
                                     now
                                 ],
                             );
                         }
                     }
                     let _ = set_setting(&conn, "sheets_service_account_json", &service_account_json);
-                    let _ = set_setting(&conn, "sheets_target_sheet_id", &target_sheet_id);
+                    let _ = set_setting(&conn, "sheets_target_sheet_id", &target_sheet_id_clone);
+                    // Also save sheets_id for company_config push (used by push_company_config)
+                    let _ = set_setting(&conn, "sheets_id", &target_sheet_id_clone);
+                    let _ = set_setting(&conn, "sheets_frequency", &sync_frequency_clone);
                     let _ = append_audit(
                         &conn,
                         &actor_id,
@@ -5001,9 +5916,9 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
                         None,
                         Some(json!({
                             "service_account_email": email,
-                            "target_sheet_id": target_sheet_id,
+                            "target_sheet_id": target_sheet_id_clone,
                             "shared_group": shared_group,
-                            "sync_frequency": sync_frequency,
+                            "sync_frequency": sync_frequency_clone,
                         })),
                     );
                     let view = sheets_state_impl(&conn, &*sheets).ok();
@@ -5012,6 +5927,12 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
                 } else {
                     None
                 };
+
+                // Push company config to cloud so new admins get the settings
+                if let Some(ref cid) = company_id_for_push {
+                    let _ = push_company_config_raw(&pg, &db, cid);
+                }
+
                 if let Some(view) = emit_payload {
                     let _ = handle.emit("sheets-configured", view);
                 }
@@ -5197,6 +6118,42 @@ mod tests {
     }
 
     #[test]
+    fn rest_config_normalizes_bare_supabase_url() {
+        // The login flow used to save a bare project URL, which made every
+        // PostgREST push 404 with {"error":"requested path is invalid"}.
+        for raw in [
+            "REST|https://abcdef.supabase.co|key",
+            "REST|https://abcdef.supabase.co/|key",
+            "REST|https://abcdef.supabase.co/rest/v1|key",
+            "REST|https://abcdef.supabase.co/rest/v1/|key",
+        ] {
+            let cfg = RestConfig::parse(raw).expect("should parse");
+            assert_eq!(cfg.url, "https://abcdef.supabase.co/rest/v1", "input: {raw}");
+            assert_eq!(cfg.project_ref, "abcdef");
+        }
+    }
+
+    #[test]
+    fn normalize_supabase_rest_url_handles_all_shapes() {
+        assert_eq!(
+            normalize_supabase_rest_url("https://x.supabase.co"),
+            "https://x.supabase.co/rest/v1"
+        );
+        assert_eq!(
+            normalize_supabase_rest_url("https://x.supabase.co/rest/v1"),
+            "https://x.supabase.co/rest/v1"
+        );
+        assert_eq!(
+            normalize_supabase_rest_url("https://x.supabase.co/").trim_end_matches('/'),
+            "https://x.supabase.co/rest/v1".trim_end_matches('/')
+        );
+        assert_eq!(
+            normalize_supabase_rest_url("  https://x.supabase.co/rest/v1/  "),
+            "https://x.supabase.co/rest/v1"
+        );
+    }
+
+    #[test]
     fn sanitize_conn_string_masks_passwords() {
         assert_eq!(
             sanitize_conn_string("postgresql://u:pw@h:5432/db"),
@@ -5246,5 +6203,117 @@ mod tests {
         assert_eq!(field_key_to_value(&row, "receipt_no"), json!(""));
         assert_eq!(field_key_to_value(&row, "is_discharge_trip"), json!("Yes"));
         assert_eq!(field_key_to_value(&row, "driver"), json!("Jane"));
+    }
+
+    #[test]
+    fn generate_schema_from_local_creates_valid_pg_ddl() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create a few tables that mirror what the app actually uses
+        conn.execute_batch(
+            "            CREATE TABLE companies (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                extra_fields TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                synced INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                auth_type TEXT NOT NULL,
+                credential_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                company_id INTEGER REFERENCES companies(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                synced INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE trips (
+                id INTEGER PRIMARY KEY,
+                vehicle_id INTEGER,
+                driver_id INTEGER,
+                company_id INTEGER,
+                capacity_at_trip REAL,
+                time_in TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'logged',
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                synced INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_trips_time_in ON trips(time_in);
+            CREATE INDEX idx_trips_status ON trips(status);
+            CREATE TABLE sync_log (
+                id TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload TEXT,
+                synced INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_sync_log_table ON sync_log(table_name);
+            CREATE UNIQUE INDEX idx_sync_log_record ON sync_log(table_name, record_id);
+            CREATE TABLE system_health_events (
+                id TEXT PRIMARY KEY,
+                component TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT,
+                detected_at TEXT NOT NULL,
+                acknowledged_by TEXT,
+                acknowledged_at TEXT,
+                resolved_at TEXT,
+                synced INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        let sql = generate_schema_from_local(&conn).unwrap();
+
+        // Print the SQL for manual inspection FIRST (before any assertions)
+        println!("=== Generated SQL ===\n{}", sql);
+
+        // Should contain CREATE TABLE for syncable tables
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS public.\"companies\""), "missing companies table");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS public.\"users\""), "missing users table");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS public.\"trips\""), "missing trips table");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS public.\"sync_log\""), "missing sync_log table");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS public.\"system_health_events\""), "missing system_health_events table");
+
+        // Should contain column definitions with correct PG types
+        assert!(sql.contains("\"id\" BIGINT"), "id should be BIGINT");
+        assert!(sql.contains("\"synced\" INTEGER"), "synced should be INTEGER");
+        assert!(sql.contains("\"capacity_at_trip\" DOUBLE PRECISION"), "capacity_at_trip should be DOUBLE PRECISION");
+        assert!(sql.contains("\"status\" TEXT NOT NULL"), "status should be TEXT NOT NULL");
+
+        // Should contain NOT NULL for required fields
+        assert!(sql.contains("\"name\" TEXT NOT NULL"), "name should be NOT NULL");
+
+        // TEXT PRIMARY KEY columns (like system_health_events.id) must get NOT NULL in PG DDL
+        // because SQLite allows NULL in TEXT PRIMARY KEY but PostgreSQL does not.
+        assert!(sql.contains("\"id\" TEXT NOT NULL"), "system_health_events.id TEXT PRIMARY KEY must be NOT NULL in PG");
+
+        // Should contain GRANT statements
+        assert!(sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon"));
+        assert!(sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated"));
+
+        // Should contain index creation (check idx names, not full DDL)
+        assert!(sql.contains("idx_trips_time_in"), "missing trips time_in index");
+        assert!(sql.contains("idx_trips_status"), "missing trips status index");
+        assert!(sql.contains("idx_sync_log_table"), "missing sync_log table index");
+
+        // Should contain FK constraints (DEFERRABLE)
+        assert!(sql.contains("DEFERRABLE INITIALLY DEFERRED"), "FK constraints should be DEFERRABLE");
+
+        // Should contain schema reload function
+        assert!(sql.contains("notify_pgrst_cache_needs_refresh"), "missing schema reload function");
+
+        // Should contain RLS lockdown so the anon key is denied
+        assert!(sql.contains("ENABLE ROW LEVEL SECURITY"), "missing RLS lockdown");
     }
 }

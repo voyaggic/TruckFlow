@@ -68,7 +68,7 @@ export const api = {
     invoke<LoginResult>("create_company_and_admin_cloud", { companyName, adminName, password, supabaseUrl, apiKey }),
 
   loginPassword: (username: string, password: string, supabaseUrl?: string, apiKey?: string) =>
-    invoke<LoginResult>("login_password", { username, password, supabaseUrl: supabaseUrl || "", apiKey: apiKey || "" }),
+    invoke<LoginResult>("login_password", { username, password, supabaseUrl: supabaseUrl || "", apiKey: apiKey || "", pat: "" }),
 
   logout: () => invoke<void>("logout"),
 
@@ -716,6 +716,9 @@ export const api = {
 
   createPostgresTables: (actorId: string, pat: string) =>
     invoke<string>("create_postgres_tables", { actorId, pat }),
+
+  generateCloudSchema: (actorId: string) =>
+    invoke<string>("generate_cloud_schema", { actorId }),
 
   disconnectPostgres: (actorId: string) =>
     invoke<string>("disconnect_postgres", { actorId }),

@@ -69,7 +69,7 @@ impl TestCtx {
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
             anpr_processes: Arc::new(Mutex::new(Vec::new())),
             pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
@@ -101,8 +101,9 @@ impl TestCtx {
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            company_id,
+            
         )
         .expect("create gate user")
     }
@@ -113,12 +114,10 @@ impl TestCtx {
             self.state(),
             admin.id.clone(),
             name.to_string(),
+            password.to_string(),
             permissions,
-            company_id.clone(),
         )
         .expect("create user");
-        commands::set_initial_password(self.state(), name.to_string(), company_id, password.to_string())
-            .expect("set initial password");
         user
     }
 }
@@ -167,7 +166,7 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
     let admin = ctx.create_admin();
     let gate = ctx.create_gate_user(&admin);
 
-    let err = update_anpr_config(ctx.state(), gate.id.clone(), Some("easyocr".to_string()), None, None, None, None, None, None, None, None, None, None, None)
+    let err = update_anpr_config(ctx.state(), gate.id.clone(), Some("easyocr".to_string()), None, None, None, None, None, None, None, None, None, None, None, None)
         .expect_err("gate officer must not change ANPR config");
     assert!(err.contains("permission"));
 
@@ -184,6 +183,7 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
         Some(100),
         None,
         Some(48.0),
+        None,
         None,
         None,
     )
@@ -224,7 +224,7 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
     assert_eq!(switched.0, 1, "engine swap is audit-logged");
     assert!(switched.1.contains("paddleocr") && switched.1.contains("easyocr"), "swap records from/to: {switched:?}");
 
-    let bad = update_anpr_config(ctx.state(), admin.id.clone(), None, None, Some(1.5), None, None, None, None, None, None, None, None, None)
+    let bad = update_anpr_config(ctx.state(), admin.id.clone(), None, None, Some(1.5), None, None, None, None, None, None, None, None, None, None)
         .expect_err("threshold out of range rejected");
     assert!(bad.contains("between 0 and 1"));
 }
@@ -238,7 +238,7 @@ fn confidence_threshold_is_per_engine_and_tracks_active_engine() {
 
     // Admin switches to easyocr (active) with its own threshold; paddleocr stays
     // at the seed 0.7. The active threshold is easyocr's.
-    update_anpr_config(ctx.state(), admin.id.clone(), Some("easyocr".to_string()), Some(0.7), Some(0.55), None, None, None, None, None, None, None, None, None)
+    update_anpr_config(ctx.state(), admin.id.clone(), Some("easyocr".to_string()), Some(0.7), Some(0.55), None, None, None, None, None, None, None, None, None, None)
         .expect("switch to easyocr");
     let state = ctx.state();
     let conn = state.db.lock().unwrap();

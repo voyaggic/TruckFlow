@@ -562,6 +562,22 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
   const editing = users.find((u) => u.id === editingId) ?? null;
   const visible = showDeleted ? users : users.filter((u) => u.status !== "deleted");
 
+  // Resolve a display role for a user: the most specific role preset whose
+  // permission bundle the user fully holds, else Admin/Custom/No access.
+  const roleFor = (u: UserView): string => {
+    const keys = new Set(u.permissions);
+    let best: { name: string; size: number } | null = null;
+    for (const p of presets) {
+      const pk = p.permission_keys ?? [];
+      if (pk.length === 0 || !pk.every((k) => keys.has(k))) continue;
+      if (!best || pk.length > best.size) best = { name: p.name, size: pk.length };
+    }
+    if (best) return best.name;
+    if (keys.has("manage_users")) return "Admin";
+    if (keys.size === 0) return "No access";
+    return "Custom";
+  };
+
   return (
     <div className="card stack" style={{ marginBottom: 16 }}>
       <div className="row between">
@@ -594,7 +610,7 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
       <table className="table">
         <colgroup>
           <col style={{ width: "120px" }} />
-          <col style={{ width: "80px" }} />
+          <col style={{ width: "110px" }} />
           <col style={{ width: "90px" }} />
           <col />
           <col style={{ width: "70px", whiteSpace: "nowrap" }} />
@@ -602,7 +618,7 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
         <thead>
           <tr>
             <th>Name</th>
-            <th>Credential</th>
+            <th>Role</th>
             <th>Status</th>
             <th>Permissions</th>
             <th style={{ whiteSpace: "nowrap" }} />
@@ -616,7 +632,8 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
                 {u.id === actor.id && <span className="muted small"> (you)</span>}
               </td>
               <td>
-                <span className="badge password">{u.permissions.includes("manage_users") ? "Admin" : "User"}</span>
+                <span className="badge password">{roleFor(u)}</span>
+                <span className="muted small" style={{ marginLeft: 6 }}>{u.auth_type}</span>
               </td>
               <td>
                 <span className={`badge ${u.status}`}>{u.status}</span>

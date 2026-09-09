@@ -92,6 +92,10 @@ function PostgresPanel({
   const [pat, setPat] = useState("");
   const [connType, setConnType] = useState<"pgbouncer" | "rest">("pgbouncer");
   const [tripRetention, setTripRetention] = useState("");
+  const [schemaSql, setSchemaSql] = useState<string | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [copySuccess, setCopySuccess] = useState(false);
   const pg = status?.pg;
 
   // Track the pending count when sync starts so we can show incremental
@@ -106,6 +110,38 @@ function PostgresPanel({
     }
   }, [totalPending]);
   const pgSynced = pgBaseline > 0 ? pgBaseline - totalPending : 0;
+
+  const generateSchema = async () => {
+    setSchemaLoading(true);
+    setSchemaError(null);
+    try {
+      const sql = await api.generateCloudSchema(actor.id);
+      setSchemaSql(sql);
+    } catch (e) {
+      setSchemaError(String(e));
+    } finally {
+      setSchemaLoading(false);
+    }
+  };
+
+  const copySchema = async () => {
+    if (!schemaSql) return;
+    try {
+      await navigator.clipboard.writeText(schemaSql);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    } catch {
+      // Fallback: select text for manual copy
+      const el = document.getElementById("schema-output");
+      if (el) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      }
+    }
+  };
 
   const saveTripRetention = () => {
     const v = tripRetention.trim();
@@ -215,6 +251,8 @@ function PostgresPanel({
             <div className="field grow">
               <label>Connection string</label>
               <input
+                type="password"
+                autoComplete="off"
                 value={connString}
                 onChange={(e) => setConnString(e.target.value)}
                 placeholder={connType === "pgbouncer"
@@ -231,6 +269,8 @@ function PostgresPanel({
                 <div className="field" style={{ marginTop: 8 }}>
                   <label>Personal Access Token (for table creation)</label>
                   <input
+                    type="password"
+                    autoComplete="off"
                     value={pat}
                     onChange={(e) => setPat(e.target.value)}
                     placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -251,6 +291,47 @@ function PostgresPanel({
             </div>
           </div>
           <AdapterError message={pg?.last_error} />
+          <div className="row" style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+            <button
+              className="ghost small"
+              onClick={generateSchema}
+              disabled={schemaLoading}
+            >
+              {schemaLoading ? "Generating…" : "Generate Schema"}
+            </button>
+            <span className="muted small" style={{ alignSelf: "center" }}>
+              Generate PostgreSQL schema from local data — paste into Supabase SQL Editor before connecting.
+            </span>
+          </div>
+          {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
+          {schemaSql && (
+            <div className="stack" style={{ marginTop: 8 }}>
+              <div className="row between" style={{ alignItems: "center" }}>
+                <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
+                <button className="ghost small" onClick={copySchema}>
+                  {copySuccess ? "Copied!" : "Copy to clipboard"}
+                </button>
+              </div>
+              <pre
+                id="schema-output"
+                style={{
+                  background: "var(--card-muted, #f5f5f5)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: 12,
+                  fontSize: 11,
+                  fontFamily: "monospace",
+                  maxHeight: 300,
+                  overflow: "auto",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                  margin: 0,
+                }}
+              >
+                {schemaSql}
+              </pre>
+            </div>
+          )}
         </div>
       ) : (
         <div className="stack">
@@ -331,6 +412,51 @@ function PostgresPanel({
           </div>
 
           <AdapterError message={pg?.last_error} />
+
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <button
+                className="ghost small"
+                onClick={generateSchema}
+                disabled={schemaLoading}
+              >
+                {schemaLoading ? "Generating…" : "Generate Schema"}
+              </button>
+              <span className="muted small">
+                Regenerate after adding/editing tables or columns.
+              </span>
+            </div>
+            {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
+            {schemaSql && (
+              <div className="stack" style={{ marginTop: 8 }}>
+                <div className="row between" style={{ alignItems: "center" }}>
+                  <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
+                  <button className="ghost small" onClick={copySchema}>
+                    {copySuccess ? "Copied!" : "Copy to clipboard"}
+                  </button>
+                </div>
+                <pre
+                  id="schema-output"
+                  style={{
+                    background: "var(--card-muted, #f5f5f5)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: 12,
+                    fontSize: 11,
+                    fontFamily: "monospace",
+                    maxHeight: 300,
+                    overflow: "auto",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                    margin: 0,
+                  }}
+                >
+                  {schemaSql}
+                </pre>
+              </div>
+            )}
+          </div>
+
           <div className="row">
             <button className="danger small" onClick={disconnect} disabled={isPending("pg-disconnect")}>
               {isPending("pg-disconnect") ? "Disconnecting…" : "Disconnect"}

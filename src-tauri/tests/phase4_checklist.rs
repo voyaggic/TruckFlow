@@ -77,7 +77,7 @@ impl TestCtx {
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
             anpr_processes: Arc::new(Mutex::new(Vec::new())),
             pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
@@ -112,30 +112,27 @@ impl TestCtx {
     }
 
     fn create_gate_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        // create_user signature: (state, actor_id, name, password, permission_keys)
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            company_id,
         )
         .expect("create gate user")
     }
 
     fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
-        let user = commands::create_user(
+        // The admin sets the initial password directly at creation time.
+        commands::create_user(
             self.state(),
             admin.id.clone(),
             name.to_string(),
+            password.to_string(),
             permissions,
-            company_id.clone(),
         )
-        .expect("create user");
-        commands::set_initial_password(self.state(), name.to_string(), company_id, password.to_string())
-            .expect("set initial password");
-        user
+        .expect("create user")
     }
 }
 
@@ -193,6 +190,21 @@ fn queue_trip(ctx: &TestCtx, plate: &str) -> truckflow_lib::models::TripView {
     res.queued.expect("unknown plate with confirm-required mode must queue")
 }
 
+/// Log a trip AND close it with a matching exit read. The Postgres sync engine
+/// only pushes COMPLETED trips (entry AND exit — an open trip is still in
+/// progress), so sync assertions need a closed trip.
+fn complete_trip(ctx: &TestCtx, admin: &SessionUser, plate: &str) -> truckflow_lib::models::TripView {
+    let entry = log_trip(ctx, admin, plate);
+    let res = ingest_read(&ctx.conn(), None, &read(plate, 0.95, &now_iso()), "auto", &ctx.frames_dir()).unwrap();
+    assert!(res.trip.is_some(), "second read must resolve the open trip");
+    let exit_time: Option<String> = ctx
+        .conn()
+        .query_row("SELECT exit_time FROM trips WHERE id = ?1", rusqlite::params![entry.id], |r| r.get(0))
+        .unwrap();
+    assert!(exit_time.is_some(), "trip must be closed by the exit read");
+    entry
+}
+
 fn synced_flag(conn: &rusqlite::Connection, table: &str, id: &str) -> i64 {
     conn.query_row(&format!("SELECT synced FROM {table} WHERE id = ?1"), rusqlite::params![id], |r| r.get(0))
         .unwrap()
@@ -220,7 +232,7 @@ fn offline_first_capture_then_reconnect_no_loss_no_duplicates() {
     let pg = MockPostgres::new();
     pg.simulate_connectivity(false).unwrap();
 
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
     let trip_id = trip.id.clone();
 
     // Offline pass: nothing pushed, trip still unsynced — no error surfaced.
@@ -266,7 +278,7 @@ fn sheets_and_postgres_sync_fail_independently() {
     sheets.simulate_connectivity(false).unwrap();
     let pg = MockPostgres::new();
 
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
     let trip_id = trip.id.clone();
 
     let s = run_sheets_sync_impl(&conn, &sheets).expect("sheets sync must not error while down");
@@ -366,8 +378,13 @@ fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
     assert_eq!(second.pushed, 0, "non-discharge manual entry never reaches the sheet");
     assert_eq!(pushed_to_sheets_flag(&conn, &manual.id), 0);
 
-    // Another manual entry classified as discharge (Yes) → exported.
-    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir(), None)
+    // Another manual entry classified as discharge (Yes) → exported. A third
+    // vehicle avoids entry/exit matching with the still-open trips above.
+    reference::create_vehicle(
+        ctx.state(), admin.id.clone(), "A323AB".into(),
+        None, Some(20.0), "litres".into(), None, None,
+    ).unwrap();
+    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A323AB", &ctx.frames_dir(), None)
         .unwrap()
         .trip
         .expect("manual exact match logs");
@@ -462,7 +479,7 @@ fn connectivity_simulation_toggles_status_and_sync() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
     seed_reference(&ctx, &admin);
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
 
     // Connect sheets so its integration state is genuinely "connected".
     connect_google_sheets(ctx.state(), admin.id.clone(), None, None, "realtime".into()).unwrap();

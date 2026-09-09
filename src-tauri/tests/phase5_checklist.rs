@@ -81,7 +81,7 @@ impl TestCtx {
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
             anpr_processes: Arc::new(Mutex::new(Vec::new())),
             pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
@@ -116,56 +116,51 @@ impl TestCtx {
     }
 
     fn create_gate_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        // create_user signature: (state, actor_id, name, password, permission_keys)
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            company_id,
         )
         .expect("create gate user")
     }
 
     fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
-        let user = commands::create_user(
+        // The admin sets the initial password directly at creation time.
+        commands::create_user(
             self.state(),
             admin.id.clone(),
             name.to_string(),
+            password.to_string(),
             permissions,
-            company_id.clone(),
         )
-        .expect("create user");
-        commands::set_initial_password(self.state(), name.to_string(), company_id, password.to_string())
-            .expect("set initial password");
-        user
+        .expect("create user")
     }
 
     fn create_monitor_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Watchdog".to_string(),
+            "Str0ng!Pass".to_string(),
             vec![
                 "view_system_health".to_string(),
                 "acknowledge_health_alerts".to_string(),
                 "view_health_history".to_string(),
             ],
-            company_id,
         )
         .expect("create monitor user")
     }
 
     fn create_operations_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "OpsChief".to_string(),
-            vec!["view_reports".to_string(), "view_audit_log".to_string(), "view_gate_entries".to_string()],
-            company_id,
+            "Str0ng!Pass".to_string(),
+            vec!["view_reporting_dashboard".to_string(), "view_audit_log".to_string(), "view_gate_entries".to_string()],
         )
         .expect("create operations user")
     }
@@ -925,7 +920,7 @@ fn reference_export_then_import_round_trips_custom_fields() {
         running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         frames_dir: fdir,
-        pg: Arc::new(MockPostgres::new()),
+        pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
         sheets: Arc::new(MockSheets::new()),
         anpr_processes: Arc::new(Mutex::new(Vec::new())),
         pending_sync_marks: Arc::new(Mutex::new(Vec::new())),

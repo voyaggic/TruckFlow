@@ -15,6 +15,7 @@ use crate::models::{
     AnprRead, AnprStatus, CaptureSettings, IngestResult, MatchOutcome, TripView, VehicleView,
 };
 use crate::reference::normalize_plate;
+use crate::sync;
 
 const UNKNOWN_CHARS: &[char] = &['*', '?', '.', ' '];
 
@@ -523,6 +524,10 @@ fn insert_trip(
         ],
     )
     .map_err(|e| format!("trip creation failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "vehicle_id": vehicle.id, "status": status, "capture_method": capture_method,
+        "time_in": time_in, "created_at": now, "updated_at": now
+    })));
     trip_by_id(conn, &id)
 }
 
@@ -562,7 +567,8 @@ fn insert_queued(
                     model_version = ?3,
                     ocr_engine = ?4,
                     entry_photo_refs = ?5,
-                    updated_at = ?6
+                    updated_at = ?6,
+                    synced = 0
                  WHERE id = ?7",
                 params![
                     capture_method,
@@ -574,6 +580,9 @@ fn insert_queued(
                     open_id,
                 ],
             ).map_err(|e| format!("open trip update failed: {e}"))?;
+            let _ = sync::write_to_sync_log(conn, "trips", &open_id, "UPDATE", Some(&serde_json::json!({
+                "id": open_id, "capture_method": capture_method, "updated_at": now_iso()
+            })));
             return trip_by_id(conn, &open_id);
         }
     }
@@ -617,6 +626,10 @@ fn insert_queued(
         ],
     )
     .map_err(|e| format!("trip queue failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "status": "queued", "capture_method": capture_method, "time_in": time_in,
+        "created_at": now, "updated_at": now
+    })));
     trip_by_id(conn, &id)
 }
 
@@ -841,17 +854,24 @@ fn match_entry_exit(
             conn.execute(
                 "UPDATE trips SET exit_time = ?1, trip_status = 'complete',
                         exit_photo_refs = ?2, updated_at = ?1,
-                        is_discharge_trip = 1
+                        is_discharge_trip = 1, synced = 0
                  WHERE id = ?3",
                 params![read.timestamp, exit_refs, open_id],
             ).map_err(|e| format!("exit update failed: {e}"))?;
+            let _ = sync::write_to_sync_log(conn, "trips", &open_id, "UPDATE", Some(&serde_json::json!({
+                "id": open_id, "exit_time": read.timestamp, "trip_status": "complete",
+                "is_discharge_trip": 1, "updated_at": read.timestamp
+            })));
             return Ok(EntryExitOutcome::ExitMatched(trip_by_id(conn, &open_id)?));
         }
         // Beyond window → mark old missed_exit, then fall through to create fresh entry.
         conn.execute(
-            "UPDATE trips SET trip_status = 'missed_exit', updated_at = ?1 WHERE id = ?2",
+            "UPDATE trips SET trip_status = 'missed_exit', updated_at = ?1, synced = 0 WHERE id = ?2",
             params![now_iso(), open_id],
         ).map_err(|e| format!("missed_exit update failed: {e}"))?;
+        let _ = sync::write_to_sync_log(conn, "trips", &open_id, "UPDATE", Some(&serde_json::json!({
+            "id": open_id, "trip_status": "missed_exit", "updated_at": now_iso()
+        })));
     }
 
     let trip = insert_trip(conn, officer_id, read, vehicle, capture_method, "logged", frames_dir)?;
@@ -863,7 +883,7 @@ fn match_entry_exit(
 // ---------------------------------------------------------------------------
 
 fn officer_id_for_session(state: &State<AppState>) -> Result<String, String> {
-    let session = state.session.lock().map_err(|e| e.to_string())?;
+    let session = match state.session.lock() { Ok(s) => s, Err(p) => p.into_inner() };
     session
         .as_ref()
         .map(|s| s.user_id.clone())
@@ -947,10 +967,13 @@ pub fn manual_entry_impl(
     if let Some(is_dis) = is_discharge {
         if let Some(ref trip) = result.trip {
             conn.execute(
-                "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
                 params![if is_dis { 1 } else { 0 }, now_iso(), trip.id],
             )
             .map_err(|e| format!("discharge classification failed: {e}"))?;
+            let _ = sync::write_to_sync_log(conn, "trips", &trip.id, "UPDATE", Some(&serde_json::json!({
+                "id": trip.id, "is_discharge_trip": is_dis, "updated_at": now_iso()
+            })));
             result.trip = Some(trip_by_id(conn, &trip.id)?);
         }
     }
@@ -1002,10 +1025,13 @@ pub fn approve_trip_impl(conn: &Connection, trip_id: &str, officer_id: &str) -> 
         m.insert("approved_at".to_string(), Value::String(now_iso()));
     }
     conn.execute(
-        "UPDATE trips SET status = 'logged', resolution_notes = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE trips SET status = 'logged', resolution_notes = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![map.to_string(), now_iso(), trip_id],
     )
     .map_err(|e| format!("trip approval failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "status": "logged", "updated_at": now_iso()
+    })));
     append_audit(conn, officer_id, "approved_trip", Some(trip_id), None)?;
     trip_by_id(conn, trip_id)
 }
@@ -1052,7 +1078,7 @@ pub fn update_trip_fields_impl(
     let n = conn
         .execute(
             "UPDATE trips SET company_id = ?1, driver_id = ?2, capacity_at_trip = ?3,
-                    receipt_no = ?4, updated_at = ?5
+                    receipt_no = ?4, updated_at = ?5, synced = 0
              WHERE id = ?6",
             params![company_id, driver_id, capacity_at_trip, receipt_no, now_iso(), trip_id],
         )
@@ -1060,6 +1086,10 @@ pub fn update_trip_fields_impl(
     if n == 0 {
         return Err("Trip not found.".to_string());
     }
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "company_id": company_id, "driver_id": driver_id,
+        "capacity_at_trip": capacity_at_trip, "receipt_no": receipt_no, "updated_at": now_iso()
+    })));
     append_audit(conn, officer_id, "edited_trip", Some(trip_id), None)?;
     trip_by_id(conn, trip_id)
 }
@@ -1165,9 +1195,12 @@ pub fn archive_trip(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE trips SET archived = 1, updated_at = ?1 WHERE id = ?2",
+        "UPDATE trips SET archived = 1, updated_at = ?1, synced = 0 WHERE id = ?2",
         params![crate::db::now_iso(), trip_id],
     ).map_err(|e| format!("archive trip failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "trips", &trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "archived": 1, "updated_at": crate::db::now_iso()
+    })));
     crate::db::append_audit(&conn, &actor_id, "archived_trip", Some(&trip_id), None)?;
     Ok(())
 }
@@ -1181,12 +1214,26 @@ pub fn clear_today_trips(
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let day = chrono::Utc::now().format("%Y-%m-%d");
     let from = format!("{day}T00:00:00Z");
+    let now = crate::db::now_iso();
+    let mut stmt = conn.prepare(
+        "SELECT id FROM trips WHERE time_in >= ?1 AND status != 'declined' AND archived = 0"
+    ).map_err(|e| format!("clear trips query failed: {e}"))?;
+    let ids: Vec<String> = stmt.query_map(params![from], |r| r.get(0))
+        .map_err(|e| format!("clear trips query failed: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("clear trips query failed: {e}"))?;
+    drop(stmt);
     let n = conn
         .execute(
-            "UPDATE trips SET archived = 1, updated_at = ?1 WHERE time_in >= ?2 AND status != 'declined' AND archived = 0",
-            params![crate::db::now_iso(), from],
+            "UPDATE trips SET archived = 1, updated_at = ?1, synced = 0 WHERE time_in >= ?2 AND status != 'declined' AND archived = 0",
+            params![now, from],
         )
         .map_err(|e| format!("clear trips failed: {e}"))?;
+    for id in &ids {
+        let _ = sync::write_to_sync_log(&conn, "trips", id, "UPDATE", Some(&serde_json::json!({
+            "id": id, "archived": 1, "updated_at": now
+        })));
+    }
     crate::db::append_audit(&conn, &actor_id, "cleared_gate_entries", None, Some(serde_json::json!({ "count": n })))?;
     Ok(n as i64)
 }
@@ -1420,7 +1467,7 @@ fn resolve_to_logged(
     conn.execute(
         "UPDATE trips SET vehicle_id = ?1, company_id = ?2, driver_id = ?3,
                 capacity_at_trip = ?4, capacity_unit = ?5, receipt_no = COALESCE(?6, receipt_no),
-                status = 'logged', resolution_notes = ?7, updated_at = ?8
+                status = 'logged', resolution_notes = ?7, updated_at = ?8, synced = 0
          WHERE id = ?9",
         params![
             vehicle.id,
@@ -1435,6 +1482,10 @@ fn resolve_to_logged(
         ],
     )
     .map_err(|e| format!("resolution failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "vehicle_id": vehicle.id, "status": "logged",
+        "updated_at": now_iso()
+    })));
     // A human selected/entered the correct vehicle here — the frames plus the
     // corrected answer are prime retraining data (08 §6.2).
     flag_training_candidates(conn, trip_id, "human_corrected")?;
@@ -1481,7 +1532,7 @@ pub fn resolve_queued_manual(
     conn.execute(
         "UPDATE trips SET vehicle_id = NULL, company_id = COALESCE(?1, company_id), driver_id = COALESCE(?2, driver_id),
                 capacity_at_trip = COALESCE(?3, capacity_at_trip), capacity_unit = ?4, receipt_no = COALESCE(?5, receipt_no),
-                status = 'logged', resolution_notes = ?6, updated_at = ?7
+                status = 'logged', resolution_notes = ?6, updated_at = ?7, synced = 0
          WHERE id = ?8",
         params![
             company_id,
@@ -1495,6 +1546,9 @@ pub fn resolve_queued_manual(
         ],
     )
     .map_err(|e| format!("manual resolution failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "trips", &trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "status": "logged", "updated_at": now_iso()
+    })));
 
     flag_training_candidates(&conn, &trip_id, "human_corrected")?;
     append_audit(&conn, &officer_id, "resolved_queue_manual", Some(&trip_id), None)?;
@@ -1713,10 +1767,13 @@ pub fn discard_trip_impl(conn: &Connection, trip_id: &str, officer_id: &str) -> 
         m.insert("resolved_at".to_string(), Value::String(now_iso()));
     }
     conn.execute(
-        "UPDATE trips SET status = 'discarded', resolution_notes = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE trips SET status = 'discarded', resolution_notes = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![map.to_string(), now_iso(), trip_id],
     )
     .map_err(|e| format!("discard failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "status": "discarded", "updated_at": now_iso()
+    })));
     append_audit(conn, officer_id, "discarded_trip", Some(trip_id), None)?;
     trip_by_id(conn, trip_id)
 }
@@ -1755,10 +1812,13 @@ pub fn decline_trip_impl(conn: &Connection, trip_id: &str, officer_id: &str) -> 
         m.insert("resolved_at".to_string(), Value::String(now_iso()));
     }
     conn.execute(
-        "UPDATE trips SET status = 'declined', resolution_notes = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE trips SET status = 'declined', resolution_notes = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![map.to_string(), now_iso(), trip_id],
     )
     .map_err(|e| format!("decline failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "status": "declined", "updated_at": now_iso()
+    })));
     append_audit(conn, officer_id, "declined_trip", Some(trip_id), None)?;
     trip_by_id(conn, trip_id)
 }
@@ -1824,6 +1884,9 @@ pub fn purge_declined_impl(
     }
     conn.execute("DELETE FROM trips WHERE id = ?1", params![trip_id])
         .map_err(|e| format!("purge failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "DELETE", Some(&serde_json::json!({
+        "id": trip_id
+    })));
     let trip_dir = frames_dir.join(trip_id);
     if trip_dir.is_dir() {
         let _ = std::fs::remove_dir_all(&trip_dir);
@@ -1866,10 +1929,13 @@ pub fn classify_discharge_impl(
         return Err("Discharge classification applies to logged trips only.".to_string());
     }
     conn.execute(
-        "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE trips SET is_discharge_trip = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![if is_discharge { 1 } else { 0 }, now_iso(), trip_id],
     )
     .map_err(|e| format!("discharge classification failed: {e}"))?;
+    let _ = sync::write_to_sync_log(conn, "trips", trip_id, "UPDATE", Some(&serde_json::json!({
+        "id": trip_id, "is_discharge_trip": is_discharge, "updated_at": now_iso()
+    })));
     append_audit(
         conn,
         officer_id,

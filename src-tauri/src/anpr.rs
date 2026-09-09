@@ -15,6 +15,7 @@ use crate::models::{
     AnprConfigView, AnprCredentialView, AnprDiagnosticsView, CameraSourceView,
     DependencyHealthView, ModelVersionView, TrainingCandidateView,
 };
+use crate::sync;
 
 const CONFIG_PERM: &str = "manage_anpr_config";
 
@@ -233,6 +234,9 @@ pub fn update_anpr_config(
         ],
     )
     .map_err(|e| format!("anpr config update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "anpr_config", ANPR_CONFIG_ID, "UPDATE", Some(&serde_json::json!({
+        "id": ANPR_CONFIG_ID, "updated_by": actor_id, "updated_at": now_iso()
+    })));
     if previous_engine.as_deref().is_some_and(|prev| prev != engine.as_str()) {
         append_audit(
             &conn,
@@ -327,6 +331,9 @@ pub fn add_camera_source<R: tauri::Runtime>(
         params![id, label.trim(), source_type, connection_string.trim(), extra_fields, now],
     )
     .map_err(|e| format!("camera source create failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "label": label.trim(), "source_type": source_type, "created_at": now
+    })));
     append_audit(&conn, &actor_id, "added_camera_source", Some(&id), Some(json!({ "label": label.trim(), "source_type": source_type })))?;
     let result = camera_source_by_id(&conn, &id);
     drop(conn);
@@ -376,6 +383,9 @@ pub fn update_camera_source<R: tauri::Runtime>(
         ],
     )
     .map_err(|e| format!("camera source update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
+        "id": source_id, "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "updated_camera_source", Some(&source_id), None)?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -402,6 +412,9 @@ pub fn set_camera_source_status<R: tauri::Runtime>(
         params![status, now_iso(), source_id],
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
+        "id": source_id, "status": status, "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "set_camera_source_status", Some(&source_id), Some(json!({ "status": status })))?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -426,6 +439,9 @@ pub fn set_camera_source_tracked<R: tauri::Runtime>(
         params![if tracked { 1 } else { 0 }, now_iso(), source_id],
     )
     .map_err(|e| format!("camera source tracked update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
+        "id": source_id, "tracked": tracked, "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "set_camera_source_tracked", Some(&source_id), Some(json!({ "tracked": tracked })))?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -455,6 +471,9 @@ pub fn delete_camera_source<R: tauri::Runtime>(
         params![source_id],
     )
     .map_err(|e| format!("camera source delete failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "DELETE", Some(&serde_json::json!({
+        "id": source_id
+    })));
     // Archive all queued trips since a camera source was removed — the queue
     // is only meaningful while the pipeline that produced those reads is active.
     let archived = conn
@@ -511,6 +530,9 @@ pub fn test_camera_connection(
         params![status, now, result_str, source_id],
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
+        "id": source_id, "status": status, "last_connection_check_at": now
+    })));
     camera_source_by_id(&conn, &source_id)
 }
 
@@ -868,6 +890,9 @@ pub fn register_model_version(
         params![id, version_label.trim(), component.trim(), validation_accuracy, now],
     )
     .map_err(|e| format!("model version create failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "model_versions", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "version_label": version_label.trim(), "component": component.trim(), "created_at": now
+    })));
     append_audit(&conn, &actor_id, "registered_model_version", Some(&id), Some(json!({ "component": component.trim() })))?;
     model_version_by_id(&conn, &id)
 }
@@ -903,6 +928,9 @@ pub fn deploy_model_version(state: State<AppState>, actor_id: String, version_id
     )
     .map_err(|e| format!("model deploy failed: {e}"))?;
     tx.commit().map_err(|e| format!("transaction commit failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "model_versions", &version_id, "UPDATE", Some(&serde_json::json!({
+        "id": version_id, "is_live": 1, "deployed_by": actor_id, "deployed_at": now
+    })));
     append_audit(&conn, &actor_id, "deployed_model_version", Some(&version_id), Some(json!({ "component": component })))?;
     model_version_by_id(&conn, &version_id)
 }
@@ -946,6 +974,9 @@ pub fn rollback_model_version(state: State<AppState>, actor_id: String, version_
     )
     .map_err(|e| format!("model rollback failed: {e}"))?;
     tx.commit().map_err(|e| format!("transaction commit failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "model_versions", &version_id, "UPDATE", Some(&serde_json::json!({
+        "id": version_id, "is_live": 1, "deployed_by": actor_id, "deployed_at": now
+    })));
     append_audit(&conn, &actor_id, "rolled_back_model_version", Some(&version_id), Some(json!({ "from": current_live })))?;
     model_version_by_id(&conn, &version_id)
 }
@@ -1036,6 +1067,9 @@ pub fn add_training_candidate(
         params![id, frame_ref, now],
     )
     .map_err(|e| format!("Failed to insert training candidate: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "training_candidates", &id, "INSERT", Some(&serde_json::json!({
+        "id": id, "frame_ref": frame_ref, "reason": "manual_upload", "created_at": now
+    })));
     Ok(TrainingCandidateView {
         id,
         source_trip_id: None,
@@ -1065,6 +1099,9 @@ pub fn approve_training_candidate(
         params![candidate_id],
     )
     .map_err(|e| format!("Failed to approve candidate: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "training_candidates", &candidate_id, "DELETE", Some(&serde_json::json!({
+        "id": candidate_id
+    })));
     append_audit(&conn, &actor_id, "approved_training_candidate", Some(&candidate_id), None)?;
     Ok(())
 }
@@ -1083,6 +1120,9 @@ pub fn reject_training_candidate(
         params![candidate_id],
     )
     .map_err(|e| format!("Failed to reject candidate: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "training_candidates", &candidate_id, "DELETE", Some(&serde_json::json!({
+        "id": candidate_id
+    })));
     append_audit(&conn, &actor_id, "rejected_training_candidate", Some(&candidate_id), None)?;
     Ok(())
 }
@@ -1098,6 +1138,9 @@ pub fn approve_all_training_candidates(
     let count = conn
         .execute("DELETE FROM training_candidates", [])
         .map_err(|e| format!("Failed to approve all candidates: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "training_candidates", "_bulk", "DELETE", Some(&serde_json::json!({
+        "count": count, "reason": "approve_all"
+    })));
     append_audit(&conn, &actor_id, "approved_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
     Ok(count as i64)
 }
@@ -1113,6 +1156,9 @@ pub fn reject_all_training_candidates(
     let count = conn
         .execute("DELETE FROM training_candidates", [])
         .map_err(|e| format!("Failed to reject all candidates: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "training_candidates", "_bulk", "DELETE", Some(&serde_json::json!({
+        "count": count, "reason": "reject_all"
+    })));
     append_audit(&conn, &actor_id, "rejected_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
     Ok(count as i64)
 }
@@ -1370,6 +1416,9 @@ pub fn set_anpr_machine(
         params![info.machine_id, now_iso(), ANPR_CONFIG_ID],
     )
     .map_err(|e| format!("machine designation failed: {e}"))?;
+    let _ = sync::write_to_sync_log(&conn, "anpr_config", ANPR_CONFIG_ID, "UPDATE", Some(&serde_json::json!({
+        "id": ANPR_CONFIG_ID, "designated_machine_id": info.machine_id, "updated_at": now_iso()
+    })));
     append_audit(&conn, &actor_id, "designated_anpr_machine", None, Some(json!({
         "hostname": info.hostname,
         "machine_id": info.machine_id,
