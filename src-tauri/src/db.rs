@@ -1,8 +1,4 @@
-use std::io::Read;
 use std::path::PathBuf;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
@@ -37,11 +33,8 @@ pub struct AppState {
     pub anpr_starting: Arc<std::sync::atomic::AtomicBool>,
     /// Root directory where frame evidence files are stored (04 §7.4).
     pub frames_dir: PathBuf,
-    /// PostgreSQL sync adapter — runtime-swappable wrapper so connecting to
-    /// Supabase (which may switch adapter type) takes effect immediately
-    /// without an app restart. Consumers call through the PostgresAdapter
-    /// trait; configure_postgres swaps the inner adapter on success.
-    pub pg: std::sync::Arc<crate::sync::SharedPg>,
+    /// PostgreSQL sync adapter (mock in dev, real driver swappable later).
+    pub pg: Arc<dyn PostgresAdapter>,
     /// Google Sheets export adapter (mock in dev).
     pub sheets: Arc<dyn SheetsProvider>,
     /// ANPR service child processes (managed by start/stop commands).
@@ -50,9 +43,6 @@ pub struct AppState {
     /// but couldn't be marked locally because sync_db was contended.
     /// Drained at the start of each poller cycle before pushing.
     pub pending_sync_marks: Arc<Mutex<Vec<(String, Vec<String>)>>>,
-    /// Event-driven sync trigger. When a trip is created, send(()) wakes
-    /// the sync worker instantly — zero polling delay.
-    pub sync_notify: std::sync::mpsc::SyncSender<()>,
 }
 
 pub fn now_iso() -> String {
@@ -65,73 +55,7 @@ pub fn now_iso_offset(secs: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-// ── Session token persistence ──────────────────────────────────────────
-const SESSION_TOKEN_FILE: &str = "session.token";
-const SESSION_TTL_DAYS: i64 = 30;
-
-/// Generate a 256-bit cryptographically secure session token (64 hex chars).
-/// The previous scheme (clock nanos + PID + thread-id length) was guessable
-/// by any process on the machine — token ENTROPY is the security boundary
-/// here, since the file lives in user-space next to the database.
-pub fn generate_session_token() -> String {
-    use rand_core::{OsRng, RngCore};
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Lookup key for the sessions table. Not the security boundary (the token's
-/// 256 bits of entropy are) — this just avoids storing raw tokens in SQLite.
-pub fn hash_session_token(token: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h1 = DefaultHasher::new();
-    token.hash(&mut h1);
-    let mut h2 = DefaultHasher::new();
-    format!("{:x}", h1.finish()).hash(&mut h2);
-    format!("{:x}", h2.finish())
-}
-
-fn token_file_path() -> PathBuf {
-    let dir = default_db_path().parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-    dir.join(SESSION_TOKEN_FILE)
-}
-
-
-
-/// Validate a session token from the file against the DB. Returns the user_id if valid.
-pub fn validate_session_token(conn: &Connection) -> Result<Option<String>, String> {
-    let path = token_file_path();
-    let mut file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return Ok(None),
-    };
-    let mut token = String::new();
-    file.read_to_string(&mut token).map_err(|e| format!("cannot read session file: {e}"))?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return Ok(None);
-    }
-
-    let token_hash = hash_session_token(&token);
-    let now = now_iso();
-
-    let result: Option<String> = conn
-        .query_row(
-            "SELECT user_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2 LIMIT 1",
-            params![token_hash, now],
-            |r| r.get(0),
-        )
-        .ok();
-
-    if result.is_none() {
-        let _ = std::fs::remove_file(&path);
-    }
-
-    Ok(result)
-}
-
-pub fn init_state(app: &AppHandle) -> Result<(AppState, std::sync::mpsc::Receiver<()>), String> {
+pub fn init_state(app: &AppHandle) -> Result<AppState, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -155,33 +79,21 @@ pub fn init_state(app: &AppHandle) -> Result<(AppState, std::sync::mpsc::Receive
     std::fs::create_dir_all(&frames_dir).map_err(|e| format!("cannot create frames dir: {e}"))?;
     let pg = crate::sync::real_postgres(&conn);
     let sheets = crate::sync::real_sheets(&conn);
-    // Event-driven sync channel: send(()) wakes the sync worker instantly.
-    // SyncSender capacity 1 — extra signals while busy are dropped (safe,
-    // the worker already knows to process pending rows).
-    let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel(1);
-    // Restore session from persistent token file on startup
-    let session_user_id = validate_session_token(&conn).ok().flatten();
-    let session = session_user_id.map(|user_id| Session {
-        user_id,
-        logged_in_at: now_iso(),
-        auth_type: "token".to_string(),
-    });
-    Ok((AppState {
+    Ok(AppState {
         db: Arc::new(Mutex::new(conn)),
         sync_db: Arc::new(Mutex::new(sync_conn)),
         anpr_db: Arc::new(Mutex::new(anpr_conn)),
-        session: Mutex::new(session),
+        session: Mutex::new(None),
         simulator: Arc::new(SimulatorSource::new()),
         anpr_last: Mutex::new(None),
         running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         frames_dir,
-        pg: std::sync::Arc::new(crate::sync::SharedPg::new(pg)),
+        pg,
         sheets,
         anpr_processes: Arc::new(Mutex::new(Vec::new())),
         anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
-        sync_notify: sync_tx,
-    }, sync_rx))
+    })
 }
 
 /// Open a database file, enable foreign keys, run migrations and seed data.
@@ -309,7 +221,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             );
 
             CREATE TABLE system_health_events (
-                id TEXT PRIMARY KEY NOT NULL,
+                id TEXT PRIMARY KEY,
                 component TEXT NOT NULL,
                 status TEXT NOT NULL,
                 detected_at TEXT NOT NULL,
@@ -1077,291 +989,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("version bump failed: {e}"))?;
     }
 
-    // Migration 31: Multi-PC architecture tables
-    if current < 31 {
-        conn.execute_batch(
-            r#"
-            -- Machine status: track which PC is online/offline
-            CREATE TABLE IF NOT EXISTS machine_status (
-                id TEXT PRIMARY KEY,
-                machine_id TEXT NOT NULL,
-                user_id TEXT,
-                company_id TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'gate_person',
-                last_seen_at TEXT NOT NULL,
-                is_online INTEGER NOT NULL DEFAULT 1,
-                ip_address TEXT,
-                pc_name TEXT,
-                UNIQUE(machine_id)
-            );
-
-            -- Company config: shared PG/Sheets settings
-            CREATE TABLE IF NOT EXISTS company_config (
-                company_id TEXT PRIMARY KEY,
-                pg_connection_string TEXT,
-                sheets_id TEXT,
-                sheets_frequency TEXT DEFAULT 'realtime',
-                anpr_enabled INTEGER DEFAULT 0,
-                updated_at TEXT NOT NULL,
-                updated_by TEXT
-            );
-            "#,
-        )
-        .map_err(|e| format!("migration 31 failed: {e}"))?;
-        conn.execute_batch("PRAGMA user_version = 31;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // Migration 32: Add company_id to users, unique username per company
-    if current < 32 {
-        // Add company_id column to users table (nullable for existing users)
-        conn.execute_batch(
-            r#"
-            ALTER TABLE users ADD COLUMN company_id TEXT REFERENCES companies(id);
-            "#,
-        )
-        .map_err(|e| format!("migration 32a failed: {e}"))?;
-        
-        // Create unique index: username must be unique per company
-        // Handle existing duplicates by keeping first user per (name, company_id) pair
-        conn.execute_batch(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_company 
-            ON users(name, company_id);
-            "#,
-        )
-        .map_err(|e| format!("migration 32b failed: {e}"))?;
-        
-        conn.execute_batch("PRAGMA user_version = 32;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // Migration 33: Add pending_deletes table to track deletions for sync
-    if current < 33 {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS pending_deletes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_name TEXT NOT NULL,
-                row_id TEXT NOT NULL,
-                deleted_at TEXT NOT NULL,
-                UNIQUE(table_name, row_id)
-            );
-            "#,
-        )
-        .map_err(|e| format!("migration 33 failed: {e}"))?;
-        conn.execute_batch("PRAGMA user_version = 33;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // Migration 34: Add detection_method to anpr_config
-    if current < 34 {
-        conn.execute_batch(
-            "ALTER TABLE anpr_config ADD COLUMN detection_method TEXT NOT NULL DEFAULT 'contour';",
-        )
-        .map_err(|e| format!("migration 34 failed: {e}"))?;
-        conn.execute_batch("PRAGMA user_version = 34;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // ── Migration 35: two-way sync infrastructure ──────────────────────────
-    // sync_log: every create/update/delete on a synced table is logged here.
-    // This is the change-tracking backbone for two-way sync, offline replay,
-    // and conflict detection.
-    if current < 35 {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS sync_log (
-                id TEXT PRIMARY KEY,
-                table_name TEXT NOT NULL,
-                record_id TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                payload TEXT,
-                pc_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                synced_to_cloud INTEGER NOT NULL DEFAULT 0,
-                synced_to_local INTEGER NOT NULL DEFAULT 0,
-                conflict_resolved INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_sync_log_table ON sync_log(table_name);
-            CREATE INDEX IF NOT EXISTS idx_sync_log_record ON sync_log(table_name, record_id);
-            CREATE INDEX IF NOT EXISTS idx_sync_log_pending ON sync_log(synced_to_cloud, created_at);
-
-            CREATE TABLE IF NOT EXISTS pc_identity (
-                pc_id TEXT PRIMARY KEY,
-                hostname TEXT,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS offline_queue (
-                id TEXT PRIMARY KEY,
-                sync_log_id TEXT NOT NULL REFERENCES sync_log(id),
-                operation TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                record_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                status TEXT NOT NULL DEFAULT 'pending'
-            );
-            CREATE INDEX IF NOT EXISTS idx_offline_queue_status ON offline_queue(status, created_at);
-            "#,
-        )
-        .map_err(|e| format!("migration 35 failed: {e}"))?;
-        conn.execute_batch("PRAGMA user_version = 35;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // ── Migration 36: add synced + updated_at to remaining sync tables ─────
-    // These tables previously existed only locally. Now that two-way sync is
-    // coming online, they need the same sync columns as the core 5 tables.
-    if current < 36 {
-        let now = now_iso();
-        // permissions
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE permissions ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE permissions ADD COLUMN updated_at TEXT NOT NULL DEFAULT '{now}';"
-        ));
-        // user_permissions
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE user_permissions ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE user_permissions ADD COLUMN updated_at TEXT NOT NULL DEFAULT '{now}';"
-        ));
-        // role_presets
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE role_presets ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE role_presets ADD COLUMN updated_at TEXT NOT NULL DEFAULT '{now}';"
-        ));
-        // field_definitions
-        let _ = conn.execute_batch(
-            "ALTER TABLE field_definitions ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;"
-        );
-        // audit_log
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE audit_log ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE audit_log ADD COLUMN updated_at TEXT NOT NULL DEFAULT '{now}';"
-        ));
-        // system_health_events
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE system_health_events ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE system_health_events ADD COLUMN updated_at TEXT NOT NULL DEFAULT '{now}';"
-        ));
-        // integrations — already has updated_at, just needs synced
-        let _ = conn.execute_batch(
-            "ALTER TABLE integrations ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;"
-        );
-        conn.execute_batch("PRAGMA user_version = 36;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // ── Migration 37: normalize permission min_auth_level to 'password' ────
-    // The app issues password credentials only; older databases still carry a
-    // pin/password mix in permissions.min_auth_level. Normalize locally and
-    // mark synced=0 so the corrected rows push to Supabase on next connect.
-    if current < 37 {
-        let changed = conn
-            .execute(
-                "UPDATE permissions SET min_auth_level = 'password', synced = 0, updated_at = ?1
-                 WHERE min_auth_level IS NULL OR min_auth_level != 'password'",
-                params![now_iso()],
-            )
-            .unwrap_or(0);
-        if changed > 0 {
-            crate::log::log(&format!("[DB] Migration 37: normalized min_auth_level to 'password' on {changed} permission(s)"));
-        }
-        conn.execute_batch("PRAGMA user_version = 37;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
-    // ── Migration 38: separate the ORGANIZATION from client companies ──────
-    // The signup flow creates the owner organization, but it was stored in the
-    // same `companies` table as the client companies whose trucks discharge
-    // trips — so the org row appeared in the admin Companies tab where it could
-    // be edited or deleted like any client. Organizations now live in their own
-    // table; `companies` holds ONLY client companies from here on.
-    if current < 38 {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS organizations (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                synced INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
-        )
-        .map_err(|e| format!("migration 38a failed: {e}"))?;
-
-        // Identify the org row: the company referenced by users created before
-        // any client use, i.e. the company of the FIRST admin (earliest user).
-        // Everything else in `companies` is a client company and stays.
-        // SQL is idempotent: if users.company_id is NULL or already migrated,
-        // nothing is inserted.
-        conn.execute_batch(
-            r#"
-            INSERT OR IGNORE INTO organizations (id, name, created_at, updated_at, synced)
-            SELECT c.id, c.name, c.created_at, c.updated_at, c.synced
-            FROM companies c
-            WHERE c.id = (
-                SELECT u.company_id FROM users u
-                WHERE u.company_id IS NOT NULL
-                ORDER BY u.created_at ASC LIMIT 1
-            );
-            "#,
-        )
-        .map_err(|e| format!("migration 38b failed: {e}"))?;
-
-        // users.organization_id replaces users.company_id for ownership.
-        // Backfill FIRST (while company_id still points at the org row).
-        conn.execute_batch(
-            r#"
-            ALTER TABLE users ADD COLUMN organization_id TEXT REFERENCES organizations(id);
-            UPDATE users SET organization_id = company_id
-            WHERE company_id IS NOT NULL
-              AND company_id IN (SELECT id FROM organizations);
-            "#,
-        )
-        .map_err(|e| format!("migration 38d failed: {e}"))?;
-
-        // Then clear the legacy link and drop the org rows from companies so
-        // the admin UI lists clients only. (FK constraint requires clearing
-        // company_id before the DELETE.)
-        conn.execute(
-            "UPDATE users SET company_id = NULL WHERE company_id IN (SELECT id FROM organizations)",
-            [],
-        )
-        .map_err(|e| format!("migration 38c-pre failed: {e}"))?;
-        conn.execute(
-            "DELETE FROM companies WHERE id IN (SELECT id FROM organizations)",
-            [],
-        )
-        .map_err(|e| format!("migration 38c failed: {e}"))?;
-
-        // Queue the deletions so the removal propagates to Supabase (existing
-        // cloud DBs still hold the org row inside `companies`).
-        {
-            let now = now_iso();
-            let ids: Vec<String> = {
-                let mut stmt = conn.prepare("SELECT id FROM organizations").map_err(|e| format!("migration 38e failed: {e}"))?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| format!("migration 38e failed: {e}"))?;
-                rows.filter_map(|r| r.ok()).collect()
-            };
-            for id in ids {
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO pending_deletes (table_name, row_id, deleted_at) VALUES ('companies', ?1, ?2)",
-                    params![id, now],
-                );
-            }
-        }
-
-        crate::log::log("[DB] Migration 38: organization separated from client companies");
-        conn.execute_batch("PRAGMA user_version = 38;")
-            .map_err(|e| format!("version bump failed: {e}"))?;
-    }
-
     Ok(())
 }
 
@@ -1424,25 +1051,23 @@ pub fn default_db_path() -> std::path::PathBuf {
 pub const ANPR_CONFIG_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 /// System-defined permission catalog. Keys are the stable identifiers the whole
-/// app gates on. min_auth_level records the credential kind the permission was
-/// designed for; the app currently issues password credentials only, so every
-/// entry is normalized to "password" (was a pin/password mix).
+/// app gates on; min_auth_level enforces credential strength per 03-auth-permissions.md §3.
 pub const PERMISSION_CATALOG: &[(&str, &str, &str, &str)] = &[
-    ("perm-view-gate-entries", "view_gate_entries", "password", "View the gate officer main view and recent entries"),
-    ("perm-resolve-queue", "resolve_queue", "password", "Resolve items in the verification queue"),
-    ("perm-view-reporting", "view_reporting_dashboard", "password", "View the reporting dashboard"),
-    ("perm-view-system-health", "view_system_health", "password", "View system health / monitor section"),
+    ("perm-view-gate-entries", "view_gate_entries", "pin", "View the gate officer main view and recent entries"),
+    ("perm-resolve-queue", "resolve_queue", "pin", "Resolve items in the verification queue"),
+    ("perm-view-reporting", "view_reporting_dashboard", "pin", "View the reporting dashboard"),
+    ("perm-view-system-health", "view_system_health", "pin", "View system health / monitor section"),
     ("perm-manage-users", "manage_users", "password", "Create, edit, disable and grant permissions to users"),
     ("perm-manage-reference", "manage_reference_database", "password", "Manage companies, vehicles and drivers"),
     ("perm-manage-integrations", "manage_integrations", "password", "Connect and manage external integrations"),
     ("perm-manage-anpr-config", "manage_anpr_config", "password", "Configure the ANPR engine, models, camera sources and thresholds"),
     ("perm-view-audit-log", "view_audit_log", "password", "View the audit log"),
-    ("perm-edit-existing-vehicles", "edit_existing_vehicles", "password", "Edit existing vehicles in the reference database"),
-    ("perm-register-new-vehicle", "register_new_vehicle", "password", "Register new vehicles from the Gate page"),
-    ("perm-export-reporting", "export_reporting", "password", "Export reporting data (CSV/PDF)"),
-    ("perm-edit-trip", "edit_trip", "password", "Edit trip details before confirming"),
-    ("perm-acknowledge-health-alerts", "acknowledge_health_alerts", "password", "Acknowledge system health alerts"),
-    ("perm-view-health-history", "view_health_history", "password", "View system health incident history"),
+    ("perm-edit-existing-vehicles", "edit_existing_vehicles", "pin", "Edit existing vehicles in the reference database"),
+    ("perm-register-new-vehicle", "register_new_vehicle", "pin", "Register new vehicles from the Gate page"),
+    ("perm-export-reporting", "export_reporting", "pin", "Export reporting data (CSV/PDF)"),
+    ("perm-edit-trip", "edit_trip", "pin", "Edit trip details before confirming"),
+    ("perm-acknowledge-health-alerts", "acknowledge_health_alerts", "pin", "Acknowledge system health alerts"),
+    ("perm-view-health-history", "view_health_history", "pin", "View system health incident history"),
 ];
 
 pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
@@ -1451,7 +1076,6 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
         "preset-admin",
         "Admin",
         &[
-            "view_gate_entries",
             "manage_reference_database",
             "manage_users",
             "view_audit_log",
@@ -1460,10 +1084,6 @@ pub const ROLE_PRESETS: &[(&str, &str, &[&str])] = &[
             "view_reporting_dashboard",
             "view_system_health",
             "acknowledge_health_alerts",
-            "export_reporting",
-            "register_new_vehicle",
-            "edit_existing_vehicles",
-            "resolve_queue",
         ],
     ),
     ("preset-reporting", "Reporting", &["view_reporting_dashboard", "export_reporting"]),
@@ -1615,109 +1235,4 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
     )
     .map(|_| ())
     .map_err(|e| format!("app_settings write failed: {e}"))
-}
-
-#[cfg(test)]
-mod security_tests {
-    use super::*;
-
-    #[test]
-    fn session_tokens_are_256bit_and_unique() {
-        let a = generate_session_token();
-        let b = generate_session_token();
-        assert_eq!(a.len(), 64, "token must be 64 hex chars (256 bits)");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b, "two tokens must never collide");
-    }
-
-    #[test]
-    fn session_token_hash_is_deterministic() {
-        let t = generate_session_token();
-        assert_eq!(hash_session_token(&t), hash_session_token(&t));
-        assert_ne!(hash_session_token(&t), hash_session_token("other"));
-    }
-}
-
-#[cfg(test)]
-mod org_migration_tests {
-    use super::*;
-    use rusqlite::params;
-
-    /// Migration 38 must move the signup company into `organizations`, remove it
-    /// from `companies`, and link users via organization_id — while leaving
-    /// genuine client companies untouched in `companies`.
-    #[test]
-    fn migration38_separates_org_from_client_companies() {
-        let conn = Connection::open_in_memory().unwrap();
-        // Build a pre-38 database: schema v1 + the migration-32 users.company_id column.
-        conn.execute_batch(
-            r#"
-            CREATE TABLE companies (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                extra_fields TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                synced INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE users (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                auth_type TEXT NOT NULL,
-                credential_hash TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                synced INTEGER NOT NULL DEFAULT 0,
-                company_id TEXT REFERENCES companies(id)
-            );
-            PRAGMA user_version = 37;
-            "#,
-        )
-        .unwrap();
-
-        let now = "2026-09-09T00:00:00Z";
-        // Org company (created at signup, referenced by the admin user)
-        conn.execute(
-            "INSERT INTO companies (id, name, created_at, updated_at) VALUES ('org-1', 'Exhauster Ltd', ?1, ?1)",
-            params![now],
-        ).unwrap();
-        // A genuine client company
-        conn.execute(
-            "INSERT INTO companies (id, name, created_at, updated_at) VALUES ('client-1', 'Acme Transport', ?1, ?1)",
-            params![now],
-        ).unwrap();
-        // Admin user linked to the org company
-        conn.execute(
-            "INSERT INTO users (id, name, auth_type, credential_hash, created_at, updated_at, company_id)
-             VALUES ('u1', 'admin', 'password', 'x', ?1, ?1, 'org-1')",
-            params![now],
-        ).unwrap();
-
-        // Run ONLY migration 38's logic by invoking migrate() — it is idempotent
-        // for versions < 38 and skips 1..37 because user_version = 37.
-        migrate(&conn).unwrap();
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 38, "migration must bump to 38");
-
-        // Org moved
-        let org_name: String = conn
-            .query_row("SELECT name FROM organizations WHERE id = 'org-1'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(org_name, "Exhauster Ltd");
-
-        // Org removed from companies; client remains
-        let companies: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT id FROM companies ORDER BY id").unwrap();
-            stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
-        };
-        assert_eq!(companies, vec!["client-1"], "only the client company remains");
-
-        // User now linked via organization_id
-        let org_id: String = conn
-            .query_row("SELECT organization_id FROM users WHERE id = 'u1'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(org_id, "org-1");
-    }
 }

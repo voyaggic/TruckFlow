@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
-import { listen } from "@tauri-apps/api/event";
 
 export default function SyncPanel({ user }: { user: SessionUser }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
@@ -21,24 +20,14 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
     // background poller pushes rows. Pure read-only call — no I/O beyond
     // a single SQLite query, so no lag or freeze.
     const id = setInterval(refresh, 5000);
-
-    // Listen for tables-created event and trigger sync automatically
-    const unlisten = listen("pg-tables-created", () => {
-      console.log("[SyncPanel] pg-tables-created received, triggering sync...");
-      fire("pg-auto-sync", () => api.syncNowPg(user.id), { successEvent: "pg-sync-done" });
-    });
-
-    return () => {
-      clearInterval(id);
-      unlisten.then((fn) => fn());
-    };
+    return () => clearInterval(id);
   }, [refresh]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
 
   // Non-blocking run: fires action, shows pending on that item, never freezes UI
-  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => {
-    fire(key, fn, { successMsg: okMsg, successEvent: event, errorEvent, refresh });
+  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => {
+    fire(key, fn, { successMsg: okMsg, successEvent: event, refresh });
   };
 
   return (
@@ -84,18 +73,12 @@ function PostgresPanel({
   status: SyncStatusView | null;
   totalPending: number;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {
   const [connString, setConnString] = useState("");
-  const [pat, setPat] = useState("");
-  const [connType, setConnType] = useState<"pgbouncer" | "rest">("pgbouncer");
   const [tripRetention, setTripRetention] = useState("");
-  const [schemaSql, setSchemaSql] = useState<string | null>(null);
-  const [schemaError, setSchemaError] = useState<string | null>(null);
-  const [schemaLoading, setSchemaLoading] = useState(false);
-  const [copySuccess, setCopySuccess] = useState(false);
   const pg = status?.pg;
 
   // Track the pending count when sync starts so we can show incremental
@@ -110,38 +93,6 @@ function PostgresPanel({
     }
   }, [totalPending]);
   const pgSynced = pgBaseline > 0 ? pgBaseline - totalPending : 0;
-
-  const generateSchema = async () => {
-    setSchemaLoading(true);
-    setSchemaError(null);
-    try {
-      const sql = await api.generateCloudSchema(actor.id);
-      setSchemaSql(sql);
-    } catch (e) {
-      setSchemaError(String(e));
-    } finally {
-      setSchemaLoading(false);
-    }
-  };
-
-  const copySchema = async () => {
-    if (!schemaSql) return;
-    try {
-      await navigator.clipboard.writeText(schemaSql);
-      setCopySuccess(true);
-      setTimeout(() => setCopySuccess(false), 2000);
-    } catch {
-      // Fallback: select text for manual copy
-      const el = document.getElementById("schema-output");
-      if (el) {
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        const sel = window.getSelection();
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      }
-    }
-  };
 
   const saveTripRetention = () => {
     const v = tripRetention.trim();
@@ -158,37 +109,7 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    let finalConnString = connString.trim();
-    if (connType === "rest") {
-      // User provides only the service_role key (eyJ...)
-      // Extract project_ref from JWT payload, build 3-part format: REST|URL|service_role_key
-      const apiKey = finalConnString;
-
-      try {
-        const parts = apiKey.split('.');
-        if (parts.length !== 3) {
-          window.alert("Invalid service_role key format. Should be a JWT like: eyJ...");
-          return;
-        }
-        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-        const projectRef = payload?.ref;
-        if (!projectRef) {
-          window.alert("Could not extract project reference from service_role key.");
-          return;
-        }
-        // 3-part format: REST|URL|service_role_key
-        finalConnString = `REST|https://${projectRef}.supabase.co/rest/v1|${apiKey}`;
-      } catch (e) {
-        window.alert("Failed to parse service_role key. Make sure you copied the full key starting with eyJ...");
-        return;
-      }
-    }
-    run("pg-connect", async () => {
-      await api.configurePostgres(actor.id, finalConnString);
-      if (connType === "rest" && pat.trim()) {
-        await api.createPostgresTables(actor.id, pat.trim());
-      }
-    }, "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
+    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured");
   };
 
   const disconnect = () => {
@@ -224,63 +145,17 @@ function PostgresPanel({
         <div className="stack">
           <p className="muted small">
             Connect to a PostgreSQL server by pasting its connection string. The first connect <b>creates the database
-            and its tables automatically</b>, so setup is paste-and-go.
+            and its tables automatically</b>, so setup is paste-and-go. On this machine your local server accepts:
           </p>
-          <div className="row" style={{ gap: 8, alignItems: "center" }}>
-            <span className="muted small">Connection type:</span>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-              <input
-                type="radio"
-                name="connType"
-                checked={connType === "pgbouncer"}
-                onChange={() => setConnType("pgbouncer")}
-              />
-              <span className="small">PgBouncer (fast, recommended)</span>
-            </label>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-              <input
-                type="radio"
-                name="connType"
-                checked={connType === "rest"}
-                onChange={() => setConnType("rest")}
-              />
-              <span className="small">REST API (more resilient for unstable connections)</span>
-            </label>
-          </div>
           <div className="row">
             <div className="field grow">
               <label>Connection string</label>
               <input
-                type="password"
-                autoComplete="off"
                 value={connString}
                 onChange={(e) => setConnString(e.target.value)}
-                placeholder={connType === "pgbouncer"
-                  ? "postgresql://postgres@127.0.0.1:5432/truckflow_central"
-                  : "Paste your Supabase service_role key (eyJ...)"}
+                placeholder="postgresql://postgres@127.0.0.1:5432/truckflow_central"
                 spellCheck={false}
               />
-              {connType === "rest" && (
-                <p className="muted small" style={{ marginTop: 4 }}>
-                  Paste the <b>service_role</b> key from Supabase Dashboard → Settings → API.
-                </p>
-              )}
-              {connType === "rest" && (
-                <div className="field" style={{ marginTop: 8 }}>
-                  <label>Personal Access Token (for table creation)</label>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={pat}
-                    onChange={(e) => setPat(e.target.value)}
-                    placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                    spellCheck={false}
-                  />
-                  <p className="muted small" style={{ marginTop: 4 }}>
-                    Generate at Supabase Dashboard → Settings → API → Personal Tokens → "Create a new token"
-                  </p>
-                </div>
-              )}
             </div>
             <div className="field">
               <label>&nbsp;</label>
@@ -291,47 +166,6 @@ function PostgresPanel({
             </div>
           </div>
           <AdapterError message={pg?.last_error} />
-          <div className="row" style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-            <button
-              className="ghost small"
-              onClick={generateSchema}
-              disabled={schemaLoading}
-            >
-              {schemaLoading ? "Generating…" : "Generate Schema"}
-            </button>
-            <span className="muted small" style={{ alignSelf: "center" }}>
-              Generate PostgreSQL schema from local data — paste into Supabase SQL Editor before connecting.
-            </span>
-          </div>
-          {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
-          {schemaSql && (
-            <div className="stack" style={{ marginTop: 8 }}>
-              <div className="row between" style={{ alignItems: "center" }}>
-                <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
-                <button className="ghost small" onClick={copySchema}>
-                  {copySuccess ? "Copied!" : "Copy to clipboard"}
-                </button>
-              </div>
-              <pre
-                id="schema-output"
-                style={{
-                  background: "var(--card-muted, #f5f5f5)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  padding: 12,
-                  fontSize: 11,
-                  fontFamily: "monospace",
-                  maxHeight: 300,
-                  overflow: "auto",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-all",
-                  margin: 0,
-                }}
-              >
-                {schemaSql}
-              </pre>
-            </div>
-          )}
         </div>
       ) : (
         <div className="stack">
@@ -412,51 +246,6 @@ function PostgresPanel({
           </div>
 
           <AdapterError message={pg?.last_error} />
-
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-            <div className="row" style={{ gap: 8, alignItems: "center" }}>
-              <button
-                className="ghost small"
-                onClick={generateSchema}
-                disabled={schemaLoading}
-              >
-                {schemaLoading ? "Generating…" : "Generate Schema"}
-              </button>
-              <span className="muted small">
-                Regenerate after adding/editing tables or columns.
-              </span>
-            </div>
-            {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
-            {schemaSql && (
-              <div className="stack" style={{ marginTop: 8 }}>
-                <div className="row between" style={{ alignItems: "center" }}>
-                  <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
-                  <button className="ghost small" onClick={copySchema}>
-                    {copySuccess ? "Copied!" : "Copy to clipboard"}
-                  </button>
-                </div>
-                <pre
-                  id="schema-output"
-                  style={{
-                    background: "var(--card-muted, #f5f5f5)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: 12,
-                    fontSize: 11,
-                    fontFamily: "monospace",
-                    maxHeight: 300,
-                    overflow: "auto",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-all",
-                    margin: 0,
-                  }}
-                >
-                  {schemaSql}
-                </pre>
-              </div>
-            )}
-          </div>
-
           <div className="row">
             <button className="danger small" onClick={disconnect} disabled={isPending("pg-disconnect")}>
               {isPending("pg-disconnect") ? "Disconnecting…" : "Disconnect"}
@@ -478,7 +267,7 @@ function ColumnMappingPanel({
   isPending: _isPending,
 }: {
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
   isPending: (key: string) => boolean;
 }) {
   const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
@@ -631,7 +420,7 @@ function SheetsPanel({
 }: {
   status: SyncStatusView | null;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
 }) {
@@ -671,8 +460,6 @@ function SheetsPanel({
     run("sheets-connect",
       () => api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
       "Google Sheets connected — logged trips will now export.",
-      "sheets-configured",
-      "sheets-config-error",
     );
   };
 

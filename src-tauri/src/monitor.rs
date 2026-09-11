@@ -12,7 +12,6 @@ use tauri::State;
 
 use crate::db::{now_iso, AppState};
 use crate::models::{ComponentHealth, ConfidenceTrendPoint, HealthDashboard, HealthEventView};
-use crate::sync;
 
 pub const COMPONENTS: &[&str] = &["camera", "anpr_service", "sync", "database"];
 
@@ -26,14 +25,11 @@ pub fn record_health_event(conn: &Connection, component: &str, status: &str, det
     let now = now_iso();
     if status == "ok" {
         conn.execute(
-            "UPDATE system_health_events SET resolved_at = ?1, synced = 0
+            "UPDATE system_health_events SET resolved_at = ?1
              WHERE component = ?2 AND resolved_at IS NULL",
             params![now, component],
         )
         .map_err(|e| format!("health resolve failed: {e}"))?;
-        let _ = sync::write_to_sync_log(conn, "system_health_events", component, "UPDATE", Some(&serde_json::json!({
-            "component": component, "resolved_at": now
-        })));
         return Ok(());
     }
 
@@ -46,25 +42,18 @@ pub fn record_health_event(conn: &Connection, component: &str, status: &str, det
         .map_err(|e| format!("health scan failed: {e}"))?;
     if open > 0 {
         conn.execute(
-            "UPDATE system_health_events SET detail = ?1, detected_at = ?2, synced = 0
+            "UPDATE system_health_events SET detail = ?1, detected_at = ?2
              WHERE component = ?3 AND resolved_at IS NULL",
             params![detail, now, component],
         )
         .map_err(|e| format!("health refresh failed: {e}"))?;
-        let _ = sync::write_to_sync_log(conn, "system_health_events", component, "UPDATE", Some(&serde_json::json!({
-            "component": component, "detail": detail, "detected_at": now
-        })));
     } else {
-        let event_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO system_health_events (id, component, status, detail, detected_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![event_id, component, status, detail, now],
+            params![uuid::Uuid::new_v4().to_string(), component, status, detail, now],
         )
         .map_err(|e| format!("health insert failed: {e}"))?;
-        let _ = sync::write_to_sync_log(conn, "system_health_events", &event_id, "INSERT", Some(&serde_json::json!({
-            "id": event_id, "component": component, "status": status, "detail": detail, "detected_at": now
-        })));
     }
     Ok(())
 }
@@ -208,7 +197,7 @@ pub fn acknowledge_health_event(state: State<AppState>, actor_id: String, event_
     crate::commands::ensure_admin_permission(&conn, &actor_id, "acknowledge_health_alerts")?;
     let n = conn
         .execute(
-            "UPDATE system_health_events SET acknowledged_by = ?1, acknowledged_at = ?2, synced = 0
+            "UPDATE system_health_events SET acknowledged_by = ?1, acknowledged_at = ?2
              WHERE id = ?3 AND resolved_at IS NULL",
             params![actor_id, now_iso(), event_id],
         )
@@ -216,9 +205,6 @@ pub fn acknowledge_health_event(state: State<AppState>, actor_id: String, event_
     if n == 0 {
         return Err("Alert not found or already resolved.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "system_health_events", &event_id, "UPDATE", Some(&serde_json::json!({
-        "id": event_id, "acknowledged_by": actor_id, "acknowledged_at": now_iso()
-    })));
     let event = conn
         .query_row(
             "SELECT e.id, e.component, e.status, e.detail, e.detected_at,
@@ -321,9 +307,6 @@ pub fn delete_health_events(
         deleted += conn
             .execute("DELETE FROM system_health_events WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| format!("health event delete failed: {e}"))?;
-        let _ = sync::write_to_sync_log(&conn, "system_health_events", id, "DELETE", Some(&serde_json::json!({
-            "id": id
-        })));
     }
     crate::db::append_audit(
         &conn,
@@ -333,84 +316,4 @@ pub fn delete_health_events(
         Some(serde_json::json!({ "count": event_ids.len() })),
     )?;
     Ok(deleted as i64)
-}
-
-// ---------------------------------------------------------------------------
-// Machine & User Monitoring (Phase 7 Pilot Deployment)
-// ---------------------------------------------------------------------------
-
-use crate::models::{MachineStatusView, MonitoringDashboard, UserStatusView};
-
-#[tauri::command]
-pub fn monitoring_dashboard(
-    state: State<AppState>,
-    actor_id: String,
-) -> Result<MonitoringDashboard, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::commands::ensure_admin_permission(&conn, &actor_id, "view_reporting_dashboard")?;
-
-    // Get machine statuses
-    let mut stmt = conn
-        .prepare(
-            "SELECT ms.machine_id, ms.user_id, u.name, ms.role, ms.last_seen_at, ms.is_online, ms.ip_address, ms.pc_name
-             FROM machine_status ms
-             LEFT JOIN users u ON ms.user_id = u.id
-             ORDER BY ms.last_seen_at DESC",
-        )
-        .map_err(|e| format!("machine list failed: {e}"))?;
-
-    let machines: Vec<MachineStatusView> = stmt
-        .query_map([], |r| {
-            Ok(MachineStatusView {
-                machine_id: r.get(0)?,
-                user_id: r.get(1)?,
-                user_name: r.get(2)?,
-                role: r.get(3)?,
-                last_seen_at: r.get(4)?,
-                is_online: r.get::<_, i64>(5)? == 1,
-                ip_address: r.get(6)?,
-                pc_name: r.get(7)?,
-            })
-        })
-        .map_err(|e| format!("machine query failed: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Get user statuses
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, status, auth_type, must_change_password, credential_hash, created_at
-             FROM users
-             WHERE status != 'deleted'
-             ORDER BY created_at DESC",
-        )
-        .map_err(|e| format!("user list failed: {e}"))?;
-
-    let users: Vec<UserStatusView> = stmt
-        .query_map([], |r| {
-            let credential_hash: String = r.get(5)?;
-            Ok(UserStatusView {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                status: r.get(2)?,
-                auth_type: r.get(3)?,
-                must_change_password: r.get::<_, i64>(4)? == 1,
-                credential_pending: credential_hash == "pending",
-                last_login: None,
-                created_at: r.get(6)?,
-            })
-        })
-        .map_err(|e| format!("user query failed: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let pending_users_count = users.iter().filter(|u| u.credential_pending).count() as i64;
-    let online_machines_count = machines.iter().filter(|m| m.is_online).count() as i64;
-
-    Ok(MonitoringDashboard {
-        machines,
-        users,
-        pending_users_count,
-        online_machines_count,
-    })
 }

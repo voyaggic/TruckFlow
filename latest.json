@@ -1,11 +1,11 @@
 {
-  "version": "1.0.0",
-  "notes": "TruckFlow v1.0.0",
-  "pub_date": "2026-09-09T12:19:52Z",
+  "version": "0.1.4",
+  "notes": "TruckFlow v0.1.4",
+  "pub_date": "2026-09-11T09:19:58Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSK2Y2UkRUaENVRDVyRlFiMlJncEkzaDRCaTRoWUlHanNnMXpQRFYxR3M3dTZ3bVlveWY4UVR5WGFPZ292R01hdXlGbkk2cC9rSWxJWi9QSzluNEY5aWtSWUkxZ1YzeEFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4OTU2Mzg3CWZpbGU6VHJ1Y2tGbG93XzAuMS4xX3g2NC1zZXR1cC5leGUKYnBrcjVHdEJpOTg3Y25Bb1N2dDlQTHZiKzVqbDdiV25iQUlyVmpRVFB5OUd0Nzk4UFBjcDJ3d3JRTkVRWHVlMzc1amNtcEV6VVhHSHgwQUZlN1ZqQVE9PQo=",
-      "url": "https://github.com/voyaggic/TruckFlow/releases/download/v1.0.0/TruckFlow_0.1.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSK2Y2UkRUaENVRHd4VzlrekhTMzBtSVJ6cnJwNjdWdm5XOVp0WE5YaXJoZFdOL3QrUjZzTTluTkVKOVA4YkV1akhiR1RUMFJRVmUreEQ1NnJxUUFXQ0luQ3h2MDNWZEEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MTE4MzkzCWZpbGU6VHJ1Y2tGbG93XzAuMS4xX3g2NC1zZXR1cC5leGUKRVRFazRQNE95S25zcVNnWDNpOStpZzFwQVBpK2tNbGEzOE0zTzJyeE5ud0N1YlJnRTYrNHpTbE11MnhuNjVzZUpLa01Qb1VHenh5WGNmdmt4NkhLRHc9PQo=",
+      "url": "https://github.com/voyaggic/TruckFlow/releases/download/v0.1.4/TruckFlow_0.1.1_x64-setup.exe"
     }
   }
 }

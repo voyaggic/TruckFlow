@@ -204,7 +204,6 @@ pub fn hard_delete_trips(
     if !synced.is_empty() {
         state
             .pg
-            .get()
             .delete_rows("trips", &synced)
             .map_err(|e| format!("central delete failed: {e}"))?;
     }

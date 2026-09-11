@@ -15,7 +15,6 @@ use crate::models::{
     ReferenceEntity, ReferenceImportPreview, ReferenceImportRequest, ReferenceImportSummary,
     SheetPreview, VehicleView,
 };
-use crate::sync;
 
 const REF_PERM: &str = "manage_reference_database";
 
@@ -176,10 +175,6 @@ pub fn create_company(
         params![id, name, extra_fields, now],
     )
     .map_err(|e| format!("company creation failed: {e}"))?;
-    // Log change for two-way sync
-    let _ = sync::write_to_sync_log(&conn, "companies", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "name": name, "status": "active", "extra_fields": extra_fields, "created_at": now, "updated_at": now
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -223,17 +218,13 @@ pub fn update_company(
     }
     let n = conn
         .execute(
-            "UPDATE companies SET name = ?1, extra_fields = ?2, updated_at = ?3, synced = 0 WHERE id = ?4",
+            "UPDATE companies SET name = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
             params![name, extra_fields, now_iso(), company_id],
         )
         .map_err(|e| format!("company update failed: {e}"))?;
     if n == 0 {
         return Err("Company not found.".to_string());
     }
-    // Log change for two-way sync
-    let _ = sync::write_to_sync_log(&conn, "companies", &company_id, "UPDATE", Some(&serde_json::json!({
-        "id": company_id, "name": name, "extra_fields": extra_fields, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "updated_company", Some(&company_id), Some(serde_json::json!({ "name": name })))?;
     Ok(())
 }
@@ -246,14 +237,10 @@ pub fn set_company_status(state: State<AppState>, actor_id: String, company_id: 
         return Err("Invalid status.".to_string());
     }
     conn.execute(
-        "UPDATE companies SET status = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
+        "UPDATE companies SET status = ?1, updated_at = ?2 WHERE id = ?3",
         params![status, now_iso(), company_id],
     )
     .map_err(|e| format!("company update failed: {e}"))?;
-    // Log change for two-way sync
-    let _ = sync::write_to_sync_log(&conn, "companies", &company_id, "UPDATE", Some(&serde_json::json!({
-        "id": company_id, "status": status, "updated_at": now_iso()
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -306,9 +293,6 @@ pub fn create_driver(
         params![id, name, extra_fields, now],
     )
     .map_err(|e| format!("driver creation failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "drivers", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "name": name, "status": "active", "extra_fields": extra_fields, "created_at": now, "updated_at": now
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -341,16 +325,13 @@ pub fn update_driver(
     }
     let n = conn
         .execute(
-            "UPDATE drivers SET name = ?1, extra_fields = ?2, updated_at = ?3, synced = 0 WHERE id = ?4",
+            "UPDATE drivers SET name = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
             params![name, extra_fields, now_iso(), driver_id],
         )
         .map_err(|e| format!("driver update failed: {e}"))?;
     if n == 0 {
         return Err("Driver not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "drivers", &driver_id, "UPDATE", Some(&serde_json::json!({
-        "id": driver_id, "name": name, "extra_fields": extra_fields, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "updated_driver", Some(&driver_id), None)?;
     Ok(())
 }
@@ -363,13 +344,10 @@ pub fn set_driver_status(state: State<AppState>, actor_id: String, driver_id: St
         return Err("Invalid status.".to_string());
     }
     conn.execute(
-        "UPDATE drivers SET status = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
+        "UPDATE drivers SET status = ?1, updated_at = ?2 WHERE id = ?3",
         params![status, now_iso(), driver_id],
     )
     .map_err(|e| format!("driver update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "drivers", &driver_id, "UPDATE", Some(&serde_json::json!({
-        "id": driver_id, "status": status, "updated_at": now_iso()
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -436,11 +414,6 @@ pub fn create_vehicle(
         params![id, plate, company_id, registered_capacity, unit, default_driver_id, extra_fields, now],
     )
     .map_err(|e| format!("vehicle creation failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "vehicles", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "plate_number": plate, "company_id": company_id, "registered_capacity": registered_capacity,
-        "capacity_unit": unit, "default_driver_id": default_driver_id, "status": "active",
-        "extra_fields": extra_fields, "created_at": now, "updated_at": now
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -486,7 +459,7 @@ pub fn update_vehicle(
     let n = conn
         .execute(
             "UPDATE vehicles SET plate_number = ?1, company_id = ?2, registered_capacity = ?3,
-                    capacity_unit = ?4, default_driver_id = ?5, extra_fields = ?6, updated_at = ?7, synced = 0
+                    capacity_unit = ?4, default_driver_id = ?5, extra_fields = ?6, updated_at = ?7
              WHERE id = ?8",
             params![plate, company_id, registered_capacity, unit, default_driver_id, extra_fields, now_iso(), vehicle_id],
         )
@@ -494,10 +467,6 @@ pub fn update_vehicle(
     if n == 0 {
         return Err("Vehicle not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "vehicles", &vehicle_id, "UPDATE", Some(&serde_json::json!({
-        "id": vehicle_id, "plate_number": plate, "company_id": company_id, "registered_capacity": registered_capacity,
-        "capacity_unit": unit, "default_driver_id": default_driver_id, "extra_fields": extra_fields, "updated_at": now_iso()
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -516,13 +485,10 @@ pub fn set_vehicle_status(state: State<AppState>, actor_id: String, vehicle_id: 
         return Err("Invalid status.".to_string());
     }
     conn.execute(
-        "UPDATE vehicles SET status = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
+        "UPDATE vehicles SET status = ?1, updated_at = ?2 WHERE id = ?3",
         params![status, now_iso(), vehicle_id],
     )
     .map_err(|e| format!("vehicle update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "vehicles", &vehicle_id, "UPDATE", Some(&serde_json::json!({
-        "id": vehicle_id, "status": status, "updated_at": now_iso()
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -561,16 +527,12 @@ pub fn delete_company(state: State<AppState>, actor_id: String, company_id: Stri
         params![company_id],
     )
     .map_err(|e| format!("trip company unlink failed: {e}"))?;
-    // Record deletion for central sync BEFORE deleting locally
-    sync::record_deleted_ids(&conn, "companies", &[company_id.clone()])
-        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM companies WHERE id = ?1", params![company_id])
         .map_err(|e| format!("company delete failed: {e}"))?;
     if n == 0 {
         return Err("Company not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "companies", &company_id, "DELETE", None);
     append_audit(&conn, &actor_id, "deleted_company", Some(&company_id), None)?;
     Ok(())
 }
@@ -591,16 +553,12 @@ pub fn delete_driver(state: State<AppState>, actor_id: String, driver_id: String
         params![driver_id],
     )
     .map_err(|e| format!("trip driver unlink failed: {e}"))?;
-    // Record deletion for central sync BEFORE deleting locally
-    sync::record_deleted_ids(&conn, "drivers", &[driver_id.clone()])
-        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM drivers WHERE id = ?1", params![driver_id])
         .map_err(|e| format!("driver delete failed: {e}"))?;
     if n == 0 {
         return Err("Driver not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "drivers", &driver_id, "DELETE", None);
     append_audit(&conn, &actor_id, "deleted_driver", Some(&driver_id), None)?;
     Ok(())
 }
@@ -616,16 +574,12 @@ pub fn delete_vehicle(state: State<AppState>, actor_id: String, vehicle_id: Stri
         params![vehicle_id],
     )
     .map_err(|e| format!("vehicle unlink failed: {e}"))?;
-    // Record deletion for central sync BEFORE deleting locally
-    sync::record_deleted_ids(&conn, "vehicles", &[vehicle_id.clone()])
-        .map_err(|e| format!("record delete failed: {e}"))?;
     let n = conn
         .execute("DELETE FROM vehicles WHERE id = ?1", params![vehicle_id])
         .map_err(|e| format!("vehicle delete failed: {e}"))?;
     if n == 0 {
         return Err("Vehicle not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "vehicles", &vehicle_id, "DELETE", None);
     append_audit(&conn, &actor_id, "deleted_vehicle", Some(&vehicle_id), None)?;
     Ok(())
 }
@@ -746,11 +700,6 @@ pub fn create_field_definition(
         params![id, entity_type, key, label, field_type, is_required as i32, unit, order, now],
     )
     .map_err(|e| format!("field_definitions create failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "field_definitions", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "entity_type": entity_type, "field_key": key, "field_label": label,
-        "field_type": field_type, "is_required": is_required as i32, "field_unit": unit,
-        "sort_order": order, "created_at": now, "updated_at": now
-    })));
     append_audit(&conn, &actor_id, "created_field_definition", Some(&id), Some(serde_json::json!({ "entity_type": entity_type, "field_key": key, "field_label": label, "field_unit": unit })))?;
     Ok(FieldDefinition {
         id,
@@ -803,13 +752,10 @@ fn migrate_extra_field_key(
             obj.insert(new_key.to_string(), old_val);
             let updated = serde_json::Value::Object(obj.clone()).to_string();
             conn.execute(
-                &format!("UPDATE {table} SET extra_fields = ?1, updated_at = ?2, synced = 0 WHERE id = ?3"),
+                &format!("UPDATE {table} SET extra_fields = ?1, updated_at = ?2 WHERE id = ?3"),
                 params![updated, now_iso(), id],
             )
             .map_err(|e| format!("extra_fields update failed: {e}"))?;
-            let _ = sync::write_to_sync_log(conn, table, &id, "UPDATE", Some(&serde_json::json!({
-                "id": id, "extra_fields": updated
-            })));
         }
     }
     Ok(())
@@ -853,7 +799,7 @@ pub fn update_field_definition(
     let (entity_type, old_key, _old_label, is_standard) =
         cur.ok_or_else(|| "Field definition not found.".to_string())?;
 
-    let mut sets = vec!["updated_at = ?1".to_string(), "synced = 0".to_string()];
+    let mut sets = vec!["updated_at = ?1".to_string()];
     let mut idx = 2;
     let mut key_used = old_key.clone();
     if let Some(ref new_key) = field_key {
@@ -943,9 +889,6 @@ pub fn update_field_definition(
     if n == 0 {
         return Err("Field definition not found.".to_string());
     }
-    let _ = sync::write_to_sync_log(&conn, "field_definitions", &field_id, "UPDATE", Some(&serde_json::json!({
-        "id": field_id, "field_key": key_used, "updated_at": now_iso()
-    })));
     append_audit(
         &conn,
         &actor_id,
@@ -989,7 +932,6 @@ pub fn delete_field_definition(
             if n == 0 {
                 return Err("Field definition not found.".to_string());
             }
-            let _ = sync::write_to_sync_log(&conn, "field_definitions", &field_id, "DELETE", None);
             append_audit(&conn, &actor_id, "deleted_field_definition", Some(&field_id), None)?;
             Ok(())
         }
@@ -1166,14 +1108,11 @@ fn read_csv_rows(path: &std::path::Path) -> Result<Vec<Vec<String>>, String> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(path)
-        .map_err(|e| format!("Failed to open CSV file: {e}. Ensure the file is a valid CSV with UTF-8 encoding."))?;
+        .map_err(|e| format!("csv open failed: {e}"))?;
     let mut out = Vec::new();
     for rec in rdr.records() {
-        let rec = rec.map_err(|e| format!("Failed to read CSV row: {e}. The file may contain invalid characters or be corrupted."))?;
+        let rec = rec.map_err(|e| format!("csv record failed: {e}"))?;
         out.push(rec.iter().map(|s| s.to_string()).collect());
-    }
-    if out.is_empty() {
-        return Err("The CSV file is empty. Please add data before importing.".to_string());
     }
     Ok(out)
 }
@@ -1252,13 +1191,10 @@ fn import_row(
             match existing {
                 Some(id) => {
                     conn.execute(
-                        "UPDATE companies SET status = ?1, extra_fields = ?2, updated_at = ?3, synced = 0 WHERE id = ?4",
+                        "UPDATE companies SET status = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
                         params![status, extra, now_iso(), id],
                     )
                     .map_err(|e| format!("company update failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "companies", &id, "UPDATE", Some(&serde_json::json!({
-                        "id": id, "name": name, "status": status, "extra_fields": extra, "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "updated_company", Some(&id), Some(serde_json::json!({ "name": name })))?;
                     Ok(false)
                 }
@@ -1269,9 +1205,6 @@ fn import_row(
                         params![id, name, status, extra, now_iso()],
                     )
                     .map_err(|e| format!("company create failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "companies", &id, "INSERT", Some(&serde_json::json!({
-                        "id": id, "name": name, "status": status, "extra_fields": extra, "created_at": now_iso(), "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "created_company", Some(&id), Some(serde_json::json!({ "name": name })))?;
                     Ok(true)
                 }
@@ -1290,13 +1223,10 @@ fn import_row(
             match existing {
                 Some(id) => {
                     conn.execute(
-                        "UPDATE drivers SET status = ?1, extra_fields = ?2, updated_at = ?3, synced = 0 WHERE id = ?4",
+                        "UPDATE drivers SET status = ?1, extra_fields = ?2, updated_at = ?3 WHERE id = ?4",
                         params![status, extra, now_iso(), id],
                     )
                     .map_err(|e| format!("driver update failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "drivers", &id, "UPDATE", Some(&serde_json::json!({
-                        "id": id, "name": name, "status": status, "extra_fields": extra, "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "updated_driver", Some(&id), Some(serde_json::json!({ "name": name })))?;
                     Ok(false)
                 }
@@ -1307,9 +1237,6 @@ fn import_row(
                         params![id, name, status, extra, now_iso()],
                     )
                     .map_err(|e| format!("driver create failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "drivers", &id, "INSERT", Some(&serde_json::json!({
-                        "id": id, "name": name, "status": status, "extra_fields": extra, "created_at": now_iso(), "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "created_driver", Some(&id), Some(serde_json::json!({ "name": name })))?;
                     Ok(true)
                 }
@@ -1369,15 +1296,11 @@ fn import_row(
                 Some(id) => {
                     conn.execute(
                         "UPDATE vehicles SET company_id = ?1, registered_capacity = ?2, capacity_unit = ?3,
-                                default_driver_id = ?4, status = ?5, extra_fields = ?6, updated_at = ?7, synced = 0
+                                default_driver_id = ?4, status = ?5, extra_fields = ?6, updated_at = ?7
                          WHERE id = ?8",
                         params![company_id, capacity, unit, driver_id, status, extra, now_iso(), id],
                     )
                     .map_err(|e| format!("vehicle update failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "vehicles", &id, "UPDATE", Some(&serde_json::json!({
-                        "id": id, "plate_number": plate, "company_id": company_id, "registered_capacity": capacity,
-                        "capacity_unit": unit, "default_driver_id": driver_id, "status": status, "extra_fields": extra, "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "updated_vehicle", Some(&id), Some(serde_json::json!({ "plate_number": plate })))?;
                     Ok(false)
                 }
@@ -1390,11 +1313,6 @@ fn import_row(
                         params![id, plate, company_id, capacity, unit, driver_id, status, extra, now_iso()],
                     )
                     .map_err(|e| format!("vehicle create failed: {e}"))?;
-                    let _ = sync::write_to_sync_log(conn, "vehicles", &id, "INSERT", Some(&serde_json::json!({
-                        "id": id, "plate_number": plate, "company_id": company_id, "registered_capacity": capacity,
-                        "capacity_unit": unit, "default_driver_id": driver_id, "status": status,
-                        "extra_fields": extra, "created_at": now_iso(), "updated_at": now_iso()
-                    })));
                     append_audit(conn, actor_id, "created_vehicle", Some(&id), Some(serde_json::json!({ "plate_number": plate })))?;
                     Ok(true)
                 }
@@ -2094,25 +2012,17 @@ fn field_label(conn: &Connection, entity_type: &str, key: &str) -> Option<String
 
 /// Read every worksheet of an XLSX file as (sheet name, rows incl. header).
 fn read_xlsx_sheets(path: &std::path::Path) -> Result<Vec<(String, Vec<Vec<String>>)>, String> {
-    let mut workbook = calamine::open_workbook_auto(path)
-        .map_err(|e| format!("Failed to open Excel file: {e}. Ensure the file is a valid .xlsx or .xls file."))?;
+    let mut workbook = calamine::open_workbook_auto(path).map_err(|e| format!("xlsx open failed: {e}"))?;
     let names: Vec<String> = workbook.sheet_names().to_vec();
-    if names.is_empty() {
-        return Err("The Excel file has no worksheets. Please add a sheet with data before importing.".to_string());
-    }
     let mut out = Vec::new();
     for name in names {
         let range = workbook
             .worksheet_range(&name)
-            .map_err(|e| format!("Failed to read sheet '{name}': {e}. The sheet may be corrupted."))?;
-        let rows: Vec<Vec<String>> = range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect();
-        if rows.is_empty() {
-            continue;
-        }
-        out.push((name, rows));
-    }
-    if out.is_empty() {
-        return Err("The Excel file contains no data. Please add data before importing.".to_string());
+            .map_err(|e| format!("xlsx sheet '{name}' read failed: {e}"))?;
+        out.push((
+            name,
+            range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect(),
+        ));
     }
     Ok(out)
 }

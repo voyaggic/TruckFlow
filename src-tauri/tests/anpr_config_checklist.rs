@@ -2,7 +2,6 @@
 //! (per-engine confidence thresholds + plate_vehicle_ratio_threshold), driven
 //! by 08-anpr-integration.md §5 / §6 / §8 and 01-database-schema.md.
 
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -47,7 +46,6 @@ impl Drop for TempDb {
 struct TestCtx {
     _tmp: TempDb,
     app: App<tauri::test::MockRuntime>,
-    company_id: RefCell<String>,
 }
 
 impl TestCtx {
@@ -56,26 +54,18 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
-        let db_path = tmp.db_path();
         let app = mock_app();
-        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Arc::new(Mutex::new(conn)),
-            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
-            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            db: Mutex::new(conn),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
+            pg: Arc::new(MockPostgres::new()),
             sheets: Arc::new(MockSheets::new()),
-            anpr_processes: Arc::new(Mutex::new(Vec::new())),
-            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
-            sync_notify: sync_tx,
         });
-        Self { _tmp: tmp, app, company_id: RefCell::new(String::new()) }
+        Self { _tmp: tmp, app }
     }
 
     fn state(&self) -> State<'_, AppState> {
@@ -83,42 +73,20 @@ impl TestCtx {
     }
 
     fn create_admin(&self) -> SessionUser {
-        let result = commands::create_first_admin_for_company(self.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
-            .expect("create first admin");
-        if let Some(ref cid) = result.user.company_id {
-            *self.company_id.borrow_mut() = cid.clone();
-        }
-        result.user
-    }
-
-    fn company_id(&self) -> String {
-        self.company_id.borrow().clone()
+        commands::create_first_admin(self.state(), "Boss".to_string(), ADMIN_PASS.to_string())
+            .expect("create first admin")
+            .user
     }
 
     fn create_gate_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
-            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            
+            "GatePass!2024".to_string(),
         )
         .expect("create gate user")
-    }
-
-    fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
-        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
-        let user = commands::create_user(
-            self.state(),
-            admin.id.clone(),
-            name.to_string(),
-            password.to_string(),
-            permissions,
-        )
-        .expect("create user");
-        user
     }
 }
 
@@ -166,7 +134,7 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
     let admin = ctx.create_admin();
     let gate = ctx.create_gate_user(&admin);
 
-    let err = update_anpr_config(ctx.state(), gate.id.clone(), Some("easyocr".to_string()), None, None, None, None, None, None, None, None, None, None, None, None)
+    let err = update_anpr_config(ctx.state(), gate.id.clone(), Some("easyocr".to_string()), None, None, None, None, None, None, None, None, None)
         .expect_err("gate officer must not change ANPR config");
     assert!(err.contains("permission"));
 
@@ -183,9 +151,6 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
         Some(100),
         None,
         Some(48.0),
-        None,
-        None,
-        None,
     )
     .expect("admin updates config");
     assert_eq!(cfg.active_ocr_engine, "easyocr");
@@ -224,7 +189,7 @@ fn anpr_config_updates_are_permission_gated_and_audited() {
     assert_eq!(switched.0, 1, "engine swap is audit-logged");
     assert!(switched.1.contains("paddleocr") && switched.1.contains("easyocr"), "swap records from/to: {switched:?}");
 
-    let bad = update_anpr_config(ctx.state(), admin.id.clone(), None, None, Some(1.5), None, None, None, None, None, None, None, None, None, None)
+    let bad = update_anpr_config(ctx.state(), admin.id.clone(), None, None, Some(1.5), None, None, None, None, None, None, None)
         .expect_err("threshold out of range rejected");
     assert!(bad.contains("between 0 and 1"));
 }
@@ -238,7 +203,7 @@ fn confidence_threshold_is_per_engine_and_tracks_active_engine() {
 
     // Admin switches to easyocr (active) with its own threshold; paddleocr stays
     // at the seed 0.7. The active threshold is easyocr's.
-    update_anpr_config(ctx.state(), admin.id.clone(), Some("easyocr".to_string()), Some(0.7), Some(0.55), None, None, None, None, None, None, None, None, None, None)
+    update_anpr_config(ctx.state(), admin.id.clone(), Some("easyocr".to_string()), Some(0.7), Some(0.55), None, None, None, None, None, None, None)
         .expect("switch to easyocr");
     let state = ctx.state();
     let conn = state.db.lock().unwrap();
@@ -263,19 +228,19 @@ fn camera_sources_crud_and_deactivate_not_delete() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
 
-    let src = add_camera_source(ctx.state(), ctx.app.handle().clone(), admin.id.clone(), "Gate cam".into(), "rtsp".into(), "rtsp://10.0.0.5".into(), None)
+    let src = add_camera_source(ctx.state(), admin.id.clone(), "Gate cam".into(), "rtsp".into(), "rtsp://10.0.0.5".into())
         .expect("add camera source");
     assert_eq!(src.status, "active");
 
-    let bad = add_camera_source(ctx.state(), ctx.app.handle().clone(), admin.id.clone(), "Bad".into(), "hls".into(), "x".into(), None)
+    let bad = add_camera_source(ctx.state(), admin.id.clone(), "Bad".into(), "hls".into(), "x".into())
         .expect_err("invalid source type rejected");
     assert!(bad.contains("Unknown camera source type"));
 
-    let updated = update_camera_source(ctx.state(), ctx.app.handle().clone(), admin.id.clone(), src.id.clone(), Some("Main gate".into()), None, None)
+    let updated = update_camera_source(ctx.state(), admin.id.clone(), src.id.clone(), Some("Main gate".into()), None, None)
         .expect("update camera source");
     assert_eq!(updated.label, "Main gate");
 
-    let inactive = set_camera_source_status(ctx.state(), ctx.app.handle().clone(), admin.id.clone(), src.id.clone(), "inactive".into())
+    let inactive = set_camera_source_status(ctx.state(), admin.id.clone(), src.id.clone(), "inactive".into())
         .expect("deactivate camera source");
     assert_eq!(inactive.status, "inactive");
     let listed = list_camera_sources(ctx.state()).unwrap();

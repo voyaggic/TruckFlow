@@ -9,8 +9,6 @@ const LOGGED_OUT_KEY = "tf.logged-out";
 interface SavedLogin {
   username: string;
   password: string;
-  supabaseUrl?: string;
-  apiKey?: string;
 }
 
 function loadSaved(): SavedLogin | null {
@@ -27,11 +25,19 @@ function loadSaved(): SavedLogin | null {
   }
 }
 
-function saveLogin(username: string, password: string, supabaseUrl?: string, apiKey?: string) {
+function saveLogin(username: string, password: string) {
   try {
-    localStorage.setItem(SAVED_KEY, JSON.stringify({ username, password, supabaseUrl, apiKey }));
+    localStorage.setItem(SAVED_KEY, JSON.stringify({ username, password }));
   } catch {
     /* storage unavailable — ignore */
+  }
+}
+
+function clearSaved() {
+  try {
+    localStorage.removeItem(SAVED_KEY);
+  } catch {
+    /* ignore */
   }
 }
 
@@ -60,33 +66,31 @@ function clearLoggedOut() {
   }
 }
 
-export default function LoginScreen({
-  onLogin,
-}: {
-  onLogin: (user: SessionUser) => void;
-}) {
-  const [mode, setMode] = useState<"login" | "signup">("login");
+export default function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [auto, setAuto] = useState(false);
-
-  // Supabase connection fields (shared between login and signup)
-  const [supabaseUrl, setSupabaseUrl] = useState("");
-  const [apiKey, setApiKey] = useState("");
-
-  // Signup fields
-  const [companyName, setCompanyName] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
+  const [forgot, setForgot] = useState(false);
+  const [codeMode, setCodeMode] = useState(false);
+  const [reqMode, setReqMode] = useState(false);
+  const [codeUser, setCodeUser] = useState("");
+  const [code, setCode] = useState("");
+  const [codeOk, setCodeOk] = useState(false);
+  const [codePass, setCodePass] = useState("");
+  const [codeConfirm, setCodeConfirm] = useState("");
+  const [reqUser, setReqUser] = useState("");
+  const [reqSent, setReqSent] = useState(false);
 
   // Prefill from the saved sign-in. Auto sign-in only when the user did not
   // manually log out (a manual log out must stick until they sign in again).
   useEffect(() => {
     const saved = loadSaved();
     if (!saved) return;
-
+    setUsername(saved.username);
+    setPassword(saved.password);
     const loggedOut = (() => {
       try {
         return localStorage.getItem("tf.logged-out") === "1";
@@ -94,18 +98,11 @@ export default function LoginScreen({
         return false;
       }
     })();
-
-    // Always prefill fields regardless of loggedOut status
-    setUsername(saved.username);
-    setPassword(saved.password);
-    if (saved.supabaseUrl) setSupabaseUrl(saved.supabaseUrl);
-    if (saved.apiKey) setApiKey(saved.apiKey);
-
-    if (loggedOut) return;
+    if (loggedOut) return; // stay on the sign-in screen, just prefilled
     setAuto(true);
     setBusy(true);
     api
-      .loginPassword(saved.username, saved.password, saved.supabaseUrl || "", saved.apiKey || "")
+      .loginPassword(saved.username, saved.password)
       .then((res) => onLogin(res.user))
       .catch((e) => {
         setError(String(e));
@@ -119,35 +116,44 @@ export default function LoginScreen({
     setError(null);
     setBusy(true);
     try {
-      if (!username.trim()) {
-        setError("Username is required.");
-        setBusy(false);
-        return;
-      }
-      if (!password) {
-        setError("Password is required.");
-        setBusy(false);
-        return;
-      }
-      if (!supabaseUrl.trim()) {
-        setError("Supabase URL is required.");
-        setBusy(false);
-        return;
-      }
-      if (!apiKey.trim()) {
-        setError("API Key is required.");
-        setBusy(false);
-        return;
-      }
-
-      const res = await api.loginPassword(username.trim(), password, supabaseUrl.trim(), apiKey.trim());
-      // Always save supabase credentials - needed for cloud auth
-      // Only save password if "remember me" is checked
+      const res = await api.loginPassword(username, password);
       if (remember) {
-        saveLogin(username.trim(), password, supabaseUrl.trim(), apiKey.trim());
+        saveLogin(username.trim(), password);
       } else {
-        saveLogin(username.trim(), "", supabaseUrl.trim(), apiKey.trim());
+        clearSaved();
       }
+      clearLoggedOut(); // a manual sign-in resumes auto sign-in on future launches
+      onLogin(res.user);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const checkCode = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await api.checkRecoveryCode(codeUser, code);
+      setCodeOk(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitCode = async () => {
+    setError(null);
+    if (codePass !== codeConfirm) {
+      setError("Passwords do not match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await api.recoverAdminPassword(codeUser, code, codePass);
+      saveLogin(codeUser.trim(), codePass);
       clearLoggedOut();
       onLogin(res.user);
     } catch (e) {
@@ -157,34 +163,12 @@ export default function LoginScreen({
     }
   };
 
-  const submitSignup = async () => {
+  const submitRequest = async () => {
     setError(null);
-    if (!companyName.trim()) {
-      setError("Company name is required.");
-      return;
-    }
-    if (!username.trim()) {
-      setError("Username is required.");
-      return;
-    }
-    if (password.length < 8) {
-      setError("Password must be at least 8 characters.");
-      return;
-    }
-    if (password !== confirmPassword) {
-      setError("Passwords do not match.");
-      return;
-    }
-
     setBusy(true);
     try {
-      // Local-only signup — cloud connection is configured later via the Sync panel
-      const res = await api.createCompanyAndAdmin(companyName.trim(), username.trim(), password);
-      if (remember) {
-        saveLogin(username.trim(), password);
-      }
-      clearLoggedOut();
-      onLogin(res.user);
+      await api.createPasswordResetRequest(reqUser);
+      setReqSent(true);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -193,15 +177,8 @@ export default function LoginScreen({
   };
 
   return (
-    <div style={{
-      position: "fixed",
-      inset: 0,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      background: "var(--bg)",
-    }}>
-      <div className="auth-card" style={{ width: 360 }}>
+    <div className="auth-wrap">
+      <div className="auth-card">
         <div className="brand">
           <div className="brand-mark">TF</div>
           <div>
@@ -210,185 +187,178 @@ export default function LoginScreen({
           </div>
         </div>
 
+        <div className="auth-title">{auto ? "Signing you in…" : "Sign in"}</div>
+        <div className="auth-hint">
+          {auto ? (
+            <>Using your saved sign-in for <b>{username}</b>. No need to type anything.</>
+          ) : (
+            "Every account signs in with a username and password."
+          )}
+        </div>
+
         {error && <div className="error-banner">{error}</div>}
 
-        {/* Mode switcher */}
-        <div style={{ display: "flex", marginBottom: 16, gap: 4, background: "var(--bg-secondary)", borderRadius: "var(--radius)", padding: 4 }}>
-          <button
-            style={{
-              flex: 1,
-              padding: "8px 12px",
-              border: "none",
-              borderRadius: "calc(var(--radius) - 2px)",
-              cursor: "pointer",
-              fontWeight: mode === "login" ? 600 : 400,
-              background: mode === "login" ? "var(--bg-primary)" : "transparent",
-              color: mode === "login" ? "var(--text)" : "var(--muted)",
-            }}
-            onClick={() => { setMode("login"); setError(null); }}
-            disabled={busy}
-          >
-            Login
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          <div className="field">
+            <label>Username</label>
+            <input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoFocus={!auto}
+              placeholder="e.g. andreah"
+              autoComplete="username"
+            />
+          </div>
+          <div className="field">
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
+              placeholder="••••••••"
+            />
+          </div>
+
+          <label className="row" style={{ gap: 8, alignItems: "center", cursor: "pointer", marginBottom: 14 }}>
+            <input
+              type="checkbox"
+              style={{ width: "auto" }}
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+            />
+            <span className="small">Keep me signed in — no typing next time</span>
+          </label>
+
+          <button className="primary" style={{ width: "100%", padding: "11px" }} type="submit" disabled={busy || !username || !password}>
+            {busy ? "Signing in…" : "Sign in"}
           </button>
+        </form>
+
+        <div style={{ textAlign: "center", marginTop: 16 }}>
           <button
-            style={{
-              flex: 1,
-              padding: "8px 12px",
-              border: "none",
-              borderRadius: "calc(var(--radius) - 2px)",
-              cursor: "pointer",
-              fontWeight: mode === "signup" ? 600 : 400,
-              background: mode === "signup" ? "var(--bg-primary)" : "transparent",
-              color: mode === "signup" ? "var(--text)" : "var(--muted)",
+            className="ghost small"
+            onClick={() => {
+              setForgot((f) => !f);
+              setCodeMode(false);
+              setReqMode(false);
+              setReqSent(false);
+              setCodeOk(false);
             }}
-            onClick={() => { setMode("signup"); setError(null); }}
             disabled={busy}
           >
-            Sign Up
+            {forgot ? "Back to sign in" : "Forgot your password?"}
           </button>
         </div>
 
-        {mode === "login" ? (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              submit();
-            }}
+        {forgot && (
+          <div
+            className="stack"
+            style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14 }}
           >
-            <div className="auth-title">{auto ? "Signing you in…" : "Login"}</div>
+            {!codeMode && !reqMode && (
+              <>
+                <div className="muted small" style={{ marginBottom: 10 }}>
+                  Choose how to get back in:
+                </div>
+                <div className="row" style={{ gap: 10 }}>
+                  <button className="ghost" style={{ flex: 1 }} onClick={() => setCodeMode(true)}>
+                    Enter recovery code
+                  </button>
+                  <button className="ghost" style={{ flex: 1 }} onClick={() => setReqMode(true)}>
+                    Request password reset
+                  </button>
+                </div>
+              </>
+            )}
 
-            <div className="field">
-              <label>Username</label>
-              <input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoFocus={!auto}
-                placeholder="Enter username"
-                autoComplete="username"
-              />
-            </div>
-            <div className="field">
-              <label>Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="current-password"
-                placeholder="Enter password"
-              />
-            </div>
+            {codeMode && (
+              <>
+                <div className="section-title" style={{ fontSize: 14 }}>
+                  Admin recovery code
+                </div>
+                {!codeOk ? (
+                  <>
+                    <p className="muted small">
+                      For admins when no other admin can reset you. Enter your username and the recovery code from the
+                      file saved on your computer.
+                    </p>
+                    <div className="field">
+                      <label>Admin username</label>
+                      <input value={codeUser} onChange={(e) => setCodeUser(e.target.value)} placeholder="e.g. andreah" />
+                    </div>
+                    <div className="field">
+                      <label>Recovery code</label>
+                      <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="XXXXX-XXXXX" />
+                    </div>
+                    <div className="row">
+                      <button className="primary" onClick={checkCode} disabled={busy || !codeUser || !code}>
+                        {busy ? "Checking…" : "Check code"}
+                      </button>
+                      <button className="ghost" onClick={() => setCodeMode(false)}>
+                        Back
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p className="muted small">Code accepted. Set your new password to sign in.</p>
+                    <div className="field">
+                      <label>New password</label>
+                      <input type="password" value={codePass} onChange={(e) => setCodePass(e.target.value)} />
+                      <PasswordChecklist password={codePass} />
+                    </div>
+                    <div className="field">
+                      <label>Confirm new password</label>
+                      <input type="password" value={codeConfirm} onChange={(e) => setCodeConfirm(e.target.value)} />
+                    </div>
+                    <div className="row">
+                      <button className="primary" onClick={submitCode} disabled={busy || !codePass || codePass !== codeConfirm}>
+                        {busy ? "Signing in…" : "Recover and sign in"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
 
-            {/* Supabase fields - always visible on login */}
-            <div style={{ marginTop: 12, padding: 12, background: "var(--bg-secondary)", borderRadius: "var(--radius)" }}>
-              <div className="small muted" style={{ marginBottom: 8, fontWeight: 600 }}>
-                Supabase Connection
-              </div>
-              <div className="field" style={{ marginBottom: 8 }}>
-                <label>Supabase URL</label>
-                <input
-                  value={supabaseUrl}
-                  onChange={(e) => setSupabaseUrl(e.target.value)}
-                  placeholder="https://xxx.supabase.co"
-                  autoComplete="off"
-                />
-              </div>
-              <div className="field" style={{ marginBottom: 0 }}>
-                <label>API Key</label>
-                <input
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="eyJhbGciOiJIUzI1NiIs..."
-                  autoComplete="off"
-                  type="password"
-                />
-              </div>
-            </div>
-
-            <label className="row" style={{ gap: 8, alignItems: "center", cursor: "pointer", marginBottom: 14, marginTop: 14 }}>
-              <input
-                type="checkbox"
-                style={{ width: "auto" }}
-                checked={remember}
-                onChange={(e) => setRemember(e.target.checked)}
-              />
-              <span className="small">Keep me signed in</span>
-            </label>
-
-            <button className="primary" style={{ width: "100%", padding: "11px" }} type="submit" disabled={busy}>
-              {busy ? "Signing in…" : "Sign in"}
-            </button>
-          </form>
-        ) : (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitSignup();
-            }}
-          >
-            <div className="auth-title">Create Account</div>
-
-            <div className="field">
-              <label>Company Name</label>
-              <input
-                value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-                placeholder="Enter company name"
-                autoComplete="off"
-              />
-            </div>
-            <div className="field">
-              <label>Username</label>
-              <input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Choose username"
-                autoComplete="username"
-              />
-            </div>
-            <div className="field">
-              <label>Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Min 8 characters"
-                autoComplete="new-password"
-              />
-              <PasswordChecklist password={password} />
-            </div>
-            <div className="field">
-              <label>Confirm Password</label>
-              <input
-                type="password"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Re-enter password"
-                autoComplete="new-password"
-              />
-            </div>
-            <p className="small muted" style={{ marginTop: 12 }}>
-              Cloud connection is configured later in the Sync panel.
-            </p>
-
-            <label className="row" style={{ gap: 8, alignItems: "center", cursor: "pointer", marginBottom: 14, marginTop: 14 }}>
-              <input
-                type="checkbox"
-                style={{ width: "auto" }}
-                checked={remember}
-                onChange={(e) => setRemember(e.target.checked)}
-              />
-              <span className="small">Keep me signed in</span>
-            </label>
-
-            <button
-              className="primary"
-              style={{ width: "100%", padding: "11px" }}
-              type="submit"
-              disabled={busy || !companyName || !username || !password}
-            >
-              {busy ? "Creating account…" : "Create Account"}
-            </button>
-          </form>
+            {reqMode && (
+              <>
+                <div className="section-title" style={{ fontSize: 14 }}>
+                  Request password reset
+                </div>
+                {reqSent ? (
+                  <p className="muted small">
+                    Request sent — an admin will review it and reset your password. You'll be asked to set a new
+                    password at your next sign-in.
+                  </p>
+                ) : (
+                  <>
+                    <p className="muted small">
+                      An admin will review your request and reset your password.
+                    </p>
+                    <div className="field">
+                      <label>Your username</label>
+                      <input value={reqUser} onChange={(e) => setReqUser(e.target.value)} placeholder="e.g. peter" />
+                    </div>
+                    <div className="row">
+                      <button className="primary" onClick={submitRequest} disabled={busy || !reqUser}>
+                        {busy ? "Sending…" : "Send request"}
+                      </button>
+                      <button className="ghost" onClick={() => setReqMode(false)}>
+                        Back
+                      </button>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
         )}
       </div>
     </div>

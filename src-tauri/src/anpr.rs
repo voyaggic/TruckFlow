@@ -15,7 +15,6 @@ use crate::models::{
     AnprConfigView, AnprCredentialView, AnprDiagnosticsView, CameraSourceView,
     DependencyHealthView, ModelVersionView, TrainingCandidateView,
 };
-use crate::sync;
 
 const CONFIG_PERM: &str = "manage_anpr_config";
 
@@ -49,7 +48,7 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
         "SELECT active_ocr_engine, confidence_threshold_paddleocr, confidence_threshold_easyocr,
                 plate_vehicle_ratio_threshold, plate_format_rules, discharge_confirmation_required,
                 save_recognition_images, retrain_candidate_threshold, is_capture_point,
-                prefer_cloud, max_pending_duration_hours, designated_machine_id, detection_method
+                prefer_cloud, max_pending_duration_hours, designated_machine_id
          FROM anpr_config WHERE id = ?1",
         params![ANPR_CONFIG_ID],
         |r| {
@@ -66,7 +65,6 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
                 prefer_cloud: r.get::<_, i64>(9)? != 0,
                 max_pending_duration_hours: r.get(10)?,
                 designated_machine_id: r.get(11)?,
-                detection_method: r.get(12)?,
             })
         },
     )
@@ -78,7 +76,6 @@ pub fn read_anpr_config(conn: &Connection) -> Result<AnprConfigView, String> {
 fn sync_config_json(state: &State<AppState>) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let config = read_anpr_config(&conn)?;
-
     // Read cloud credentials
     let cloud_api_url: String = conn
         .query_row(
@@ -94,7 +91,6 @@ fn sync_config_json(state: &State<AppState>) -> Result<(), String> {
             |r| r.get(0),
         )
         .unwrap_or_default();
-
     // Read current source from existing config.json
     let anpr_dir = crate::find_anpr_dir();
     let config_path = anpr_dir.join("config.json");
@@ -110,23 +106,8 @@ fn sync_config_json(state: &State<AppState>) -> Result<(), String> {
     cfg["prefer_cloud"] = serde_json::json!(config.prefer_cloud);
     cfg["cloud_api_url"] = serde_json::json!(cloud_api_url);
     cfg["cloud_api_key"] = serde_json::json!(cloud_api_key);
-    cfg["detection_method"] = serde_json::json!(config.detection_method);
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
         .map_err(|e| format!("Failed to write config.json: {e}"))?;
-
-    // Send detection_method via HTTP POST to the running ANPR service (no restart needed)
-    let anpr_url = anpr_service_url(&conn);
-    if let Some(port) = anpr_url.strip_prefix("http://127.0.0.1:") {
-        let url = format!("http://127.0.0.1:{}/config", port);
-        let client = reqwest::blocking::Client::new();
-        let body = serde_json::json!({
-            "detection_method": config.detection_method
-        });
-        if let Err(e) = client.post(&url).json(&body).send() {
-            crate::log::log(&format!("[ANPR] Failed to send detection_method to service: {}", e));
-        }
-    }
-
     Ok(())
 }
 
@@ -150,18 +131,12 @@ pub fn update_anpr_config(
     max_pending_duration_hours: Option<f64>,
     designated_machine_id: Option<String>,
     prefer_cloud: Option<bool>,
-    detection_method: Option<String>,
 ) -> Result<AnprConfigView, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     crate::commands::ensure_admin_permission(&conn, &actor_id, CONFIG_PERM)?;
     if let Some(engine) = &active_ocr_engine {
         if engine != "paddleocr" && engine != "easyocr" && engine != "cloud_provider" {
             return Err("Unknown OCR engine.".to_string());
-        }
-    }
-    if let Some(method) = &detection_method {
-        if method != "contour" && method != "paddleocr" && method != "consecutive" {
-            return Err("Detection method must be 'contour', 'paddleocr', or 'consecutive'.".to_string());
         }
     }
     if let Some(h) = max_pending_duration_hours {
@@ -208,12 +183,10 @@ pub fn update_anpr_config(
             save_recognition_images = COALESCE(?7, save_recognition_images),
             retrain_candidate_threshold = COALESCE(?8, retrain_candidate_threshold),
             is_capture_point = COALESCE(?9, is_capture_point),
-            max_pending_duration_hours = COALESCE(?10, max_pending_duration_hours),
-            prefer_cloud = COALESCE(?11, prefer_cloud),
-            designated_machine_id = COALESCE(?12, designated_machine_id),
-            detection_method = COALESCE(?13, detection_method),
-            updated_by = ?14, updated_at = ?15
-         WHERE id = ?16",
+            prefer_cloud = COALESCE(?10, prefer_cloud),
+            designated_machine_id = COALESCE(?11, designated_machine_id),
+            updated_by = ?12, updated_at = ?13
+         WHERE id = ?14",
         params![
             engine,
             confidence_threshold_paddleocr,
@@ -224,19 +197,14 @@ pub fn update_anpr_config(
             save_recognition_images.map(|b| if b { 1 } else { 0 }),
             retrain_candidate_threshold,
             is_capture_point.map(|b| if b { 1 } else { 0 }),
-            max_pending_duration_hours,
             prefer_cloud,
             designated_machine_id,
-            detection_method,
             actor_id,
             now_iso(),
             ANPR_CONFIG_ID,
         ],
     )
     .map_err(|e| format!("anpr config update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "anpr_config", ANPR_CONFIG_ID, "UPDATE", Some(&serde_json::json!({
-        "id": ANPR_CONFIG_ID, "updated_by": actor_id, "updated_at": now_iso()
-    })));
     if previous_engine.as_deref().is_some_and(|prev| prev != engine.as_str()) {
         append_audit(
             &conn,
@@ -291,9 +259,9 @@ pub fn list_camera_sources(state: State<AppState>) -> Result<Vec<CameraSourceVie
 }
 
 #[tauri::command]
-pub fn add_camera_source<R: tauri::Runtime>(
+pub fn add_camera_source(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     label: String,
     source_type: String,
@@ -331,9 +299,6 @@ pub fn add_camera_source<R: tauri::Runtime>(
         params![id, label.trim(), source_type, connection_string.trim(), extra_fields, now],
     )
     .map_err(|e| format!("camera source create failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "label": label.trim(), "source_type": source_type, "created_at": now
-    })));
     append_audit(&conn, &actor_id, "added_camera_source", Some(&id), Some(json!({ "label": label.trim(), "source_type": source_type })))?;
     let result = camera_source_by_id(&conn, &id);
     drop(conn);
@@ -343,9 +308,9 @@ pub fn add_camera_source<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub fn update_camera_source<R: tauri::Runtime>(
+pub fn update_camera_source(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
     label: Option<String>,
@@ -383,9 +348,6 @@ pub fn update_camera_source<R: tauri::Runtime>(
         ],
     )
     .map_err(|e| format!("camera source update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
-        "id": source_id, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "updated_camera_source", Some(&source_id), None)?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -395,9 +357,9 @@ pub fn update_camera_source<R: tauri::Runtime>(
 
 /// Camera sources are deactivated, never hard-deleted (01-database-schema.md).
 #[tauri::command]
-pub fn set_camera_source_status<R: tauri::Runtime>(
+pub fn set_camera_source_status(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
     status: String,
@@ -412,9 +374,6 @@ pub fn set_camera_source_status<R: tauri::Runtime>(
         params![status, now_iso(), source_id],
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
-        "id": source_id, "status": status, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "set_camera_source_status", Some(&source_id), Some(json!({ "status": status })))?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -425,9 +384,9 @@ pub fn set_camera_source_status<R: tauri::Runtime>(
 /// Toggle whether a source is included in ANPR processing when the service
 /// starts. Active + tracked sources are the ones the service captures from.
 #[tauri::command]
-pub fn set_camera_source_tracked<R: tauri::Runtime>(
+pub fn set_camera_source_tracked(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
     tracked: bool,
@@ -439,9 +398,6 @@ pub fn set_camera_source_tracked<R: tauri::Runtime>(
         params![if tracked { 1 } else { 0 }, now_iso(), source_id],
     )
     .map_err(|e| format!("camera source tracked update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
-        "id": source_id, "tracked": tracked, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "set_camera_source_tracked", Some(&source_id), Some(json!({ "tracked": tracked })))?;
     let result = camera_source_by_id(&conn, &source_id);
     drop(conn);
@@ -451,9 +407,9 @@ pub fn set_camera_source_tracked<R: tauri::Runtime>(
 
 /// Camera sources can be deleted (permanent removal).
 #[tauri::command]
-pub fn delete_camera_source<R: tauri::Runtime>(
+pub fn delete_camera_source(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     source_id: String,
 ) -> Result<(), String> {
@@ -471,9 +427,6 @@ pub fn delete_camera_source<R: tauri::Runtime>(
         params![source_id],
     )
     .map_err(|e| format!("camera source delete failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "DELETE", Some(&serde_json::json!({
-        "id": source_id
-    })));
     // Archive all queued trips since a camera source was removed — the queue
     // is only meaningful while the pipeline that produced those reads is active.
     let archived = conn
@@ -530,9 +483,6 @@ pub fn test_camera_connection(
         params![status, now, result_str, source_id],
     )
     .map_err(|e| format!("camera source status update failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "camera_sources", &source_id, "UPDATE", Some(&serde_json::json!({
-        "id": source_id, "status": status, "last_connection_check_at": now
-    })));
     camera_source_by_id(&conn, &source_id)
 }
 
@@ -563,25 +513,12 @@ pub fn enumerate_cameras() -> Result<Vec<DetectedCamera>, String> {
     let anpr_dir = crate::find_anpr_dir();
     let python = crate::capture::find_python();
     if python.is_empty() {
-        return Err(
-            "Python is not installed or not found in PATH. \
-             Camera enumeration requires Python with OpenCV. \
-             Install Python 3.8+ from python.org and ensure it's in your PATH, \
-             or install the embedded Python from Settings → ANPR → Setup."
-            .to_string(),
-        );
+        return Err("Python not found".to_string());
     }
     // Use the bundled enumeration script that probes camera indices 0-9
     let script = anpr_dir.join("_enum_cameras.py");
     if !script.exists() {
-        return Err(
-            format!(
-                "Camera enumeration script not found at: {}. \
-                 The ANPR components may not be installed correctly. \
-                 Try reinstalling the application or running the ANPR setup from Settings → ANPR.",
-                script.display()
-            )
-        );
+        return Err(format!("Camera enumeration script not found: {}", script.display()));
     }
 
     let mut cmd = std::process::Command::new(&python);
@@ -592,34 +529,16 @@ pub fn enumerate_cameras() -> Result<Vec<DetectedCamera>, String> {
         cmd.creation_flags(crate::capture::CREATE_NO_WINDOW);
     }
     let output = cmd.output()
-        .map_err(|e| format!("Failed to run camera enumeration: {e}. Ensure Python is installed and accessible."))?;
+        .map_err(|e| format!("Failed to run camera enumeration: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("ModuleNotFoundError") && stderr.contains("cv2") {
-            return Err(
-                "Camera enumeration failed: OpenCV is not installed. \
-                 Install it by running: pip install opencv-python \
-                 Or use the embedded Python setup from Settings → ANPR → Setup."
-                .to_string(),
-            );
-        }
-        return Err(format!(
-            "Camera enumeration failed: {stderr}\n\
-             Ensure a camera is connected and no other application is using it."
-        ));
+        return Err(format!("Camera enumeration failed: {stderr}"));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let cameras: Vec<DetectedCamera> = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse camera list: {e}. The enumeration script returned invalid data."))?;
-    if cameras.is_empty() {
-        return Err(
-            "No cameras were detected. Ensure a USB camera is connected \
-             and not being used by another application."
-            .to_string(),
-        );
-    }
+        .map_err(|e| format!("Failed to parse camera list: {e}"))?;
     Ok(cameras)
 }
 
@@ -890,9 +809,6 @@ pub fn register_model_version(
         params![id, version_label.trim(), component.trim(), validation_accuracy, now],
     )
     .map_err(|e| format!("model version create failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "model_versions", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "version_label": version_label.trim(), "component": component.trim(), "created_at": now
-    })));
     append_audit(&conn, &actor_id, "registered_model_version", Some(&id), Some(json!({ "component": component.trim() })))?;
     model_version_by_id(&conn, &id)
 }
@@ -928,9 +844,6 @@ pub fn deploy_model_version(state: State<AppState>, actor_id: String, version_id
     )
     .map_err(|e| format!("model deploy failed: {e}"))?;
     tx.commit().map_err(|e| format!("transaction commit failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "model_versions", &version_id, "UPDATE", Some(&serde_json::json!({
-        "id": version_id, "is_live": 1, "deployed_by": actor_id, "deployed_at": now
-    })));
     append_audit(&conn, &actor_id, "deployed_model_version", Some(&version_id), Some(json!({ "component": component })))?;
     model_version_by_id(&conn, &version_id)
 }
@@ -974,9 +887,6 @@ pub fn rollback_model_version(state: State<AppState>, actor_id: String, version_
     )
     .map_err(|e| format!("model rollback failed: {e}"))?;
     tx.commit().map_err(|e| format!("transaction commit failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "model_versions", &version_id, "UPDATE", Some(&serde_json::json!({
-        "id": version_id, "is_live": 1, "deployed_by": actor_id, "deployed_at": now
-    })));
     append_audit(&conn, &actor_id, "rolled_back_model_version", Some(&version_id), Some(json!({ "from": current_live })))?;
     model_version_by_id(&conn, &version_id)
 }
@@ -1067,9 +977,6 @@ pub fn add_training_candidate(
         params![id, frame_ref, now],
     )
     .map_err(|e| format!("Failed to insert training candidate: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "training_candidates", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "frame_ref": frame_ref, "reason": "manual_upload", "created_at": now
-    })));
     Ok(TrainingCandidateView {
         id,
         source_trip_id: None,
@@ -1099,9 +1006,6 @@ pub fn approve_training_candidate(
         params![candidate_id],
     )
     .map_err(|e| format!("Failed to approve candidate: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "training_candidates", &candidate_id, "DELETE", Some(&serde_json::json!({
-        "id": candidate_id
-    })));
     append_audit(&conn, &actor_id, "approved_training_candidate", Some(&candidate_id), None)?;
     Ok(())
 }
@@ -1120,9 +1024,6 @@ pub fn reject_training_candidate(
         params![candidate_id],
     )
     .map_err(|e| format!("Failed to reject candidate: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "training_candidates", &candidate_id, "DELETE", Some(&serde_json::json!({
-        "id": candidate_id
-    })));
     append_audit(&conn, &actor_id, "rejected_training_candidate", Some(&candidate_id), None)?;
     Ok(())
 }
@@ -1138,9 +1039,6 @@ pub fn approve_all_training_candidates(
     let count = conn
         .execute("DELETE FROM training_candidates", [])
         .map_err(|e| format!("Failed to approve all candidates: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "training_candidates", "_bulk", "DELETE", Some(&serde_json::json!({
-        "count": count, "reason": "approve_all"
-    })));
     append_audit(&conn, &actor_id, "approved_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
     Ok(count as i64)
 }
@@ -1156,9 +1054,6 @@ pub fn reject_all_training_candidates(
     let count = conn
         .execute("DELETE FROM training_candidates", [])
         .map_err(|e| format!("Failed to reject all candidates: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "training_candidates", "_bulk", "DELETE", Some(&serde_json::json!({
-        "count": count, "reason": "reject_all"
-    })));
     append_audit(&conn, &actor_id, "rejected_all_training_candidates", None, Some(serde_json::json!({ "count": count })))?;
     Ok(count as i64)
 }
@@ -1416,9 +1311,6 @@ pub fn set_anpr_machine(
         params![info.machine_id, now_iso(), ANPR_CONFIG_ID],
     )
     .map_err(|e| format!("machine designation failed: {e}"))?;
-    let _ = sync::write_to_sync_log(&conn, "anpr_config", ANPR_CONFIG_ID, "UPDATE", Some(&serde_json::json!({
-        "id": ANPR_CONFIG_ID, "designated_machine_id": info.machine_id, "updated_at": now_iso()
-    })));
     append_audit(&conn, &actor_id, "designated_anpr_machine", None, Some(json!({
         "hostname": info.hostname,
         "machine_id": info.machine_id,
@@ -1700,9 +1592,9 @@ pub fn any_auto_start_for_machine(conn: &Connection, machine_id: &str) -> Option
 
 /// Set the OCR plate mode: "universal" (any plate) or "kenyan" (3 letters + 3 digits + 1 letter).
 #[tauri::command]
-pub fn set_ocr_plate_mode<R: tauri::Runtime>(
+pub fn set_ocr_plate_mode(
     state: State<AppState>,
-    handle: tauri::AppHandle<R>,
+    handle: tauri::AppHandle,
     actor_id: String,
     mode: String,
 ) -> Result<String, String> {

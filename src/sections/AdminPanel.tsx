@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../lib/api";
-import ErrorBoundary from "../components/ErrorBoundary";
 import type {
   AuditEntry,
   AuditFilters,
@@ -28,10 +27,9 @@ import type {
 } from "../lib/types";
 import PasswordChecklist from "../components/PasswordChecklist";
 import SyncPanel from "./SyncPanel";
-import { MonitoringDashboard as MonitoringPanel } from "./Monitoring";
 import { useReferenceFields } from "../lib/referenceFields";
 
-type AdminTabId = "users" | "reference" | "trips" | "sync" | "oversight" | "monitoring";
+type AdminTabId = "users" | "reference" | "trips" | "sync" | "oversight";
 
 interface AdminTab {
   id: AdminTabId;
@@ -53,7 +51,7 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
   });
 
   const refresh = useCallback(() => {
-    api.listUsers(true).then(setUsers).catch((e) => setError(String(e)));
+    api.listUsers().then(setUsers).catch((e) => setError(String(e)));
     api.listPermissions().then(setPerms).catch((e) => setError(String(e)));
     api.listRolePresets().then(setPresets).catch(() => undefined);
   }, []);
@@ -68,7 +66,6 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
   const canAccessReference = canManageReference || canEditVehicles;
   const canManageIntegrations = user.permissions.some((p) => p.key === "manage_integrations");
   const canViewAudit = user.permissions.some((p) => p.key === "view_audit_log");
-  const canViewMonitoring = user.permissions.some((p) => p.key === "view_reporting_dashboard");
 
   const tabs: AdminTab[] = [];
   if (canManageUsers) tabs.push({ id: "users", label: "Users" });
@@ -76,7 +73,6 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
   if (canManageUsers) tabs.push({ id: "trips", label: "Trip Archive" });
   if (canManageIntegrations) tabs.push({ id: "sync", label: "Sync & Integrations" });
   if (canViewAudit) tabs.push({ id: "oversight", label: "Oversight & Audit" });
-  if (canViewMonitoring) tabs.push({ id: "monitoring", label: "Monitoring" });
 
   return (
     <div>
@@ -117,8 +113,6 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
       {activeTab === "sync" && canManageIntegrations && <SyncPanel user={user} />}
 
       {activeTab === "oversight" && canViewAudit && <OversightSection actor={user} />}
-
-      {activeTab === "monitoring" && canViewMonitoring && <MonitoringPanel user={user} />}
     </div>
   );
 }
@@ -272,16 +266,7 @@ function TripArchive({ actor }: { actor: SessionUser }) {
       ) : trips.length === 0 ? (
         <p className="muted small">{view === "active" ? "No recent trips to manage." : "Nothing is archived right now."}</p>
       ) : (
-        <div className="table-scroll">
         <table className="table">
-          <colgroup>
-            <col style={{ width: "40px" }} />
-            <col style={{ width: "100px", whiteSpace: "nowrap" }} />
-            <col style={{ width: "150px" }} />
-            <col />
-            <col style={{ width: "100px" }} />
-            <col style={{ width: "80px" }} />
-          </colgroup>
           <thead>
             <tr>
               <th></th>
@@ -298,7 +283,7 @@ function TripArchive({ actor }: { actor: SessionUser }) {
                 <td>
                   <input type="checkbox" checked={selected.includes(t.id)} onChange={() => toggle(t.id)} />
                 </td>
-                <td className="plate-font" style={{ whiteSpace: "nowrap" }}>{t.plate_number}</td>
+                <td>{t.plate_number}</td>
                 <td>{fmtDate(t.time_in)}</td>
                 <td>{t.company_name ?? ""}</td>
                 <td>{t.receipt_no ?? ""}</td>
@@ -311,7 +296,6 @@ function TripArchive({ actor }: { actor: SessionUser }) {
             ))}
           </tbody>
         </table>
-        </div>
       )}
     </div>
   );
@@ -400,14 +384,7 @@ function OversightSection({ actor }: { actor: SessionUser }) {
       {activity.length === 0 ? (
         <p className="muted small">No officer activity in the selected range.</p>
       ) : (
-        <div className="table-scroll">
         <table className="table">
-          <colgroup>
-            <col style={{ width: "150px" }} />
-            <col style={{ width: "100px" }} />
-            <col style={{ width: "100px" }} />
-            <col />
-          </colgroup>
           <thead>
             <tr>
               <th>Officer</th>
@@ -427,7 +404,6 @@ function OversightSection({ actor }: { actor: SessionUser }) {
             ))}
           </tbody>
         </table>
-        </div>
       )}
 
       <h4 style={{ margin: "16px 0 0", fontSize: 14 }}>Audit log</h4>
@@ -477,16 +453,7 @@ function OversightSection({ actor }: { actor: SessionUser }) {
       {audit.length === 0 ? (
         <p className="muted small">No audit entries match the current filter.</p>
       ) : (
-        <div className="table-scroll">
         <table className="table">
-          <colgroup>
-            {canDelete && <col style={{ width: "40px" }} />}
-            <col style={{ width: "160px" }} />
-            <col style={{ width: "120px" }} />
-            <col style={{ width: "120px" }} />
-            <col style={{ width: "100px" }} />
-            <col />
-          </colgroup>
           <thead>
             <tr>
               {canDelete && <th />}
@@ -521,7 +488,6 @@ function OversightSection({ actor }: { actor: SessionUser }) {
             ))}
           </tbody>
         </table>
-        </div>
       )}
     </div>
   );
@@ -562,22 +528,6 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
   const editing = users.find((u) => u.id === editingId) ?? null;
   const visible = showDeleted ? users : users.filter((u) => u.status !== "deleted");
 
-  // Resolve a display role for a user: the most specific role preset whose
-  // permission bundle the user fully holds, else Admin/Custom/No access.
-  const roleFor = (u: UserView): string => {
-    const keys = new Set(u.permissions);
-    let best: { name: string; size: number } | null = null;
-    for (const p of presets) {
-      const pk = p.permission_keys ?? [];
-      if (pk.length === 0 || !pk.every((k) => keys.has(k))) continue;
-      if (!best || pk.length > best.size) best = { name: p.name, size: pk.length };
-    }
-    if (best) return best.name;
-    if (keys.has("manage_users")) return "Admin";
-    if (keys.size === 0) return "No access";
-    return "Custom";
-  };
-
   return (
     <div className="card stack" style={{ marginBottom: 16 }}>
       <div className="row between">
@@ -606,42 +556,31 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
         />
       )}
 
-      <div className="table-scroll">
       <table className="table">
-        <colgroup>
-          <col style={{ width: "120px" }} />
-          <col style={{ width: "110px" }} />
-          <col style={{ width: "90px" }} />
-          <col />
-          <col style={{ width: "70px", whiteSpace: "nowrap" }} />
-        </colgroup>
         <thead>
           <tr>
             <th>Name</th>
-            <th>Role</th>
+            <th>Credential</th>
             <th>Status</th>
             <th>Permissions</th>
-            <th style={{ whiteSpace: "nowrap" }} />
+            <th />
           </tr>
         </thead>
         <tbody>
           {visible.map((u) => (
             <tr key={u.id}>
-              <td style={{ whiteSpace: "nowrap" }}>
+              <td>
                 <b>{u.name}</b>
                 {u.id === actor.id && <span className="muted small"> (you)</span>}
               </td>
               <td>
-                <span className="badge password">{roleFor(u)}</span>
-                <span className="muted small" style={{ marginLeft: 6 }}>{u.auth_type}</span>
+                <span className="badge password">{u.permissions.includes("manage_users") ? "Admin" : "User"}</span>
               </td>
               <td>
                 <span className={`badge ${u.status}`}>{u.status}</span>
               </td>
-              <td className="small" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
-                {u.permissions.length ? u.permissions.join(", ") : "—"}
-              </td>
-              <td style={{ whiteSpace: "nowrap" }}>
+              <td className="small">{u.permissions.length ? u.permissions.join(", ") : "—"}</td>
+              <td>
                 <button className="ghost small" onClick={() => setEditingId(editingId === u.id ? null : u.id)}>
                   Edit
                 </button>
@@ -650,7 +589,6 @@ function UserManagement({ users, perms, presets, actor, onChanged }: MgmtProps) 
           ))}
         </tbody>
       </table>
-      </div>
 
       {editing && (
         <EditUserForm
@@ -806,10 +744,9 @@ function AddUserForm({
   onDone: () => void;
 }) {
   const [name, setName] = useState("");
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
   const [presetId, setPresetId] = useState<string>("preset-gate-officer");
   const [selected, setSelected] = useState<string[]>([]);
+  const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -829,17 +766,9 @@ function AddUserForm({
       setError("Name is required.");
       return;
     }
-    if (password !== confirm) {
-      setError("Passwords do not match.");
-      return;
-    }
-    if (!password) {
-      setError("Password is required.");
-      return;
-    }
     setBusy(true);
     try {
-      await api.createUser(actor.id, name.trim(), password, selected);
+      await api.createUser(actor.id, name.trim(), selected, password);
       onDone();
     } catch (e) {
       setError(String(e));
@@ -874,18 +803,6 @@ function AddUserForm({
         </div>
       </div>
 
-      <div className="row">
-        <div className="field grow">
-          <label>Password</label>
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" placeholder="••••••••" />
-        </div>
-        <div className="field grow">
-          <label>Confirm password</label>
-          <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" placeholder="••••••••" />
-        </div>
-      </div>
-      {password && <PasswordChecklist password={password} />}
-
       <div className="field">
         <label>Permissions (composable — pick any combination)</label>
         <div className="row">
@@ -903,8 +820,14 @@ function AddUserForm({
         </div>
       </div>
 
+      <div className="field">
+        <label>Initial password</label>
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <PasswordChecklist password={password} />
+      </div>
+
       <div className="row">
-        <button className="primary" onClick={submit} disabled={busy || !name.trim() || !password || !selected.length}>
+        <button className="primary" onClick={submit} disabled={busy || !name.trim() || !selected.length || !password}>
           {busy ? "Creating…" : "Create user"}
         </button>
       </div>
@@ -1410,49 +1333,30 @@ function ReferenceDatabase({ actor, onNotice, canRegister }: { actor: SessionUse
       )}
 
       {importPreview && (
-        <ErrorBoundary
-          key="import-wizard"
-          onReset={() => setImportPreview(null)}
-          fallback={
-            <div className="card stack" style={{ margin: "10px 0", padding: 20 }}>
-              <div className="section-title" style={{ color: "var(--error, #d32f2f)" }}>
-                Import wizard error
-              </div>
-              <p className="muted small">
-                The import preview could not be displayed. The file may be corrupted or contain unexpected data.
-                Try exporting a fresh copy of your spreadsheet and importing again.
-              </p>
-              <button className="primary" onClick={() => setImportPreview(null)} style={{ alignSelf: "flex-start" }}>
-                Close
-              </button>
-            </div>
-          }
-        >
-          <ImportWizard
-            actor={actor}
-            preview={importPreview}
-            fields={{ vehicle: vehicleFields, company: companyFields, driver: driverFields }}
-            onClose={() => setImportPreview(null)}
-            onApplied={(summary) => {
-              const parts: string[] = [];
-              for (const [label, s] of [
-                [entityLabel("company"), summary.companies],
-                [entityLabel("driver"), summary.drivers],
-                [entityLabel("vehicle"), summary.vehicles],
-              ] as const) {
-                if (s.created || s.updated || s.skipped) parts.push(`${label}: ${s.created} created, ${s.updated} updated, ${s.skipped} skipped`);
-              }
-              const errs = [...summary.companies.errors, ...summary.drivers.errors, ...summary.vehicles.errors];
-              if (errs.length) {
-                setError(`${parts.join(" · ")}. Errors:\n${errs.slice(0, 10).join("\n")}`);
-              } else {
-                onNotice(`Import complete — ${parts.join(" · ")}`);
-                setTimeout(() => onNotice(""), 8000);
-              }
-              refresh();
-            }}
-          />
-        </ErrorBoundary>
+        <ImportWizard
+          actor={actor}
+          preview={importPreview}
+          fields={{ vehicle: vehicleFields, company: companyFields, driver: driverFields }}
+          onClose={() => setImportPreview(null)}
+          onApplied={(summary) => {
+            const parts: string[] = [];
+            for (const [label, s] of [
+              [entityLabel("company"), summary.companies],
+              [entityLabel("driver"), summary.drivers],
+              [entityLabel("vehicle"), summary.vehicles],
+            ] as const) {
+              if (s.created || s.updated || s.skipped) parts.push(`${label}: ${s.created} created, ${s.updated} updated, ${s.skipped} skipped`);
+            }
+            const errs = [...summary.companies.errors, ...summary.drivers.errors, ...summary.vehicles.errors];
+            if (errs.length) {
+              setError(`${parts.join(" · ")}. Errors:\n${errs.slice(0, 10).join("\n")}`);
+            } else {
+              onNotice(`Import complete — ${parts.join(" · ")}`);
+              setTimeout(() => onNotice(""), 8000);
+            }
+            refresh();
+          }}
+        />
       )}
     </div>
   );
@@ -1975,15 +1879,6 @@ function VehicleTable({
       ) : (
         <div className="table-scroll">
         <table className="table">
-          <colgroup>
-            <col style={{ width: "100px", whiteSpace: "nowrap" }} />
-            <col style={{ width: "120px" }} />
-            <col style={{ width: "100px" }} />
-            <col style={{ width: "120px" }} />
-            {customDefs.map(() => <col />)}
-            <col style={{ width: "80px", whiteSpace: "nowrap" }} />
-            <col style={{ width: "180px", whiteSpace: "nowrap" }} />
-          </colgroup>
           <thead>
             <tr>
               <th>{label("vehicle", "plate_number")}</th>
@@ -1997,13 +1892,13 @@ function VehicleTable({
                 </th>
               ))}
               <th>Status</th>
-              <th style={{ whiteSpace: "nowrap" }}>Actions</th>
+              <th />
             </tr>
           </thead>
           <tbody>
             {vehicles.map((v) => (
               <tr key={v.id}>
-                <td className="plate-font" style={{ whiteSpace: "nowrap" }}>{v.plate_number}</td>
+                <td className="plate-font">{v.plate_number}</td>
                 <td>{v.company_name ?? "—"}</td>
                 <td>
                   {v.registered_capacity != null
@@ -2018,7 +1913,7 @@ function VehicleTable({
                   <span className={`badge ${v.status}`}>{v.status}</span>
                 </td>
                 <td>
-                  <div className="row" style={{ gap: 6, flexWrap: "nowrap", whiteSpace: "nowrap" }}>
+                  <div className="row" style={{ gap: 6 }}>
                     <button className="ghost small" onClick={() => startEdit(v)}>
                       Edit
                     </button>
