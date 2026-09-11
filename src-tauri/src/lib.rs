@@ -1233,7 +1233,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                             return (false, String::new());
                         }
                         let rows = pg_handle.query_rows(
-                            &format!("SELECT pg_connection_string FROM company_config WHERE company_id = '{}'",
+                            &format!("SELECT * FROM company_config WHERE company_id = '{}' LIMIT 1",
                                 crate::sync::pg_literal_string(&company_id)),
                             &[],
                         );

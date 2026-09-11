@@ -1405,7 +1405,7 @@ fn validate_cloud_user(
                                 }
                             }
                             // ANPR — overwrite (bool, no empty state)
-                            if let Some(enabled) = row.get("anpr_enabled").and_then(|v| v.as_bool()) {
+                            if let Some(enabled) = row.get("anpr_enabled").map(|v| crate::sync::json_bool(v)) {
                                 let _ = crate::db::set_setting(&conn, "anpr_enabled", if enabled { "true" } else { "false" });
                             }
 
