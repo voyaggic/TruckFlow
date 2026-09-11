@@ -85,6 +85,37 @@ impl SharedPg {
     fn current(&self) -> Arc<dyn PostgresAdapter> {
         self.get()
     }
+
+    /// Configure with automatic adapter-TYPE switching: a `REST|url|key`
+    /// Supabase string needs the REST adapter, anything else the pgbouncer
+    /// driver. Login/poller paths save the string and reconfigure the live
+    /// adapter — on a fresh PC (no saved string at startup) the startup
+    /// adapter is the pgbouncer driver, so delegating `configure` to it would
+    /// poison it with a REST string and sync would stay dead until restart.
+    /// This swaps in the correct adapter type first; only a SUCCESSFUL
+    /// configure replaces the current adapter (a failed test never takes the
+    /// working one down).
+    pub fn configure_for(&self, conn_string: &str) -> Result<(), String> {
+        let is_rest = conn_string.starts_with("REST|");
+        let current_is_rest = self.get().label() == "rest-postgres";
+        if is_rest == current_is_rest {
+            return self.configure(Some(conn_string.to_string()));
+        }
+        let next: Arc<dyn PostgresAdapter> = if is_rest {
+            Arc::new(RestPostgres::new())
+        } else {
+            Arc::new(RealPostgres::new())
+        };
+        // Carry over a stored PAT so table creation keeps working after the
+        // switch (same behavior as configure_postgres).
+        // (Callers with a PAT in hand also call set_pat after this; this
+        // covers the background paths that only have the saved setting.)
+        let result = next.configure(Some(conn_string.to_string()));
+        if result.is_ok() {
+            self.swap(next);
+        }
+        result
+    }
 }
 
 impl PostgresAdapter for SharedPg {
@@ -317,6 +348,14 @@ pub trait SheetsProvider: Send + Sync {
     fn read_existing_trip_ids(&self) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+
+    /// Restore credentials without network validation. The first network call
+    /// (token fetch, sheet metadata) is deferred to `ensure_validated()` on
+    /// first use. Used by the sync poller to bootstrap Sheets from cloud-
+    /// pulled `company_config` without blocking on Google.
+    fn restore_creds(&self, json: String, sheet_id: String) -> Result<String, String> {
+        self.configure(Some(json), Some(sheet_id))
+    }
 }
 
 #[derive(Default)]
@@ -387,6 +426,9 @@ impl SheetsProvider for MockSheets {
     }
     fn prune(&self, _cutoff_iso: Option<&str>, _excluded_ids: &[String]) -> Result<usize, String> {
         Ok(0)
+    }
+    fn restore_creds(&self, json: String, sheet_id: String) -> Result<String, String> {
+        self.configure(Some(json), Some(sheet_id))
     }
 }
 
@@ -1892,6 +1934,28 @@ pub fn connect_google_sheets(
             .map_err(|e| format!("integration create failed: {e}"))?;
         }
     }
+    // Mirror to sync_db so the background poller sees the connected state
+    if let Ok(sconn) = state.sync_db.lock() {
+        let has_row: bool = sconn.query_row(
+            "SELECT 1 FROM integrations WHERE type = 'google_sheets' LIMIT 1",
+            [], |_| Ok(true),
+        ).unwrap_or(false);
+        if has_row {
+            let _ = sconn.execute(
+                "UPDATE integrations SET target_sheet_id = ?1, shared_group = ?2,
+                        sync_frequency = ?3, status = 'connected', last_synced_at = NULL, updated_at = ?4
+                 WHERE type = 'google_sheets'",
+                params![target_sheet_id, shared_group, sync_frequency, now],
+            );
+        } else {
+            let _ = sconn.execute(
+                "INSERT INTO integrations (id, type, connected_by, target_sheet_id, shared_group,
+                        sync_frequency, status, created_at, updated_at)
+                 VALUES (?1, 'google_sheets', ?2, ?3, ?4, ?5, 'connected', ?6, ?6)",
+                params![uuid::Uuid::new_v4().to_string(), actor_id, target_sheet_id, shared_group, sync_frequency, now],
+            );
+        }
+    }
     append_audit(
         &conn,
         &actor_id,
@@ -1917,6 +1981,17 @@ pub fn disconnect_google_sheets(state: State<AppState>, actor_id: String) -> Res
     )
     .map_err(|e| format!("settings clear failed: {e}"))?;
     state.sheets.configure(None, None)?;
+    // Mirror disconnect to sync_db
+    if let Ok(sconn) = state.sync_db.lock() {
+        let _ = sconn.execute(
+            "UPDATE integrations SET status = 'disconnected', updated_at = ?1 WHERE type = 'google_sheets'",
+            params![now_iso()],
+        );
+        let _ = sconn.execute(
+            "DELETE FROM app_settings WHERE key IN ('sheets_service_account_json', 'sheets_target_sheet_id')",
+            [],
+        );
+    }
     append_audit(&conn, &actor_id, "disconnected_google_sheets", None, None)?;
     sheets_state_impl(&conn, &*state.sheets)
 }
@@ -2205,16 +2280,25 @@ pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
     let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
     let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
 
-    // Push to PostgreSQL
+    // Skip push entirely if nothing to push — prevents a fresh/gate-person
+    // login from overwriting the admin's cloud config with empty values.
+    if pg_conn_str.is_empty() && sheets_id.is_empty() && sheets_sa_json.is_empty() {
+        drop(conn);
+        return Ok(());
+    }
+
+    // Push to PostgreSQL — use COALESCE(NULLIF(...)) so empty local values
+    // never overwrite non-empty cloud values (protects admin config when a
+    // gate-person PC with no Sheets creds logs in).
     let sql = format!(
         "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
          VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
          ON CONFLICT (company_id) DO UPDATE SET
-             pg_connection_string = EXCLUDED.pg_connection_string,
-             sheets_id = EXCLUDED.sheets_id,
-             sheets_frequency = EXCLUDED.sheets_frequency,
+             pg_connection_string = COALESCE(NULLIF(EXCLUDED.pg_connection_string, ''), company_config.pg_connection_string),
+             sheets_id = COALESCE(NULLIF(EXCLUDED.sheets_id, ''), company_config.sheets_id),
+             sheets_frequency = COALESCE(NULLIF(EXCLUDED.sheets_frequency, ''), company_config.sheets_frequency),
              anpr_enabled = EXCLUDED.anpr_enabled,
-             sheets_service_account_json = EXCLUDED.sheets_service_account_json,
+             sheets_service_account_json = COALESCE(NULLIF(EXCLUDED.sheets_service_account_json, ''), company_config.sheets_service_account_json),
              updated_at = EXCLUDED.updated_at",
         pg_literal_string(company_id),
         pg_literal_string(&pg_conn_str),
@@ -2226,7 +2310,35 @@ pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
     );
 
     drop(conn);
-    pg.query_rows(&sql, &[]).map_err(|e| format!("Failed to push config: {e}"))?;
+    if let Err(e) = pg.query_rows(&sql, &[]) {
+        // If the table doesn't exist yet, create it and retry
+        if e.contains("PGRST205") || e.contains("does not exist") || e.contains("not find the table") {
+            crate::log::log("[sync] company_config table missing, auto-creating");
+            let create_sql = "CREATE TABLE IF NOT EXISTS public.company_config (
+                company_id TEXT PRIMARY KEY,
+                pg_connection_string TEXT,
+                sheets_id TEXT,
+                sheets_frequency TEXT DEFAULT 'realtime',
+                anpr_enabled INTEGER DEFAULT 0,
+                sheets_service_account_json TEXT,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT REFERENCES public.users(id)
+            );
+            -- service_role MUST be included: PostgREST (the REST channel the app
+            -- uses) connects as service_role, and tables WITHOUT grants for that
+            -- role are excluded from its schema cache entirely (PGRST205) — even
+            -- though the table exists. Granting only anon/authenticated made the
+            -- table invisible to every PC's credential pull.
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO service_role;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO anon;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO authenticated;";
+            let _ = pg.query_rows(create_sql, &[]);
+            // Retry the insert
+            pg.query_rows(&sql, &[]).map_err(|e| format!("Failed to push config after table creation: {e}"))?;
+        } else {
+            return Err(format!("Failed to push config: {e}"));
+        }
+    }
 
     Ok(())
 }
@@ -2237,10 +2349,32 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
         return Ok(()); // Not connected, skip
     }
     
-    let rows = pg.query_rows(
-        &format!("SELECT * FROM company_config WHERE company_id = '{}'", pg_literal_string(company_id)),
-        &[],
-    ).map_err(|e| format!("Failed to query company_config: {e}"))?;
+    let select_sql = format!("SELECT * FROM company_config WHERE company_id = '{}'", pg_literal_string(company_id));
+    let rows = match pg.query_rows(&select_sql, &[]) {
+        Ok(r) => r,
+        Err(e) if e.contains("PGRST205") || e.contains("does not exist") || e.contains("not find the table") => {
+            crate::log::log("[sync] company_config table missing in cloud, auto-creating");
+            let create_sql = "CREATE TABLE IF NOT EXISTS public.company_config (
+                company_id TEXT PRIMARY KEY,
+                pg_connection_string TEXT,
+                sheets_id TEXT,
+                sheets_frequency TEXT DEFAULT 'realtime',
+                anpr_enabled INTEGER DEFAULT 0,
+                sheets_service_account_json TEXT,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT REFERENCES public.users(id)
+            );
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO service_role;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO anon;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON public.company_config TO authenticated;";
+            let _ = pg.query_rows(create_sql, &[]);
+            // Notify PostgREST to refresh schema cache
+            let _ = pg.query_rows("SELECT notify_pgrst_cache_needs_refresh()", &[]);
+            // Retry the query
+            pg.query_rows(&select_sql, &[]).map_err(|e| format!("Failed to query company_config after creation: {e}"))?
+        }
+        Err(e) => return Err(format!("Failed to query company_config: {e}")),
+    };
     
     if let Some(row) = rows.first() {
         let conn = db.lock().map_err(|e| e.to_string())?;
@@ -2253,6 +2387,8 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
         // Save Sheets ID
         if let Some(sheets_id) = row.get("sheets_id").and_then(|v| v.as_str()) {
             let _ = crate::db::set_setting(&conn, "sheets_id", sheets_id);
+            // Also save as sheets_target_sheet_id — the key real_sheets() reads
+            let _ = crate::db::set_setting(&conn, "sheets_target_sheet_id", sheets_id);
         }
         
 
@@ -2298,6 +2434,96 @@ pub fn pull_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
     Ok(())
 }
 
+pub fn pull_company_config_bg(pg: &dyn PostgresAdapter, conn: &Connection) -> Result<(), String> {
+    if !pg.configured() || !pg.connected() {
+        return Ok(());
+    }
+    let company_id: String = conn
+        .query_row(
+            "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if company_id.is_empty() {
+        return Ok(());
+    }
+    let rows = pg.query_rows(
+        &format!("SELECT * FROM company_config WHERE company_id = '{}'", pg_literal_string(&company_id)),
+        &[],
+    ).map_err(|e| format!("query company_config: {e}"))?;
+    if let Some(row) = rows.first() {
+        if let Some(pg_str) = row.get("pg_connection_string").and_then(|v| v.as_str()) {
+            let _ = crate::db::set_setting(conn, "pg_connection_string", pg_str);
+        }
+        if let Some(sheets_id) = row.get("sheets_id").and_then(|v| v.as_str()) {
+            let _ = crate::db::set_setting(conn, "sheets_id", sheets_id);
+            let _ = crate::db::set_setting(conn, "sheets_target_sheet_id", sheets_id);
+        }
+        if let Some(freq) = row.get("sheets_frequency").and_then(|v| v.as_str()) {
+            let _ = crate::db::set_setting(conn, "sheets_frequency", freq);
+        }
+        if let Some(enabled) = row.get("anpr_enabled").and_then(|v| v.as_bool()) {
+            let _ = crate::db::set_setting(conn, "anpr_enabled", if enabled { "true" } else { "false" });
+        }
+        if let Some(sa_json) = row.get("sheets_service_account_json").and_then(|v| v.as_str()) {
+            if !sa_json.is_empty() {
+                let _ = crate::db::set_setting(conn, "sheets_service_account_json", sa_json);
+            }
+        }
+        let _ = conn.execute(
+            "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(company_id) DO UPDATE SET 
+                 pg_connection_string = excluded.pg_connection_string,
+                 sheets_id = excluded.sheets_id,
+                 sheets_frequency = excluded.sheets_frequency,
+                 anpr_enabled = excluded.anpr_enabled,
+                 sheets_service_account_json = excluded.sheets_service_account_json,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                company_id,
+                row.get("pg_connection_string").and_then(|v| v.as_str()).unwrap_or(""),
+                row.get("sheets_id").and_then(|v| v.as_str()).unwrap_or(""),
+                row.get("sheets_frequency").and_then(|v| v.as_str()).unwrap_or("realtime"),
+                row.get("anpr_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                row.get("sheets_service_account_json").and_then(|v| v.as_str()).unwrap_or(""),
+                crate::db::now_iso(),
+            ],
+        );
+
+        // Ensure the integrations row exists so sheets_due() returns true.
+        // On non-admin PCs the credentials arrive from company_config but the
+        // integrations row (which sheets_state_impl queries) was never created,
+        // causing sheets sync to silently skip forever.
+        let sheets_id_val = row.get("sheets_id").and_then(|v| v.as_str()).unwrap_or("");
+        if !sheets_id_val.is_empty() {
+            let has_integration: bool = conn.query_row(
+                "SELECT 1 FROM integrations WHERE type = 'google_sheets' LIMIT 1",
+                [],
+                |_| Ok(true),
+            ).unwrap_or(false);
+            let now = crate::db::now_iso();
+            let freq = row.get("sheets_frequency").and_then(|v| v.as_str()).unwrap_or("realtime");
+            if !has_integration {
+                let _ = conn.execute(
+                    "INSERT INTO integrations (id, type, connected_by, target_sheet_id, sync_frequency, status, created_at, updated_at)
+                     VALUES (?1, 'google_sheets', NULL, ?2, ?3, 'connected', ?4, ?4)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), sheets_id_val, freq, now],
+                );
+            } else {
+                let _ = conn.execute(
+                    "UPDATE integrations SET target_sheet_id = ?1, sync_frequency = ?2, status = 'connected', updated_at = ?3
+                     WHERE type = 'google_sheets'",
+                    rusqlite::params![sheets_id_val, freq, now],
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+
 // ---------------------------------------------------------------------------
 // Real PostgreSQL adapter — Phase 4 (02 §3, 06-data-flow.md §5)
 // ---------------------------------------------------------------------------
@@ -2335,6 +2561,20 @@ fn pg_column_type(table: &str, col: &str) -> &'static str {
 
 fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Percent-encode a query-string value (PostgREST filter values, order specs).
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' => {
+                out.push(b as char)
+            }
+            otherwise => out.push_str(&format!("%{:02X}", otherwise)),
+        }
+    }
+    out
 }
 
 /// Get column names for a table from local SQLite.
@@ -4110,6 +4350,9 @@ impl SheetsProvider for RealSheets {
             .filter(|id| !id.is_empty())
             .collect())
     }
+    fn restore_creds(&self, json: String, sheet_id: String) -> Result<String, String> {
+        self.configure(Some(json), Some(sheet_id))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4415,7 +4658,8 @@ pub fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
     sql.push_str("-- ACCESS & SCHEMA RELOAD\n");
     sql.push_str("-- ============================================================\n\n");
 
-    sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n");
+    sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n");
     sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;\n\n");
 
     sql.push_str("CREATE OR REPLACE FUNCTION public.notify_pgrst_cache_needs_refresh()\n");
@@ -4424,7 +4668,7 @@ pub fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
     sql.push_str("  NOTIFY pgrst, 'reload schema cache';\n");
     sql.push_str("END;\n");
     sql.push_str("$$;\n\n");
-    sql.push_str("GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;\n");
+    sql.push_str("GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role, anon, authenticated;\n");
 
     // Per-user profile view for the Supabase dashboard: one row per user with
     // their resolved role preset name (matched against role_presets.permission_ids),
@@ -4439,6 +4683,26 @@ pub fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
 
     // RLS lockdown: deny the anon/public key entirely (the app uses service_role)
     sql.push_str(RLS_LOCKDOWN_SQL);
+
+    // Finalize: re-assert grants on ALL current tables and force an immediate
+    // schema-cache reload. The ALL-TABLES grant covers tables like company_config
+    // that may already exist from older auto-create paths missing the service_role
+    // grant — PostgREST hides tables the connecting role cannot access, so a
+    // missing grant makes every pull 404 (PGRST205) even though the table exists.
+    // The final SELECT fires the NOTIFY so the pasted script takes effect the
+    // moment it finishes running, without waiting for a natural cache refresh.
+    sql.push_str("\n-- ============================================================\n");
+    sql.push_str("-- FINALIZE: fix role visibility + reload the REST schema cache\n");
+    sql.push_str("-- ============================================================\n\n");
+    sql.push_str("-- PostgREST (the REST API the app uses) connects as service_role; any\n");
+    sql.push_str("-- table WITHOUT this grant is INVISIBLE to it (PGRST205) even though it\n");
+    sql.push_str("-- exists. This line heals existing tables; new tables get the same grant\n");
+    sql.push_str("-- in their CREATE TABLE blocks above.\n");
+    sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;\n");
+    sql.push_str("GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role;\n");
+    sql.push_str("-- Force PostgREST to reload its schema cache NOW so the change is live\n");
+    sql.push_str("-- immediately after this script finishes.\n");
+    sql.push_str("SELECT public.notify_pgrst_cache_needs_refresh();\n");
 
     Ok(sql)
 }
@@ -4824,7 +5088,16 @@ impl RestPostgres {
             return Ok(vec![]);
         }
 
-        let url = format!("{}/{}", base_url.trim_end_matches('/'), table);
+        let mut url = format!("{}/{}", base_url.trim_end_matches('/'), table);
+
+        // field_definitions has a unique index on (entity_type, field_key) but
+        // random UUIDs as PK. The REST upsert defaults to ON CONFLICT ("id")
+        // which doesn't match — the same fields on different PCs get different
+        // UUIDs, causing a 409 unique constraint violation every cycle.
+        // Tell PostgREST to use the business key for conflict resolution.
+        if table == "field_definitions" {
+            url = format!("{}?on_conflict=entity_type,field_key", url);
+        }
 
         let mut request = self.client.post(&url);
         request = request
@@ -5096,7 +5369,8 @@ impl RestPostgres {
         }
 
         // Grant access
-        sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n");
+        sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n");
         sql.push_str("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;\n");
         sql.push_str("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO anon;\n");
         sql.push_str("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO authenticated;\n");
@@ -5159,10 +5433,15 @@ impl RestPostgres {
                 }
             })
             .collect();
+        // Grants ride along: a table created outside the full-schema batch must
+        // include service_role or PostgREST excludes it from the schema cache
+        // (PGRST205 "could not find the table" despite it existing).
         format!(
-            "CREATE TABLE IF NOT EXISTS public.\"{}\" ({});\n",
+            "CREATE TABLE IF NOT EXISTS public.\"{}\" ({});\n\
+             GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{}\" TO service_role, anon, authenticated;\n",
             table,
-            defs.join(", ")
+            defs.join(", "),
+            table
         )
     }
 
@@ -5194,7 +5473,7 @@ impl RestPostgres {
               NOTIFY pgrst, 'reload schema cache';
             END;
             $$;
-            GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
+            GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role, anon, authenticated;
         "#;
 
         // Use Management API to create the function
@@ -5249,6 +5528,112 @@ impl RestPostgres {
         }
 
         crate::log::log(&format!("[sync] Schema cache refresh notified for {}", base_url));
+    }
+
+    /// Translate a simple `SELECT * FROM <table> [WHERE col = 'v'] [ORDER BY
+    /// col [ASC|DESC]] [LIMIT n]` into a PostgREST GET. Returns None when the
+    /// SQL is not expressible (joins, functions, multiple conditions, etc.).
+    fn try_postgrest_select(&self, sql: &str) -> Option<Result<Vec<serde_json::Value>, String>> {
+        let config = self.config.lock().ok()?;
+        let config = config.as_ref()?;
+        let base_url = config.url.trim_end_matches('/').to_string();
+        let key = config.service_role_key.clone();
+        drop(config);
+
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let lower = trimmed.to_lowercase();
+
+        // Only plain SELECT * statements — no column lists, joins, aggregates.
+        if !lower.starts_with("select * from") {
+            return None;
+        }
+        let rest = &trimmed["SELECT * FROM".len()..];
+        let mut parts = rest.trim().split_whitespace();
+        let table_tok = parts.next()?;
+        let table = table_tok.trim().trim_matches('"').to_string();
+        if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+
+        // Parse the remaining clauses (WHERE / ORDER BY / LIMIT only).
+        let remainder = rest.trim()[table_tok.len()..].trim();
+        if remainder.contains("JOIN") || remainder.contains(",") {
+            return None;
+        }
+        let mut query_pairs: Vec<(String, String)> = Vec::new();
+        let mut order_by: Option<String> = None;
+        let mut limit: Option<String> = None;
+        let mut tokens = remainder.split_whitespace().peekable();
+        while let Some(tok) = tokens.next() {
+            let upper = tok.to_uppercase();
+            match upper.as_str() {
+                "WHERE" => {
+                    // Expect: col = 'value' (single equality only)
+                    let col = tokens.next()?;
+                    if col.contains('(') || col.contains('*') { return None; }
+                    let op = tokens.next()?;
+                    if op != "=" { return None; }
+                    let val_tok = tokens.next()?;
+                    let val = val_tok.trim_matches('\'').to_string();
+                    // Any additional token must be a clause keyword, not AND/OR
+                    if let Some(next) = tokens.peek() {
+                        let nu = next.to_uppercase();
+                        if nu != "ORDER" && nu != "LIMIT" { return None; }
+                    }
+                    query_pairs.push((col.trim_matches('"').to_string(), format!("eq.{}", val)));
+                }
+                "ORDER" => {
+                    if tokens.next()?.to_uppercase() != "BY" { return None; }
+                    let col = tokens.next()?;
+                    let mut spec = col.trim_matches('"').to_string();
+                    if let Some(dir) = tokens.peek() {
+                        let du = dir.to_uppercase();
+                        if du == "ASC" || du == "DESC" {
+                            spec = format!("{}{}", if du == "DESC" { "-" } else { "" }, spec);
+                            tokens.next();
+                        }
+                    }
+                    order_by = Some(spec);
+                }
+                "LIMIT" => {
+                    limit = Some(tokens.next()?.to_string());
+                }
+                _ => return None,
+            }
+        }
+
+        let mut url = format!("{}/{}?select=*", base_url, table);
+        for (k, v) in &query_pairs {
+            url.push_str(&format!("&{}={}", k, urlencode(&v)));
+        }
+        if let Some(ob) = &order_by {
+            url.push_str(&format!("&order={}", urlencode(ob)));
+        }
+        if let Some(l) = &limit {
+            url.push_str(&format!("&limit={}", l));
+        }
+
+        let client = self.client.clone();
+        Some((|| {
+            let resp = client.get(&url)
+                .header("apikey", &key)
+                .header("Authorization", format!("Bearer {}", key))
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .map_err(|e| format!("PostgREST select {table} failed: {e}"))?;
+            let status = resp.status();
+            let body = resp.text().map_err(|e| format!("PostgREST select {table}: read failed: {e}"))?;
+            if !status.is_success() {
+                if body.contains("PGRST205") || body.contains("Could not find the table") {
+                    return Err(format!(
+                        "Table '{table}' is INVISIBLE to PostgREST (PGRST205) — usually a missing GRANT for service_role. Fix: GRANT SELECT, INSERT, UPDATE, DELETE ON public.{table} TO service_role; then reload the schema cache."
+                    ));
+                }
+                return Err(format!("PostgREST select {table}: {status} {body}"));
+            }
+            serde_json::from_str(&body)
+                .map_err(|e| format!("PostgREST select {table}: parse error: {e}"))
+        })())
     }
 }
 
@@ -5392,8 +5777,18 @@ impl PostgresAdapter for RestPostgres {
         if !self.configured() {
             return Err("REST adapter not configured".to_string());
         }
+        // Try the native PostgREST channel first. The SQL API (Management API)
+        // requires a Personal Access Token, but read paths run every sync cycle
+        // on every PC — routing them through the PAT made ALL pulls fail with
+        // 401 whenever the PAT expired, even though PostgREST itself was fine
+        // with the service_role key. Simple SELECTs translate 1:1; anything the
+        // translator can't express falls back to the SQL API.
+        if let Some(result) = self.try_postgrest_select(sql) {
+            return result;
+        }
         self.query_rows_sql_api(sql)
     }
+
 
     /// Add a missing column to a table in Supabase.
     fn add_missing_column(&self, table: &str, column_name: &str) -> Result<(), String> {
@@ -5886,6 +6281,7 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
     // Phase 2: Network call on background thread — frontend receives "testing" instantly
     let sheets = state.sheets.clone();
     let db = state.db.clone();
+    let sync_db = state.sync_db.clone();
     let pg = state.pg.get();
     let company_id_for_push = company_id.clone();
     let target_sheet_id_clone = target_sheet_id.clone();
@@ -5933,6 +6329,48 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
                     // Also save sheets_id for company_config push (used by push_company_config)
                     let _ = set_setting(&conn, "sheets_id", &target_sheet_id_clone);
                     let _ = set_setting(&conn, "sheets_frequency", &sync_frequency_clone);
+
+                // ── Mirror to sync_db so the background poller can find it ──
+                // The background sync poller uses a SEPARATE SQLite connection
+                // (truckflow_sync.db). Without this mirror, sheets_due() always
+                // returns false and trips are never auto-pushed.
+                if let Ok(sconn) = sync_db.lock() {
+                    let now2 = crate::db::now_iso();
+                    let has_row: bool = sconn
+                        .query_row(
+                            "SELECT 1 FROM integrations WHERE type = 'google_sheets' LIMIT 1",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .unwrap_or(false);
+                    if has_row {
+                        let _ = sconn.execute(
+                            "UPDATE integrations SET target_sheet_id = ?1, sync_frequency = ?2,
+                                    status = 'connected', last_synced_at = NULL, updated_at = ?3
+                             WHERE type = 'google_sheets'",
+                            params![target_sheet_id_clone, sync_frequency_clone, now2],
+                        );
+                    } else {
+                        let _ = sconn.execute(
+                            "INSERT INTO integrations (id, type, connected_by, target_sheet_id, shared_group,
+                                    sync_frequency, status, created_at, updated_at)
+                             VALUES (?1, 'google_sheets', ?2, ?3, ?4, ?5, 'connected', ?6, ?6)",
+                            params![
+                                uuid::Uuid::new_v4().to_string(),
+                                actor_id,
+                                target_sheet_id_clone,
+                                shared_group,
+                                sync_frequency_clone,
+                                now2
+                            ],
+                        );
+                    }
+                    let _ = crate::db::set_setting(&sconn, "sheets_service_account_json", &service_account_json);
+                    let _ = crate::db::set_setting(&sconn, "sheets_target_sheet_id", &target_sheet_id_clone);
+                    let _ = crate::db::set_setting(&sconn, "sheets_id", &target_sheet_id_clone);
+                    let _ = crate::db::set_setting(&sconn, "sheets_frequency", &sync_frequency_clone);
+                }
+
                     let _ = append_audit(
                         &conn,
                         &actor_id,

@@ -993,6 +993,7 @@ pub fn approve_trip(
     let trip = approve_trip_impl(&conn, &trip_id, &officer_id)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(trip)
 }
 
@@ -1061,6 +1062,7 @@ pub fn update_trip_fields(
     )?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(trip)
 }
 
@@ -1202,6 +1204,8 @@ pub fn archive_trip(
         "id": trip_id, "archived": 1, "updated_at": crate::db::now_iso()
     })));
     crate::db::append_audit(&conn, &actor_id, "archived_trip", Some(&trip_id), None)?;
+    drop(conn);
+    let _ = state.sync_notify.try_send(());
     Ok(())
 }
 
@@ -1235,6 +1239,8 @@ pub fn clear_today_trips(
         })));
     }
     crate::db::append_audit(&conn, &actor_id, "cleared_gate_entries", None, Some(serde_json::json!({ "count": n })))?;
+    drop(conn);
+    let _ = state.sync_notify.try_send(());
     Ok(n as i64)
 }
 
@@ -1747,6 +1753,7 @@ pub fn discard_trip(
     let trip = discard_trip_impl(&conn, &trip_id, &officer_id)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(trip)
 }
 
@@ -1792,6 +1799,7 @@ pub fn decline_trip(
     let trip = decline_trip_impl(&conn, &trip_id, &officer_id)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(trip)
 }
 
@@ -1912,6 +1920,7 @@ pub fn classify_discharge(
     let trip = classify_discharge_impl(&conn, &trip_id, &officer_id, is_discharge)?;
     drop(conn);
     emit_capture_update(&app);
+    let _ = state.sync_notify.try_send(());
     Ok(trip)
 }
 

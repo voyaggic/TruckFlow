@@ -968,10 +968,72 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
 
             // ── Fire Sheets and PG in parallel ──────────────────────────
             let pg_handle = pg.clone();
+            let sheets_for_pg = sheets.clone();
             let sync_db_pg = sync_db.clone();
             let pending_marks_pg = pending_marks.clone();
 
             let pg_thread = std::thread::spawn(move || {
+                // ── Restore PG adapter from saved settings if needed ────
+                // On a non-admin PC, the adapter may not be configured yet
+                // (first login after restart). Reconfigure from local settings
+                // so the sync poller can push/pull without requiring a manual
+                // "Connect" click. configure_for switches adapter TYPE if the
+                // saved string is Supabase REST but the startup adapter is the
+                // pgbouncer driver (fresh PC before its first restart).
+                if !pg_handle.configured() {
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        if let Some(cs) = crate::db::get_setting(&conn, "pg_connection_string") {
+                            if !cs.is_empty() {
+                                drop(conn);
+                                if pg_handle.configure_for(&cs).is_ok() {
+                                    crate::log::log("[sync] PG adapter auto-configured from saved settings");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Pull company_config from cloud every cycle ───────────
+                // This is the mechanism that lets non-admin PCs get PG/Sheets
+                // credentials stored by the admin PC. Must run BEFORE the
+                // configured() guard so credentials can bootstrap the adapter.
+                if pg_handle.configured() {
+                    let old_pg_cs = sync_db_pg.lock().ok()
+                        .and_then(|c| crate::db::get_setting(&c, "pg_connection_string"));
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        if let Err(e) = sync::pull_company_config_bg(&*pg_handle, &conn) {
+                            crate::log::log(&format!("[sync] company_config pull: {e}"));
+                        }
+                    }
+                    // If company_config pull changed pg_connection_string,
+                    // reconfigure the PG adapter (type-switch aware).
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let new_pg_cs = crate::db::get_setting(&conn, "pg_connection_string");
+                        if let Some(cs) = new_pg_cs.filter(|s| Some(s) != old_pg_cs.as_ref()) {
+                            drop(conn);
+                            if pg_handle.configure_for(&cs).is_ok() {
+                                crate::log::log("[sync] PG adapter reconfigured from cloud company_config");
+                            }
+                        }
+                    }
+                    // Reconfigure Sheets adapter if credentials changed
+                    if let Ok(conn) = sync_db_pg.lock() {
+                        let sa = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
+                        let sid = crate::db::get_setting(&conn, "sheets_target_sheet_id").unwrap_or_default();
+                        if !sa.is_empty() && !sid.is_empty() && !sheets_for_pg.configured() {
+                            drop(conn);
+                            match sheets_for_pg.restore_creds(sa, sid) {
+                                Ok(email) => {
+                                    crate::log::log(&format!("[sync] Sheets adapter restored from cloud company_config: {email}"));
+                                }
+                                Err(e) => {
+                                    crate::log::log(&format!("[sync] Sheets adapter restore from cloud FAILED: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !pg_handle.configured() { return; }
 
                 // ── Postgres push (local → central) ──────────────────────
@@ -1143,6 +1205,88 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                     }
                     if let Ok(conn) = sync_db_pg.lock() {
                         let _ = crate::db::set_setting(&conn, "pg_last_pulled_at", &crate::db::now_iso());
+                    }
+                }
+
+                // ── Auto-push company_config to cloud (bootstraps other PCs) ──
+                // When this PC has valid PG credentials but the cloud company_config
+                // is empty (first PC to connect, or config was lost), push local
+                // config so other PCs can auto-configure without admin intervention.
+                // Runs only when connected and only every ~5 minutes to avoid write churn.
+                if pg_handle.connected() {
+                    let should_push_and_id = sync_db_pg.lock().ok().map(|conn| {
+                        let company_id: String = conn.query_row(
+                            "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+                            [],
+                            |r| r.get(0),
+                        ).unwrap_or_default();
+                        if company_id.is_empty() {
+                            return (false, String::new());
+                        }
+                        let last_push = crate::db::get_setting(&conn, "pg_last_config_push_at")
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|dt| dt.timestamp());
+                        let now = chrono::Utc::now().timestamp();
+                        let stale = last_push.map(|t| now - t > 300).unwrap_or(true);
+                        if !stale {
+                            return (false, String::new());
+                        }
+                        let rows = pg_handle.query_rows(
+                            &format!("SELECT pg_connection_string FROM company_config WHERE company_id = '{}'",
+                                crate::sync::pg_literal_string(&company_id)),
+                            &[],
+                        );
+                        let missing = match rows {
+                            Ok(r) => r.is_empty(),
+                            Err(_) => false,
+                        };
+                        (missing, company_id)
+                    }).unwrap_or((false, String::new()));
+                    if should_push_and_id.0 && !should_push_and_id.1.is_empty() {
+                        let cid = should_push_and_id.1;
+                        crate::log::log("[sync] auto-pushing company_config to cloud (bootstrapping other PCs)");
+                        // Read local config and push directly (avoids Arc type mismatch)
+                        let push_result = sync_db_pg.lock().ok().map(|conn| {
+                            let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
+                            let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
+                            let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
+                            let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
+                            let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
+                            drop(conn);
+                            if pg_conn_str.is_empty() && sheets_id.is_empty() && sheets_sa_json.is_empty() {
+                                return Ok(());
+                            }
+                            let sql = format!(
+                                "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
+                                 VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
+                                 ON CONFLICT (company_id) DO UPDATE SET
+                                     pg_connection_string = COALESCE(NULLIF(EXCLUDED.pg_connection_string, ''), company_config.pg_connection_string),
+                                     sheets_id = COALESCE(NULLIF(EXCLUDED.sheets_id, ''), company_config.sheets_id),
+                                     sheets_frequency = COALESCE(NULLIF(EXCLUDED.sheets_frequency, ''), company_config.sheets_frequency),
+                                     anpr_enabled = EXCLUDED.anpr_enabled,
+                                     sheets_service_account_json = COALESCE(NULLIF(EXCLUDED.sheets_service_account_json, ''), company_config.sheets_service_account_json),
+                                     updated_at = EXCLUDED.updated_at",
+                                crate::sync::pg_literal_string(&cid),
+                                crate::sync::pg_literal_string(&pg_conn_str),
+                                crate::sync::pg_literal_string(&sheets_id),
+                                crate::sync::pg_literal_string(&sheets_freq),
+                                anpr_enabled,
+                                crate::sync::pg_literal_string(&sheets_sa_json),
+                                crate::sync::pg_literal_string(&crate::db::now_iso()),
+                            );
+                            pg_handle.query_rows(&sql, &[]).map(|_| ())
+                        }).unwrap_or(Ok(()));
+                        match push_result {
+                            Ok(()) => {
+                                if let Ok(conn) = sync_db_pg.lock() {
+                                    let _ = crate::db::set_setting(&conn, "pg_last_config_push_at", &crate::db::now_iso());
+                                }
+                                crate::log::log("[sync] auto-push company_config: OK");
+                            }
+                            Err(e) => {
+                                crate::log::log(&format!("[sync] auto-push company_config failed: {e}"));
+                            }
+                        }
                     }
                 }
 

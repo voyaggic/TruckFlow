@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::State;
 
@@ -337,10 +337,21 @@ pub fn create_first_admin(state: State<AppState>, name: String, password: String
 
     let id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
+    // First admin of a deployment always gets an organization — every later
+    // user inherits this same org id, so the whole team shares one org.
+    let organization_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
-        params![id, name, hash, now],
+        "INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![organization_id, &name, now],
+    )
+    .map_err(|e| format!("organization creation failed: {e}"))?;
+    let _ = crate::sync::write_to_sync_log(&conn, "organizations", &organization_id, "INSERT", Some(&serde_json::json!({
+        "id": organization_id, "name": name, "created_at": now, "updated_at": now
+    })));
+    conn.execute(
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![id, name, hash, organization_id, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -414,19 +425,25 @@ pub fn create_first_admin_for_company(
     }
     let now = now_iso();
 
-    let company_id = uuid::Uuid::new_v4().to_string();
+    // The name entered at signup is the ORGANIZATION (the account owner) —
+    // deliberately NOT inserted into `companies`, which is exclusively for
+    // client companies whose trucks discharge trips.
+    let organization_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO companies (id, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)",
-        params![company_id, company_name, now],
+        "INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![organization_id, company_name, now],
     )
-    .map_err(|e| format!("company creation failed: {e}"))?;
+    .map_err(|e| format!("organization creation failed: {e}"))?;
+    let _ = crate::sync::write_to_sync_log(&conn, "organizations", &organization_id, "INSERT", Some(&serde_json::json!({
+        "id": organization_id, "name": company_name, "created_at": now, "updated_at": now
+    })));
 
     let id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
-        params![id, name, hash, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![id, name, hash, organization_id, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -517,9 +534,9 @@ pub fn create_company_and_admin(
     let user_id = uuid::Uuid::new_v4().to_string();
     let hash = crate::auth::hash_credential(&password)?;
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
-        params![user_id, admin_name, hash, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![user_id, admin_name, hash, organization_id, now],
     )
     .map_err(|e| format!("admin creation failed: {e}"))?;
 
@@ -775,9 +792,9 @@ pub fn create_company_and_admin_cloud(
 
     // Create admin user locally (synced=0 default → background sync pushes to cloud)
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4)",
-        params![user_id, admin_name, hash, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5)",
+        params![user_id, admin_name, hash, company_id, now],
     ).map_err(|e| format!("admin creation failed: {}", e))?;
     let _ = sync::write_to_sync_log(&conn, "users", &user_id, "INSERT", Some(&serde_json::json!({
         "id": user_id, "name": admin_name, "status": "active", "created_at": now, "updated_at": now
@@ -815,6 +832,28 @@ pub fn create_company_and_admin_cloud(
     });
 
     let user = load_session_user(&conn, &user_id)?;
+
+    drop(conn);
+
+    // Push company_config to cloud in background so other PCs can pull
+    // PG/Sheets credentials. The PG adapter needs to be configured first.
+    {
+        let db = state.db.clone();
+        let pg = state.pg.clone();
+        let cid = company_id.clone();
+        let cs = conn_string.clone();
+        std::thread::spawn(move || {
+            // Configure the PG adapter so we can push to cloud. configure_for
+            // swaps adapter TYPE when needed (fresh PC + Supabase REST string
+            // would otherwise poison the startup pgbouncer adapter).
+            if pg.configure_for(&cs).is_ok() {
+                let adapter = pg.get();
+                // Push company_config (PG connection string + empty Sheets for now)
+                let _ = crate::sync::push_company_config_raw(&adapter, &db, &cid);
+                crate::log::log("[setup] company_config pushed to cloud");
+            }
+        });
+    }
 
     Ok(LoginResult {
         must_change_password: false,
@@ -910,29 +949,44 @@ fn check_tables_exist(client: &reqwest::blocking::Client, supabase_url: &str, _a
     let mgmt_url = format!("https://api.supabase.com/v1/projects/{}/database/query", project_ref);
     let auth_token = if !pat.is_empty() { pat } else { _api_key };
 
-    let check_sql = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users' LIMIT 1";
+    // Check both users AND company_config tables
+    let check_users = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users' LIMIT 1";
+    let check_config = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'company_config' LIMIT 1";
 
-    let response = client.post(&mgmt_url)
+    // Check users table
+    let users_exist = match client.post(&mgmt_url)
         .header("Authorization", format!("Bearer {}", auth_token))
         .header("Content-Type", "application/json")
-        .body(serde_json::json!({ "query": check_sql }).to_string())
+        .body(serde_json::json!({ "query": check_users }).to_string())
         .send()
-        .map_err(|e| format!("Failed to check tables: {}", e))?;
-
-    if response.status().is_success() {
-        let body = response.text().unwrap_or_default();
-        // If we get rows back, users table exists
-        if body.contains("\"users\"") || body.starts_with('[') && body != "[]" {
-            crate::log::log("[check_tables] Users table exists in PostgreSQL");
-            Ok(true)
-        } else {
-            crate::log::log("[check_tables] Users table does NOT exist in PostgreSQL");
-            Ok(false)
+    {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().unwrap_or_default();
+            body.starts_with('[') && body != "[]"
         }
-    } else {
-        // Management API failed - be conservative and assume tables exist to avoid blocking login
-        crate::log::log(&format!("[check_tables] Management API error: {}", response.status()));
+        _ => true, // conservative: assume exists if API fails
+    };
+
+    // Check company_config table
+    let config_exist = match client.post(&mgmt_url)
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({ "query": check_config }).to_string())
+        .send()
+    {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().unwrap_or_default();
+            body.starts_with('[') && body != "[]"
+        }
+        _ => true, // conservative: assume exists if API fails
+    };
+
+    crate::log::log(&format!("[check_tables] users={}, company_config={}", users_exist, config_exist));
+
+    if users_exist && config_exist {
         Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -1264,6 +1318,166 @@ fn validate_cloud_user(
         params![cloud_user.id],
     );
 
+    // Ensure the organization exists locally so create_user can inherit it.
+    // On a fresh PC that has never synced, the org row is missing even though
+    // the user record carries organization_id. Pull it from cloud now.
+    if let Some(ref org_id) = cloud_user.organization_id {
+        let org_exists: bool = conn
+            .query_row("SELECT 1 FROM organizations WHERE id = ?1", params![org_id], |_| Ok(true))
+            .unwrap_or(false);
+        if !org_exists {
+            let base_url = crate::sync::normalize_supabase_rest_url(supabase_url);
+            let url = format!("{}/organizations?id=eq.{}&select=id,name,created_at,updated_at", base_url, org_id);
+            if let Ok(client) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                if let Ok(resp) = client.get(&url)
+                    .header("apikey", api_key)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .send()
+                {
+                    if let Ok(rows) = resp.json::<Vec<serde_json::Value>>() {
+                        if let Some(row) = rows.into_iter().next() {
+                            let now = crate::db::now_iso();
+                            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("Organization");
+                            let created = row.get("created_at").and_then(|v| v.as_str()).unwrap_or(&now);
+                            let updated = row.get("updated_at").and_then(|v| v.as_str()).unwrap_or(&now);
+                            let _ = conn.execute(
+                                "INSERT OR IGNORE INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                                params![org_id, name, created, updated],
+                            );
+                            crate::log::log(&format!("[login] Pulled organization '{}' ({}) from cloud", name, org_id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Pull company_config from cloud (PG + Sheets credentials) ───────
+    // Admin is the source of truth. Every login pulls the latest config so
+    // credential changes propagate automatically to all PCs. Only non-empty
+    // cloud values overwrite local ones (empty cloud = admin hasn't configured
+    // that field yet, so don't wipe the local value).
+    {
+        let base_url = crate::sync::normalize_supabase_rest_url(supabase_url);
+        let url = format!("{}/company_config?select=*&limit=1", base_url);
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            if let Ok(resp) = client.get(&url)
+                .header("apikey", api_key)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .send()
+            {
+                if resp.status().is_success() {
+                    if let Ok(rows) = resp.json::<Vec<serde_json::Value>>() {
+                        if let Some(row) = rows.into_iter().next() {
+                            let now = crate::db::now_iso();
+                            let mut injected = false;
+
+                            // PG connection string — only overwrite if cloud has a value
+                            if let Some(pg_str) = row.get("pg_connection_string").and_then(|v| v.as_str()) {
+                                if !pg_str.is_empty() {
+                                    let _ = crate::db::set_setting(&conn, "pg_connection_string", pg_str);
+                                    injected = true;
+                                }
+                            }
+                            // Sheets service account JSON — only overwrite if cloud has a value
+                            if let Some(sa_json) = row.get("sheets_service_account_json").and_then(|v| v.as_str()) {
+                                if !sa_json.is_empty() {
+                                    let _ = crate::db::set_setting(&conn, "sheets_service_account_json", sa_json);
+                                }
+                            }
+                            // Sheets ID — only overwrite if cloud has a value
+                            if let Some(sheets_id) = row.get("sheets_id").and_then(|v| v.as_str()) {
+                                if !sheets_id.is_empty() {
+                                    let _ = crate::db::set_setting(&conn, "sheets_target_sheet_id", sheets_id);
+                                    let _ = crate::db::set_setting(&conn, "sheets_id", sheets_id);
+                                }
+                            }
+                            // Frequency — only overwrite if cloud has a value
+                            if let Some(freq) = row.get("sheets_frequency").and_then(|v| v.as_str()) {
+                                if !freq.is_empty() {
+                                    let _ = crate::db::set_setting(&conn, "sheets_frequency", freq);
+                                }
+                            }
+                            // ANPR — overwrite (bool, no empty state)
+                            if let Some(enabled) = row.get("anpr_enabled").and_then(|v| v.as_bool()) {
+                                let _ = crate::db::set_setting(&conn, "anpr_enabled", if enabled { "true" } else { "false" });
+                            }
+
+                            // Create/update integrations row for sheets if credentials exist
+                            let has_sheets = row.get("sheets_id").and_then(|v| v.as_str())
+                                .map(|s| !s.is_empty()).unwrap_or(false);
+                            if has_sheets {
+                                let has_integration: bool = conn.query_row(
+                                    "SELECT 1 FROM integrations WHERE type = 'google_sheets' LIMIT 1",
+                                    [], |_| Ok(true),
+                                ).unwrap_or(false);
+                                let freq = row.get("sheets_frequency").and_then(|v| v.as_str()).unwrap_or("realtime");
+                                let sheets_id_val = row.get("sheets_id").and_then(|v| v.as_str()).unwrap_or("");
+                                if !has_integration {
+                                    let _ = conn.execute(
+                                        "INSERT INTO integrations (id, type, connected_by, target_sheet_id, sync_frequency, status, created_at, updated_at)
+                                         VALUES (?1, 'google_sheets', NULL, ?2, ?3, 'connected', ?4, ?4)",
+                                        params![uuid::Uuid::new_v4().to_string(), sheets_id_val, freq, now],
+                                    );
+                                } else {
+                                    let _ = conn.execute(
+                                        "UPDATE integrations SET target_sheet_id = ?1, sync_frequency = ?2, status = 'connected', updated_at = ?3
+                                         WHERE type = 'google_sheets'",
+                                        params![sheets_id_val, freq, now],
+                                    );
+                                }
+
+                                // Mirror credentials + integrations to sync_db for background poller
+                                if let Ok(sconn) = state.sync_db.lock() {
+                                    let _ = crate::db::set_setting(&sconn, "sheets_service_account_json",
+                                        row.get("sheets_service_account_json").and_then(|v| v.as_str()).unwrap_or(""));
+                                    let _ = crate::db::set_setting(&sconn, "sheets_target_sheet_id", sheets_id_val);
+                                    let _ = crate::db::set_setting(&sconn, "sheets_id", sheets_id_val);
+                                    let _ = crate::db::set_setting(&sconn, "sheets_frequency", freq);
+                                    let has_sync_integ: bool = sconn.query_row(
+                                        "SELECT 1 FROM integrations WHERE type = 'google_sheets' LIMIT 1",
+                                        [], |_| Ok(true),
+                                    ).unwrap_or(false);
+                                    if !has_sync_integ {
+                                        let _ = sconn.execute(
+                                            "INSERT INTO integrations (id, type, connected_by, target_sheet_id, sync_frequency, status, created_at, updated_at)
+                                             VALUES (?1, 'google_sheets', NULL, ?2, ?3, 'connected', ?4, ?4)",
+                                            params![uuid::Uuid::new_v4().to_string(), sheets_id_val, freq, now],
+                                        );
+                                    } else {
+                                        let _ = sconn.execute(
+                                            "UPDATE integrations SET target_sheet_id = ?1, sync_frequency = ?2, status = 'connected', updated_at = ?3
+                                             WHERE type = 'google_sheets'",
+                                            params![sheets_id_val, freq, now],
+                                        );
+                                    }
+                                    // Also mirror PG string to sync_db
+                                    if let Some(pg_str) = row.get("pg_connection_string").and_then(|v| v.as_str()) {
+                                        if !pg_str.is_empty() {
+                                            let _ = crate::db::set_setting(&sconn, "pg_connection_string", pg_str);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if injected {
+                                crate::log::log(&format!("[login] Pulled company_config from cloud: PG={} Sheets={}",
+                                    row.get("pg_connection_string").and_then(|v| v.as_str()).unwrap_or("").len() > 0,
+                                    has_sheets));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Check if user already exists locally
     let local_exists: bool = conn
         .query_row(
@@ -1277,16 +1491,16 @@ fn validate_cloud_user(
         // Update local user with cloud data
         let now = crate::db::now_iso();
         conn.execute(
-            "UPDATE users SET name = ?1, status = ?2, credential_hash = ?3, updated_at = ?4 WHERE id = ?5",
-            params![cloud_user.name, cloud_user.status, cloud_user.credential_hash, now, cloud_user.id],
+            "UPDATE users SET name = ?1, status = ?2, credential_hash = ?3, updated_at = ?4, organization_id = ?5 WHERE id = ?6",
+            params![cloud_user.name, cloud_user.status, cloud_user.credential_hash, now, cloud_user.organization_id, cloud_user.id],
         ).map_err(|e| format!("Failed to update local user: {}", e))?;
     } else {
         // Insert new local user (only use columns that exist in local schema)
         let now = crate::db::now_iso();
         conn.execute(
-            "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at)
-             VALUES (?1, ?2, 'password', ?3, ?4, ?5, ?6)",
-            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, now, now],
+            "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
+             VALUES (?1, ?2, 'password', ?3, ?4, ?5, ?6, ?7)",
+            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, cloud_user.organization_id, now, now],
         ).map_err(|e| format!("Failed to create local user: {}", e))?;
     }
 
@@ -1353,9 +1567,75 @@ fn validate_cloud_user(
 
     // Trigger background sync in a separate thread
     let db = state.db.clone();
+    let pg_clone = state.pg.clone();
+    let sheets_clone = state.sheets.clone();
     std::thread::spawn(move || {
-        // Pull all company data from cloud
+        // Pull all company data from cloud (uses REST directly — fine)
         let _ = pull_all_cloud_data(&db);
+
+        // Configure the PG adapter FIRST so pull_company_config_raw can
+        // actually query the cloud company_config table.
+        // login_password already saved pg_connection_string to local settings.
+        // configure_for switches adapter TYPE if needed (fresh PC: startup
+        // adapter is pgbouncer, saved string is Supabase REST).
+        let conn_str = {
+            let Ok(g) = db.lock() else { return };
+            crate::db::get_setting(&g, "pg_connection_string").unwrap_or_default()
+        };
+        let initial_conn_str = conn_str.clone();
+        if !conn_str.is_empty() {
+            let _ = pg_clone.configure_for(&conn_str);
+        }
+
+        // NOW pull company config (PG/Sheets credentials) from cloud.
+        // This overwrites local settings with whatever the latest machine saved.
+        let company_id = {
+            let Ok(g) = db.lock() else { return };
+            crate::db::get_setting(&g, "company_id")
+                .or_else(|| {
+                    g.query_row(
+                        "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    ).ok()
+                })
+                .unwrap_or_default()
+        };
+        if !company_id.is_empty() {
+            // Push LOCAL credentials to cloud so other PCs can pull them.
+            // This is the key operation: without this, non-admin PCs never
+            // store their connection strings in the cloud.
+            let pg_adapter = pg_clone.get();
+            let _ = crate::sync::push_company_config_raw(&pg_adapter, &db, &company_id);
+
+            let _ = crate::sync::pull_company_config_raw(&pg_adapter, &db, &company_id);
+
+            // Re-configure adapters with the freshly pulled credentials
+            let new_conn_str = {
+                let Ok(g) = db.lock() else { return };
+                crate::db::get_setting(&g, "pg_connection_string").unwrap_or_default()
+            };
+            if !new_conn_str.is_empty() && new_conn_str != initial_conn_str {
+                let _ = pg_clone.configure_for(&new_conn_str);
+            }
+            let (sa_json, sheet_id) = {
+                let Ok(g) = db.lock() else { return };
+                (
+                    crate::db::get_setting(&g, "sheets_service_account_json").unwrap_or_default(),
+                    crate::db::get_setting(&g, "sheets_target_sheet_id").unwrap_or_default(),
+                )
+            };
+            if !sa_json.is_empty() && !sheet_id.is_empty() {
+                match sheets_clone.restore_creds(sa_json, sheet_id) {
+                    Ok(email) => {
+                        crate::log::log(&format!("[login] Sheets adapter restored from cloud: {email}"));
+                    }
+                    Err(e) => {
+                        crate::log::log(&format!("[login] Sheets adapter restore FAILED: {e}"));
+                    }
+                }
+            }
+        }
     });
 
     Ok(LoginResult {
@@ -1490,6 +1770,7 @@ struct CloudUserData {
     name: String,
     credential_hash: String,
     status: String,
+    organization_id: Option<String>,
 }
 
 /// Cloud permission entry from Supabase
@@ -1509,7 +1790,7 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
     // normalize here to guarantee exactly one /rest/v1 prefix.
     let base_url = crate::sync::normalize_supabase_rest_url(supabase_url);
     let encoded_username = username.replace('%', "%25").replace('=', "%3D").replace('&', "%26");
-    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status",
+    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status,organization_id",
         base_url, encoded_username);
 
     crate::log::log(&format!("[query_user_from_supabase] URL: {}", url));
@@ -1557,6 +1838,7 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
         name: user.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         credential_hash: user.get("credential_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         status: user.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
+        organization_id: user.get("organization_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
     })
 }
 
@@ -1821,7 +2103,16 @@ pub fn get_cloud_config(
         (String::new(), String::new())
     };
 
-    let company_id = crate::db::get_setting(&conn, "company_id").unwrap_or_default();
+    let company_id = crate::db::get_setting(&conn, "company_id")
+        .or_else(|| {
+            // Fallback: resolve from the current session user's organization_id
+            conn.query_row(
+                "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            ).ok()
+        })
+        .unwrap_or_default();
     if company_id.is_empty() {
         return Ok(CloudConfigView::default());
     }
@@ -2046,7 +2337,7 @@ fn discover_cloud_tables(config: &crate::sync::RestConfig, conn: &std::sync::Arc
         "model_versions".to_string(), "training_candidates".to_string(),
         "role_presets".to_string(), "sync_log".to_string(),
         "pc_identity".to_string(), "offline_queue".to_string(),
-        "app_settings".to_string(),
+        "app_settings".to_string(), "company_config".to_string(),
     ])
 }
 
@@ -2072,7 +2363,16 @@ fn pull_table_data(
         .map_err(|e| format!("Failed to fetch {}: {}", table_name, e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Failed to get {} data: {}", table_name, response.status()));
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if body.contains("PGRST205") || body.contains("Could not find the table") {
+            return Err(format!(
+                "Table '{table_name}' exists in Postgres but is INVISIBLE to PostgREST (PGRST205). \
+                 Cause: the table has no GRANT for the service_role role — PostgREST excludes tables the connecting role cannot access from its schema cache. \
+                 Fix in Supabase → SQL Editor: GRANT SELECT, INSERT, UPDATE, DELETE ON public.{table_name} TO service_role; then NOTIFY pgrst, 'reload schema cache';"
+            ));
+        }
+        return Err(format!("Failed to get {table_name} data: {status} {body}"));
     }
 
     let rows: Vec<serde_json::Value> = response
@@ -2336,6 +2636,36 @@ pub fn create_user(
         return Err("Name is required.".to_string());
     }
 
+    // Every user the admin creates belongs to the SAME organization as the
+    // admin themself — one org per deployment, shared by all its users so the
+    // cloud (Supabase) always shows one org id/name across the whole team.
+    let organization_id: Option<String> = conn
+        .query_row(
+            "SELECT organization_id FROM users WHERE id = ?1",
+            params![&actor_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .or_else(|| {
+            // Fallback: sole/first admin of the deployment defines the org.
+            conn.query_row(
+                "SELECT organization_id FROM users WHERE organization_id IS NOT NULL ORDER BY created_at LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        });
+    if organization_id.is_none() {
+        return Err(
+            "No organization found for this deployment. The first admin account must exist (and be linked to an organization) before creating users."
+                .to_string(),
+        );
+    }
+    let organization_id = organization_id.unwrap();
+
     // Check if a user with this name already exists (including soft-deleted)
     let existing: Option<(String, String)> = conn
         .query_row(
@@ -2350,8 +2680,8 @@ pub fn create_user(
             // Reactivate the deleted user - this preserves audit history
             // Set synced=0 so the restored user will be pushed to Supabase on next sync
             conn.execute(
-                "UPDATE users SET status = 'active', revoked_by = NULL, revoked_at = NULL, credential_hash = ?1, synced = 0 WHERE id = ?2",
-                params![hash_credential(&password)?, existing_id],
+                "UPDATE users SET status = 'active', revoked_by = NULL, revoked_at = NULL, credential_hash = ?1, organization_id = ?3, synced = 0 WHERE id = ?2",
+                params![hash_credential(&password)?, existing_id, &organization_id],
             )
             .map_err(|e| format!("failed to restore deleted user: {}", e))?;
             let _ = sync::write_to_sync_log(&conn, "users", existing_id, "UPDATE", Some(&serde_json::json!({
@@ -2365,11 +2695,11 @@ pub fn create_user(
         let id = uuid::Uuid::new_v4().to_string();
         // Hash the password provided by admin
         let hash = hash_credential(&password)?;
-        // Insert user with hashed password
+        // Insert user with hashed password, bound to the admin's organization
         conn.execute(
-            "INSERT INTO users (id, name, auth_type, credential_hash, status, synced, created_at, updated_at)
-             VALUES (?1, ?2, 'password', ?3, 'active', 0, ?4, ?4)",
-            params![id, name, hash, now_iso()],
+            "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, synced, created_at, updated_at)
+             VALUES (?1, ?2, 'password', ?3, 'active', ?4, 0, ?5, ?5)",
+            params![id, name, hash, &organization_id, now_iso()],
         )
         .map_err(|e| {
             let msg = e.to_string();
@@ -2380,7 +2710,7 @@ pub fn create_user(
             }
         })?;
         let _ = sync::write_to_sync_log(&conn, "users", &id, "INSERT", Some(&serde_json::json!({
-            "id": id, "name": name, "status": "active", "created_at": now_iso(), "updated_at": now_iso()
+            "id": id, "name": name, "status": "active", "organization_id": organization_id, "created_at": now_iso(), "updated_at": now_iso()
         })));
         (id, false)
     };
@@ -2458,15 +2788,43 @@ pub fn signup_local(
     let hash = hash_credential(&password)?;
     let now = now_iso();
 
+    // Bind to the deployment's organization. On the very first machine (no org
+    // yet — plain local signup before any first-admin flow) create one;
+    // otherwise every signup joins the SAME existing org, so the whole team
+    // shares one org id/name in Supabase.
+    let organization_id: String = match conn
+        .query_row(
+            "SELECT organization_id FROM users WHERE organization_id IS NOT NULL ORDER BY created_at LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+    {
+        Some(org) => org,
+        None => {
+            let org_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+                params![org_id, &name, now],
+            )
+            .map_err(|e| format!("organization creation failed: {e}"))?;
+            let _ = sync::write_to_sync_log(&conn, "organizations", &org_id, "INSERT", Some(&serde_json::json!({
+                "id": org_id, "name": name, "created_at": now, "updated_at": now
+            })));
+            org_id
+        }
+    };
+
     conn.execute(
-        "INSERT INTO users (id, name, auth_type, credential_hash, status, created_at, updated_at, synced)
-         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?4, 0)",
-        params![id, name, hash, now],
+        "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at, synced)
+         VALUES (?1, ?2, 'password', ?3, 'active', ?4, ?5, ?5, 0)",
+        params![id, name, hash, organization_id, now],
     )
     .map_err(|e| format!("failed to create user: {}", e))?;
 
     let _ = sync::write_to_sync_log(&conn, "users", &id, "INSERT", Some(&serde_json::json!({
-        "id": id, "name": name, "status": "active", "created_at": now, "updated_at": now, "synced": 0
+        "id": id, "name": name, "status": "active", "organization_id": organization_id, "created_at": now, "updated_at": now, "synced": 0
     })));
 
     // Grant basic staff permissions

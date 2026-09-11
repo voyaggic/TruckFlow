@@ -1685,6 +1685,17 @@ mod org_migration_tests {
                 synced INTEGER NOT NULL DEFAULT 0,
                 company_id TEXT REFERENCES companies(id)
             );
+            -- company_config exists in every real v37 database (created long
+            -- before 38); migration 39 alters it, so the synthetic schema
+            -- needs it too.
+            CREATE TABLE company_config (
+                company_id TEXT PRIMARY KEY,
+                pg_connection_string TEXT,
+                sheets_id TEXT,
+                sheets_frequency TEXT DEFAULT 'realtime',
+                anpr_enabled INTEGER DEFAULT 0,
+                updated_at TEXT
+            );
             PRAGMA user_version = 37;
             "#,
         )
@@ -1712,7 +1723,7 @@ mod org_migration_tests {
         // for versions < 38 and skips 1..37 because user_version = 37.
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 38, "migration must bump to 38");
+        assert!(v >= 38, "migration 38 must have run (at v{v})");
 
         // Org moved
         let org_name: String = conn

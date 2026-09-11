@@ -348,6 +348,21 @@ CREATE TABLE IF NOT EXISTS public.offline_queue (
 CREATE INDEX IF NOT EXISTS idx_offline_queue_status ON public.offline_queue(status, created_at);
 
 -- ============================================================
+-- COMPANY CONFIG — shared PG/Sheets credentials per organization
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS public.company_config (
+    company_id TEXT PRIMARY KEY,
+    pg_connection_string TEXT,
+    sheets_id TEXT,
+    sheets_frequency TEXT DEFAULT 'realtime',
+    anpr_enabled INTEGER DEFAULT 0,
+    sheets_service_account_json TEXT,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT REFERENCES public.users(id)
+);
+
+-- ============================================================
 -- FK CONSTRAINTS — DEFERRABLE for sync
 -- ============================================================
 
@@ -377,6 +392,7 @@ END $$;
 -- ACCESS & SCHEMA RELOAD
 -- ============================================================
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 
@@ -388,6 +404,17 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role, anon, authenticated;
+
+-- ============================================================
+-- FINALIZE: fix role visibility + reload the REST schema cache
+-- ============================================================
+-- PostgREST (the REST API the app uses) connects as service_role; any table
+-- WITHOUT this grant is INVISIBLE to it (PGRST205) even though it exists.
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role;
+-- Force PostgREST to reload its schema cache NOW so the change is live
+-- immediately after this script finishes.
+SELECT public.notify_pgrst_cache_needs_refresh();
 
 -- Done!

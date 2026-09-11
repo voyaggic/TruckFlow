@@ -674,6 +674,17 @@ function SheetsPanel({
   const [frequency, setFrequency] = useState<string>("realtime");
   const [retention, setRetention] = useState<string>("");
 
+  const sheetsPending = sheets?.pending ?? 0;
+  const [sheetsBaseline, setSheetsBaseline] = useState(0);
+  useEffect(() => {
+    if (sheetsPending > 0) {
+      setSheetsBaseline((prev) => (prev === 0 || sheetsPending > prev ? sheetsPending : prev));
+    } else {
+      setSheetsBaseline(0);
+    }
+  }, [sheetsPending]);
+  const sheetsSynced = sheetsBaseline > 0 ? sheetsBaseline - sheetsPending : 0;
+
   // Pre-populate from cloud config if local is empty
   useEffect(() => {
     if (cloudConfig?.sheets_service_account_json && !saJson) {

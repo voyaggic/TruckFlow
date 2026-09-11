@@ -384,6 +384,7 @@ CREATE INDEX IF NOT EXISTS idx_training_candidates_trip ON public."training_cand
 -- ACCESS & SCHEMA RELOAD
 -- ============================================================
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 
@@ -394,7 +395,7 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role, anon, authenticated;
 
 -- ============================================================
 -- USER PROFILES VIEW (read-only, service_role only — not granted to anon)
@@ -452,3 +453,16 @@ BEGIN
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', t);
   END LOOP;
 END $$;
+
+-- ============================================================
+-- FINALIZE: fix role visibility + reload the REST schema cache
+-- ============================================================
+-- PostgREST (the REST API the app uses) connects as service_role; any table
+-- WITHOUT this grant is INVISIBLE to it (PGRST205) even though it exists.
+-- This heals existing tables (e.g. company_config created by older app
+-- versions without the service_role grant).
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT EXECUTE ON FUNCTION public.notify_pgrst_cache_needs_refresh() TO service_role;
+-- Force PostgREST to reload its schema cache NOW so the change is live
+-- immediately after this script finishes.
+SELECT public.notify_pgrst_cache_needs_refresh();
