@@ -1201,7 +1201,11 @@ pub fn pg_sync_state_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result
     }
     // company_config is cloud-only (no local synced column), show its status
     let company_config_pending = if pg.configured() && pg.connected() {
-        let company_id = get_setting(conn, "organization_id").unwrap_or_default();
+        let company_id: String = conn.query_row(
+            "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or_default();
         if company_id.is_empty() { 0 } else {
             match pg.query_rows(&format!("SELECT 1 FROM company_config WHERE company_id = '{}'", pg_literal_string(&company_id)), &[]) {
                 Ok(rows) if rows.is_empty() => 1, // missing in cloud = needs push

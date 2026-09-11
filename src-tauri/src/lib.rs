@@ -1246,37 +1246,24 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                     if should_push_and_id.0 && !should_push_and_id.1.is_empty() {
                         let cid = should_push_and_id.1;
                         crate::log::log("[sync] auto-pushing company_config to cloud (bootstrapping other PCs)");
-                        // Read local config and push directly (avoids Arc type mismatch)
-                        let push_result = db_for_pg.lock().ok().map(|conn| {
-                            let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
-                            let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
-                            let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
-                            let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
-                            let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
-                            drop(conn);
-                            if pg_conn_str.is_empty() && sheets_id.is_empty() && sheets_sa_json.is_empty() {
-                                return Ok(());
+                        // Use the same push function as configure_postgres — handles table creation + retries
+                        let push_result = {
+                            let conn_result = db_for_pg.lock();
+                            match conn_result {
+                                Ok(conn) => {
+                                    let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
+                                    let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
+                                    let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
+                                    drop(conn);
+                                    if pg_conn_str.is_empty() && sheets_id.is_empty() && sheets_sa_json.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        crate::sync::push_company_config_raw(&pg_handle.get(), &db_for_pg, &cid)
+                                    }
+                                }
+                                Err(_) => Ok(()),
                             }
-                            let sql = format!(
-                                "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
-                                 VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
-                                 ON CONFLICT (company_id) DO UPDATE SET
-                                     pg_connection_string = COALESCE(NULLIF(EXCLUDED.pg_connection_string, ''), company_config.pg_connection_string),
-                                     sheets_id = COALESCE(NULLIF(EXCLUDED.sheets_id, ''), company_config.sheets_id),
-                                     sheets_frequency = COALESCE(NULLIF(EXCLUDED.sheets_frequency, ''), company_config.sheets_frequency),
-                                     anpr_enabled = EXCLUDED.anpr_enabled,
-                                     sheets_service_account_json = COALESCE(NULLIF(EXCLUDED.sheets_service_account_json, ''), company_config.sheets_service_account_json),
-                                     updated_at = EXCLUDED.updated_at",
-                                crate::sync::pg_literal_string(&cid),
-                                crate::sync::pg_literal_string(&pg_conn_str),
-                                crate::sync::pg_literal_string(&sheets_id),
-                                crate::sync::pg_literal_string(&sheets_freq),
-                                anpr_enabled,
-                                crate::sync::pg_literal_string(&sheets_sa_json),
-                                crate::sync::pg_literal_string(&crate::db::now_iso()),
-                            );
-                            pg_handle.query_rows(&sql, &[]).map(|_| ())
-                        }).unwrap_or(Ok(()));
+                        };
                         match push_result {
                             Ok(()) => {
                                 if let Ok(conn) = sync_db_pg.lock() {
