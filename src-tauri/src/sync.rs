@@ -2260,29 +2260,45 @@ pub fn push_company_config(state: &AppState, company_id: &str) -> Result<(), Str
     let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());
     let anpr_enabled = crate::db::get_setting(&conn, "anpr_enabled").unwrap_or_else(|| "false".to_string()) == "true";
     let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
-
-    // Push to PostgreSQL
-    let sql = format!(
-        "INSERT INTO company_config (company_id, pg_connection_string, sheets_id, sheets_frequency, anpr_enabled, sheets_service_account_json, updated_at)
-         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')
-         ON CONFLICT (company_id) DO UPDATE SET
-             pg_connection_string = EXCLUDED.pg_connection_string,
-             sheets_id = EXCLUDED.sheets_id,
-             sheets_frequency = EXCLUDED.sheets_frequency,
-             anpr_enabled = EXCLUDED.anpr_enabled,
-             sheets_service_account_json = EXCLUDED.sheets_service_account_json,
-             updated_at = EXCLUDED.updated_at",
-        pg_literal_string(company_id),
-        pg_literal_string(&pg_conn_str),
-        pg_literal_string(&sheets_id),
-        pg_literal_string(&sheets_freq),
-        anpr_enabled,
-        pg_literal_string(&sheets_sa_json),
-        pg_literal_string(&crate::db::now_iso()),
-    );
-
     drop(conn);
-    state.pg.query_rows(&sql, &[]).map_err(|e| format!("Failed to push config: {e}"))?;
+
+    // Push via push_rows (PostgREST, PAT-free). The old raw INSERT ... ON CONFLICT
+    // went through the Management SQL API and failed with 401 whenever the PAT
+    // was dead. Read-modify-write keeps the COALESCE protection: empty local
+    // values never clobber non-empty cloud values.
+    let select_sql = format!(
+        "SELECT * FROM company_config WHERE company_id = '{}' LIMIT 1",
+        pg_literal_string(company_id)
+    );
+    let cloud_rows = state.pg.query_rows(&select_sql, &[]).unwrap_or_default();
+    let cloud = cloud_rows.first();
+    let merge = |local: &str, cloud_key: &str| -> String {
+        if !local.is_empty() {
+            local.to_string()
+        } else {
+            cloud.and_then(|r| r.get(cloud_key)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+    };
+    let merged_pg = merge(&pg_conn_str, "pg_connection_string");
+    let merged_sheets_id = merge(&sheets_id, "sheets_id");
+    let merged_freq = merge(&sheets_freq, "sheets_frequency");
+    let merged_anpr = if anpr_enabled { true } else {
+        cloud.and_then(|r| r.get("anpr_enabled")).map(|v| json_bool(v)).unwrap_or(false)
+    };
+    let merged_sa_json = merge(&sheets_sa_json, "sheets_service_account_json");
+    if merged_pg.is_empty() && merged_sheets_id.is_empty() && merged_sa_json.is_empty() {
+        return Ok(());
+    }
+    let row = serde_json::json!({
+        "company_id": company_id,
+        "pg_connection_string": merged_pg,
+        "sheets_id": merged_sheets_id,
+        "sheets_frequency": merged_freq,
+        "anpr_enabled": if merged_anpr { 1 } else { 0 },
+        "sheets_service_account_json": merged_sa_json,
+        "updated_at": crate::db::now_iso(),
+    });
+    state.pg.push_rows("company_config", &[row]).map_err(|e| format!("Failed to push config: {e}"))?;
 
     Ok(())
 }
@@ -2471,8 +2487,12 @@ pub fn pull_company_config_bg(pg: &dyn PostgresAdapter, conn: &Connection) -> Re
         &[],
     ).map_err(|e| format!("query company_config: {e}"))?;
     if let Some(row) = rows.first() {
+        // Only overwrite local settings with non-empty cloud values — a partial
+        // cloud row (e.g. Sheets-only) must never wipe this PC's working PG string.
         if let Some(pg_str) = row.get("pg_connection_string").and_then(|v| v.as_str()) {
-            let _ = crate::db::set_setting(conn, "pg_connection_string", pg_str);
+            if !pg_str.is_empty() {
+                let _ = crate::db::set_setting(conn, "pg_connection_string", pg_str);
+            }
         }
         if let Some(sheets_id) = row.get("sheets_id").and_then(|v| v.as_str()) {
             let _ = crate::db::set_setting(conn, "sheets_id", sheets_id);
@@ -2571,6 +2591,10 @@ fn pg_column_type(table: &str, col: &str) -> &'static str {
         "trips" => match col {
             "capacity_at_trip" | "confidence_score" => "DOUBLE PRECISION",
             "pushed_to_sheets" | "synced" | "archived" | "is_discharge_trip" => "INTEGER",
+            _ => "TEXT",
+        },
+        "company_config" => match col {
+            "anpr_enabled" => "INTEGER",
             _ => "TEXT",
         },
         _ => "TEXT",
@@ -2796,11 +2820,19 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
     // This avoids the per-table connection drops that killed the old
     // approach of running SELECT + CREATE TABLE per table.
     let mut sql = String::new();
-    for &(table, _) in PG_SYNC_TABLES {
+    let mut tables: Vec<&str> = PG_SYNC_TABLES.iter().map(|(t, _)| *t).collect();
+    // company_config is cloud-only (keyed by company_id, no id column) and not
+    // in PG_SYNC_TABLES — create it here so pgbouncer-path pushes don't fail
+    // when the cloud schema was never generated.
+    if !tables.contains(&"company_config") {
+        tables.push("company_config");
+    }
+    for table in tables {
+        let pk = if table == "company_config" { "company_id" } else { "id" };
         let defs: Vec<String> = base_columns(table)
             .iter()
             .map(|c| {
-                if *c == "id" {
+                if *c == pk {
                     format!("{} {} PRIMARY KEY", pg_quote_ident(c), pg_column_type(table, c))
                 } else {
                     format!("{} {}", pg_quote_ident(c), pg_column_type(table, c))
@@ -2812,11 +2844,14 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
             pg_quote_ident(table),
             defs.join(", ")
         ));
-        sql.push_str(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\"); ",
-            pg_quote_ident(&format!("{table}_id_key")),
-            pg_quote_ident(table)
-        ));
+        // Tables without an id column (company_config) get no id unique index.
+        if base_columns(table).contains(&"id") {
+            sql.push_str(&format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\"); ",
+                pg_quote_ident(&format!("{table}_id_key")),
+                pg_quote_ident(table)
+            ));
+        }
     }
     crate::log::log(&format!("[sync] ensure_schema_for: sending {} DDL statements in one batch", PG_SYNC_TABLES.len() * 2));
     match client.batch_execute(&sql) {
@@ -2896,9 +2931,11 @@ fn push_rows_impl(
     let mut all_cols: Vec<String> = Vec::new();
     {
         let mut seen = std::collections::HashSet::new();
-        // id first
-        all_cols.push("id".to_string());
-        seen.insert("id".to_string());
+        // id first (company_config has no id column — company_id leads instead)
+        if table != "company_config" {
+            all_cols.push("id".to_string());
+            seen.insert("id".to_string());
+        }
         // base columns
         for c in &base {
             if seen.insert(c.to_string()) {
@@ -2918,8 +2955,10 @@ fn push_rows_impl(
     }
     let col_count = all_cols.len();
     let quoted_cols: Vec<String> = all_cols.iter().map(|c| pg_quote_ident(c)).collect();
+    // company_config's primary key is company_id, not id.
+    let pk_col: &str = if table == "company_config" { "company_id" } else { "id" };
     let update_set: String = all_cols.iter()
-        .filter(|c| c.as_str() != "id")
+        .filter(|c| c.as_str() != pk_col)
         .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
@@ -2988,16 +3027,18 @@ fn push_rows_impl(
             value_rows.push(format!("({})", vals.join(", ")));
         }
         let simple_sql = format!(
-            "INSERT INTO {} ({}) VALUES {} ON CONFLICT (\"id\") DO UPDATE SET {}",
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
             pg_quote_ident(table), col_list,
-            value_rows.join(", "), update_set
+            value_rows.join(", "), pg_quote_ident(pk_col), update_set
         );
 
         match client.batch_execute(&simple_sql) {
             Ok(_) => {
                 for row in batch {
-                    if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                    if let Some(id) = row.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                         all_acked.push(id.to_string());
+                    } else if let Some(cid) = row.get("company_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        all_acked.push(cid.to_string());
                     }
                 }
             }
@@ -3027,19 +3068,21 @@ fn push_rows_impl(
                         }).collect();
                         Some(format!("({})", vals.join(", ")))
                     }).collect();
-                    if sub_rows_sql.is_empty() { continue; }
-                    let sub_update_set: String = sub_cols.iter().filter(|c| c.as_str() != "id")
+                    if sub_rows_sql.is_empty() { continue; }                    let sub_update_set: String = sub_cols.iter().filter(|c| c.as_str() != pk_col)
                         .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
-                        .collect::<Vec<_>>().join(", ");
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let sub_sql = format!(
-                        "INSERT INTO {} ({}) VALUES {} ON CONFLICT (\"id\") DO UPDATE SET {}",
+                        "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
                         pg_quote_ident(table), sub_col_list,
-                        sub_rows_sql.join(", "), sub_update_set
+                        sub_rows_sql.join(", "), pg_quote_ident(pk_col), sub_update_set
                     );
                     if client.batch_execute(&sub_sql).is_ok() {
                         for r in sub {
-                            if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
+                            if let Some(id) = r.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                                 all_acked.push(id.to_string());
+                            } else if let Some(cid) = r.get("company_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                                all_acked.push(cid.to_string());
                             }
                         }
                     }
@@ -6636,6 +6679,38 @@ pub fn run_background_sync(conn: &Connection, pg: &dyn PostgresAdapter, sheets: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract anpr_enabled from a cloud company_config row that may store it
+    /// as a JSON bool or a Postgres INTEGER (0/1).
+    #[test]
+    fn json_bool_handles_int_and_bool() {
+        assert!(json_bool(&serde_json::json!(true)));
+        assert!(json_bool(&serde_json::json!(1)));
+        assert!(!json_bool(&serde_json::json!(false)));
+        assert!(!json_bool(&serde_json::json!(0)));
+        assert!(!json_bool(&serde_json::Value::Null));
+    }
+
+    /// company_config has no id column — the REST push path must accept rows
+    /// keyed by company_id and ack them by that key (or they'd never sync and
+    /// never be marked done).
+    #[test]
+    fn rest_push_row_validity_accepts_company_id_keyed_rows() {
+        let cfg_row = serde_json::json!({
+            "company_id": "org-1",
+            "pg_connection_string": "REST|https://x.supabase.co|k",
+            "anpr_enabled": 0,
+        });
+        let has_id = cfg_row.get("id")
+            .map(|v| !v.is_null() && !v.as_str().map_or(false, |s| s.is_empty()))
+            .unwrap_or(false);
+        let cid_ok = !cfg_row.get("company_id").and_then(|v| v.as_str()).unwrap_or("").is_empty();
+        assert!(!has_id);
+        assert!(cid_ok, "company_config row must be considered valid without an id");
+        // A row with neither id nor company_id stays invalid
+        let bad = serde_json::json!({ "pg_connection_string": "x" });
+        assert!(bad.get("company_id").and_then(|v| v.as_str()).unwrap_or("").is_empty());
+    }
 
     #[test]
     fn real_postgres_unconfigured_is_offline() {
