@@ -2343,12 +2343,13 @@ pub fn push_company_config_raw(pg: &Arc<dyn PostgresAdapter>, db: &Arc<Mutex<Con
     }
 
     // Build the row as JSON for push_rows (PostgREST, PAT-free)
+    // anpr_enabled is INTEGER in PostgreSQL — must send 0/1, not bool
     let row = serde_json::json!({
         "company_id": company_id,
         "pg_connection_string": merged_pg,
         "sheets_id": merged_sheets_id,
         "sheets_frequency": merged_freq,
-        "anpr_enabled": merged_anpr,
+        "anpr_enabled": if merged_anpr { 1 } else { 0 },
         "sheets_service_account_json": merged_sa_json,
         "updated_at": crate::db::now_iso(),
     });
