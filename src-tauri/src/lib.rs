@@ -1247,23 +1247,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                         let cid = should_push_and_id.1;
                         crate::log::log("[sync] auto-pushing company_config to cloud (bootstrapping other PCs)");
                         // Use the same push function as configure_postgres — handles table creation + retries
-                        let push_result = {
-                            let conn_result = db_for_pg.lock();
-                            match conn_result {
-                                Ok(conn) => {
-                                    let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
-                                    let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
-                                    let sheets_sa_json = crate::db::get_setting(&conn, "sheets_service_account_json").unwrap_or_default();
-                                    drop(conn);
-                                    if pg_conn_str.is_empty() && sheets_id.is_empty() && sheets_sa_json.is_empty() {
-                                        Ok(())
-                                    } else {
-                                        crate::sync::push_company_config_raw(&pg_handle.get(), &db_for_pg, &cid)
-                                    }
-                                }
-                                Err(_) => Ok(()),
-                            }
-                        };
+                        let push_result = crate::sync::push_company_config_raw(&pg_handle.get(), &db_for_pg, &cid);
                         match push_result {
                             Ok(()) => {
                                 if let Ok(conn) = sync_db_pg.lock() {
