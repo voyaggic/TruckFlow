@@ -971,6 +971,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
             let sheets_for_pg = sheets.clone();
             let sync_db_pg = sync_db.clone();
             let pending_marks_pg = pending_marks.clone();
+            let db_for_pg = db.clone();
 
             let pg_thread = std::thread::spawn(move || {
                 // ── Restore PG adapter from saved settings if needed ────
@@ -1238,7 +1239,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                         );
                         let missing = match rows {
                             Ok(r) => r.is_empty(),
-                            Err(_) => false,
+                            Err(_) => true, // on error (table empty, stale cache), assume missing and push
                         };
                         (missing, company_id)
                     }).unwrap_or((false, String::new()));
@@ -1246,7 +1247,7 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                         let cid = should_push_and_id.1;
                         crate::log::log("[sync] auto-pushing company_config to cloud (bootstrapping other PCs)");
                         // Read local config and push directly (avoids Arc type mismatch)
-                        let push_result = sync_db_pg.lock().ok().map(|conn| {
+                        let push_result = db_for_pg.lock().ok().map(|conn| {
                             let pg_conn_str = crate::db::get_setting(&conn, "pg_connection_string").unwrap_or_default();
                             let sheets_id = crate::db::get_setting(&conn, "sheets_id").unwrap_or_default();
                             let sheets_freq = crate::db::get_setting(&conn, "sheets_frequency").unwrap_or_else(|| "realtime".to_string());

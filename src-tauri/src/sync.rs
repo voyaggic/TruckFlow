@@ -5978,7 +5978,7 @@ pub fn configure_postgres<R: tauri::Runtime>(state: State<AppState>, actor_id: S
 
         // Get company_id for pushing config to cloud
         let cid: Option<String> = conn.query_row(
-            "SELECT company_id FROM users WHERE id = ?1",
+            "SELECT COALESCE(organization_id, company_id) FROM users WHERE id = ?1",
             params![actor_id],
             |r| r.get::<_, String>(0),
         ).ok();
@@ -6300,7 +6300,7 @@ pub fn configure_google_sheets<R: tauri::Runtime>(
 
         // Get company_id for pushing config to cloud
         let cid: Option<String> = conn.query_row(
-            "SELECT company_id FROM users WHERE id = ?1",
+            "SELECT COALESCE(organization_id, company_id) FROM users WHERE id = ?1",
             params![actor_id],
             |r| r.get::<_, String>(0),
         ).ok();
