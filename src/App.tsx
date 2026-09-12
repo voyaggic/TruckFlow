@@ -42,6 +42,17 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
+  // When the background sync poller pulls new data from the cloud, refresh
+  // the session user so theme / profile / permissions update across PCs.
+  useEffect(() => {
+    const unlisten = listen("sync-data-updated", () => {
+      api.getCurrentUser().then((u) => {
+        if (u) setStatus((s) => (s ? { ...s, current_user: u } : s));
+      }).catch(() => undefined);
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
   const handleLogin = (user: SessionUser) => {
     setStatus({ needs_first_run: false, current_user: user });
   };

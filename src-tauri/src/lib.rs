@@ -492,7 +492,16 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
             crate::log::log(&format!("[ANPR] Could not set up Python: {e}"));
         }
     }
+    // Even if Python exists, check that pip dependencies are installed.
+    // On a fresh PC with system Python but no numpy/opencv/paddleocr,
+    // main.py would crash immediately at `import numpy`.
     let effective_python = capture::find_python();
+    if !effective_python.is_empty() && !capture::check_pip_deps_installed(&effective_python, &anpr_dir) {
+        crate::log::log("[ANPR] Python found but pip deps missing — installing...");
+        if let Err(e) = capture::ensure_anpr_deps(&anpr_dir, None) {
+            crate::log::log(&format!("[ANPR] Could not install pip deps: {e}"));
+        }
+    }
 
     let main_py = anpr_dir.join("main.py");
     crate::log::log(&format!("[ANPR] Using python={effective_python}, main={}", main_py.display()));
@@ -973,6 +982,9 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
             let pending_marks_pg = pending_marks.clone();
             let db_for_pg = db.clone();
 
+            let pulled_any = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pulled_flag = pulled_any.clone();
+
             let pg_thread = std::thread::spawn(move || {
                 // ── Restore PG adapter from saved settings if needed ────
                 // On a non-admin PC, the adapter may not be configured yet
@@ -1201,7 +1213,10 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
-                            let _ = sync::upsert_central_rows(&conn, table, &central_rows);
+                            match sync::upsert_central_rows(&conn, table, &central_rows) {
+                                Ok(n) if n > 0 => { pulled_flag.store(true, std::sync::atomic::Ordering::Relaxed); }
+                                _ => {}
+                            }
                         }
                     }
                     if let Ok(conn) = sync_db_pg.lock() {
@@ -1280,6 +1295,24 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
                                 by_table.entry(table).or_default().push(id);
                             }
                             for (table, ids) in by_table {
+                                if table == "users" {
+                                    // users rows have FK dependents in the cloud (trips.officer_id,
+                                    // user_permissions.user_id, …) — clear those first or Postgres
+                                    // rejects the DELETE forever (CONTINUITY.md Finding 3).
+                                    for id in &ids {
+                                        match sync::purge_user_from_cloud(pg_handle.as_ref(), id) {
+                                            Ok(()) => {
+                                                if let Ok(conn) = sync_db_pg.lock() {
+                                                    let _ = sync::clear_pending_deletes(&conn, &table, std::slice::from_ref(id));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                crate::log::log(&format!("[sync] purge_user {id} failed, retrying next cycle: {e}"));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 match pg_handle.delete_rows(&table, &ids) {
                                     Ok(()) => {
                                         crate::log::log(&format!("[sync] delete_rows {table}: deleted {} rows from central", ids.len()));
@@ -1307,6 +1340,12 @@ fn spawn_sync_poller(app: &tauri::AppHandle, state: &AppState, sync_rx: std::syn
             // the NEXT cycle (~30s later). Joining here guarantees the local DB
             // already contains every cloud trip when the Sheets scan runs.
             let _ = pg_thread.join();
+
+            // If the pull brought new data, notify the frontend so it can
+            // refresh session / theme / trip views without requiring a re-login.
+            if pulled_any.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = handle.emit("sync-data-updated", ());
+            }
 
             // ── Google Sheets sync (runs on poller thread) ─────────────
             {

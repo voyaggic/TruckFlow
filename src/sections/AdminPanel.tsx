@@ -38,7 +38,7 @@ interface AdminTab {
   label: string;
 }
 
-export default function AdminPanel({ user }: { user: SessionUser }) {
+export default function AdminPanel({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const [users, setUsers] = useState<UserView[] | null>(null);
   const [perms, setPerms] = useState<ListPermissionItem[]>([]);
   const [presets, setPresets] = useState<RolePresetView[]>([]);
@@ -59,8 +59,9 @@ export default function AdminPanel({ user }: { user: SessionUser }) {
   }, []);
 
   useEffect(() => {
+    if (!isActive) return;
     refresh();
-  }, [refresh]);
+  }, [refresh, isActive]);
 
   const canManageUsers = user.permissions.some((p) => p.key === "manage_users");
   const canManageReference = user.permissions.some((p) => p.key === "manage_reference_database");

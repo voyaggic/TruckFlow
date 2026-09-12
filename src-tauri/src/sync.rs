@@ -142,6 +142,9 @@ impl PostgresAdapter for SharedPg {
     fn query_rows(&self, sql: &str, params: &[String]) -> Result<Vec<serde_json::Value>, String> {
         self.current().query_rows(sql, params)
     }
+    fn query_rows_rest(&self, sql: &str, params: &[String]) -> Option<Result<Vec<serde_json::Value>, String>> {
+        self.current().query_rows_rest(sql, params)
+    }
     fn add_missing_column(&self, table: &str, column_name: &str) -> Result<(), String> {
         self.current().add_missing_column(table, column_name)
     }
@@ -150,6 +153,12 @@ impl PostgresAdapter for SharedPg {
     }
     fn set_pat(&self, pat: &str) {
         self.current().set_pat(pat)
+    }
+    fn ack_all_rows(&self, table: &str, rows: &[serde_json::Value]) -> Vec<String> {
+        self.current().ack_all_rows(table, rows)
+    }
+    fn exec_central_sql(&self, sql: &str) -> Result<(), String> {
+        self.current().exec_central_sql(sql)
     }
     fn simulate_connectivity(&self, online: bool) -> Result<(), String> {
         self.current().simulate_connectivity(online)
@@ -212,6 +221,22 @@ pub trait PostgresAdapter: Send + Sync {
     fn query_rows(&self, _sql: &str, _params: &[String]) -> Result<Vec<serde_json::Value>, String> {
         Err("central read queries are not supported by this adapter".to_string())
     }
+    /// Execute one non-read SQL statement (UPDATE/DELETE/…) on the central DB.
+    /// Unlike `query_rows`, this must NOT fall back to the PAT-gated Management
+    /// SQL API on rest-postgres: callers here run once per user purge and their
+    /// outcome gates whether the purge succeeds — a dead PAT would fail the
+    /// purge forever. rest-postgres implements this with PostgREST PATCH/DELETE
+    /// requests; pgbouncer runs plain SQL. Err = statement truly failed.
+    fn exec_central_sql(&self, _sql: &str) -> Result<(), String> {
+        Err("central statement execution is not supported by this adapter".to_string())
+    }
+    /// PostgREST-only read path — never touches the PAT-gated SQL API.
+    /// Returns None when the adapter cannot serve REST reads (pgbouncer, mock)
+    /// so callers can fall back to `query_rows`. Used by the background pull,
+    /// which runs on every PC every cycle and must work without a PAT.
+    fn query_rows_rest(&self, _sql: &str, _params: &[String]) -> Option<Result<Vec<serde_json::Value>, String>> {
+        None
+    }
     /// Add a missing column to a table in the central database.
     /// Used when a push fails due to a column not existing in the remote schema.
     fn add_missing_column(&self, _table: &str, _column_name: &str) -> Result<(), String> {
@@ -220,6 +245,24 @@ pub trait PostgresAdapter: Send + Sync {
     /// Store the Supabase Personal Access Token for Management API calls
     /// (table creation, DDL). No-op for adapters that don't need it.
     fn set_pat(&self, _pat: &str) {}
+    /// Confirm that every row in `rows` was received by the central side and
+    /// should be marked synced locally. Default: every row carries an `id`
+    /// (true for every sync table; adapters with other key shapes override
+    /// this). Used for ack reconciliation after an AMBIGUOUS push failure —
+    /// ack timeout, busy-defer, batch error after a partial send — where the
+    /// data may have landed but the ack was lost. Without reconciliation those
+    /// rows re-push every cycle and stay "pending" forever on one PC while
+    /// another PC shows them synced (CONTINUITY.md Finding 2).
+    fn ack_all_rows(&self, _table: &str, rows: &[serde_json::Value]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| {
+                r.get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -798,14 +841,38 @@ pub fn run_pg_sync_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<S
         if pending > 0 && pg.configured() {
             let rows = rows_where_not_synced(conn, name)?;
             if !rows.is_empty() {
-                // Push failure is non-fatal — skip this table, rows stay pending for next cycle.
-                if let Ok(ids) = pg.push_rows(name, &rows) {
-                    // Reuse mark_rows_synced (handles user_permissions composite key).
-                    // Errors are non-fatal here — rows stay pending and retry next cycle.
-                    if let Err(e) = mark_rows_synced(conn, name, &ids) {
-                        crate::log::log(&format!("[sync] {name} flag flip failed: {e}"));
+                match pg.push_rows(name, &rows) {
+                    Ok(ids) => {
+                        // Reuse mark_rows_synced (handles user_permissions composite key).
+                        // Errors are non-fatal here — rows stay pending and retry next cycle.
+                        if let Err(e) = mark_rows_synced(conn, name, &ids) {
+                            crate::log::log(&format!("[sync] {name} flag flip failed: {e}"));
+                        }
+                        acked = ids.len() as i64;
                     }
-                    acked = ids.len() as i64;
+                    Err(e) => {
+                        // Ack reconciliation: the push FAILED, but ambiguous
+                        // failures (15s ack timeout, busy-defer, batch error
+                        // after a partial send) may have landed the data anyway.
+                        // Probe the central side for each candidate id; rows
+                        // found there are marked synced so they stop re-pushing
+                        // forever. Probes use the PAT-free REST read path where
+                        // available (rest-postgres), the native one elsewhere.
+                        // Not found = genuinely unsynced, stays pending.
+                        let ids = pg.ack_all_rows(name, &rows);
+                        let confirmed = confirm_rows_present(pg, name, &ids);
+                        if !confirmed.is_empty() {
+                            if let Err(fe) = mark_rows_synced(conn, name, &confirmed) {
+                                crate::log::log(&format!("[sync] {name} reconcile flag flip failed: {fe}"));
+                            }
+                            crate::log::log(&format!(
+                                "[sync] {name}: push errored ({}) but reconciliation confirmed {} already-landed row(s) as synced",
+                                e,
+                                confirmed.len()
+                            ));
+                            acked = confirmed.len() as i64;
+                        }
+                    }
                 }
             }
         }
@@ -825,8 +892,54 @@ pub fn run_pg_sync_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result<S
 }
 
 pub fn pending_for_table(conn: &Connection, table: &str) -> Result<i64, String> {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE synced = 0"), [], |r| r.get(0))
+    // Trips that are still open (no exit_time) can never be pushed — don't
+    // count them as pending, otherwise the Sync tab shows phantom pending rows.
+    let where_extra = if table == "trips" {
+        " AND entry_time IS NOT NULL AND exit_time IS NOT NULL"
+    } else {
+        ""
+    };
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE synced = 0{where_extra}"), [], |r| r.get(0))
         .map_err(|e| format!("{table} count failed: {e}"))
+}
+
+/// Ack reconciliation: which of `ids` already exist in the central table?
+/// Single-row equality probes on `id` (or `company_id` for company_config) —
+/// exactly the shape translate_select_to_postgrest serves PAT-free. Runs only
+/// on push-failure cycles, so the extra HTTP round-trips are bounded by the
+/// number of stuck rows. user_permissions is skipped: its composite ack id
+/// ("user_id:permission_id") is not a probeable key; those rows re-push
+/// harmlessly (idempotent upsert) until a batch succeeds.
+fn confirm_rows_present(pg: &dyn PostgresAdapter, table: &str, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() || table == "user_permissions" {
+        return vec![];
+    }
+    let key_col = if table == "company_config" { "company_id" } else { "id" };
+    let mut confirmed = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id.is_empty() {
+            continue;
+        }
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} = '{}' LIMIT 1",
+            pg_quote_ident(table),
+            pg_quote_ident(key_col),
+            pg_literal_string(id)
+        );
+        let probe = match pg.query_rows_rest(&sql, &[]) {
+            Some(result) => result,
+            None => pg.query_rows(&sql, &[]),
+        };
+        match probe {
+            Ok(rows) if !rows.is_empty() => confirmed.push(id.clone()),
+            Ok(_) => {}
+            Err(e) => {
+                // Can't verify (offline / 401) — leave pending, retry next cycle.
+                crate::log::log(&format!("[sync] reconcile {table}/{id}: probe failed, leaving pending: {e}"));
+            }
+        }
+    }
+    confirmed
 }
 
 /// Record deleted IDs that need to be synced to central DB.
@@ -843,6 +956,122 @@ pub fn record_deleted_ids(conn: &Connection, table: &str, ids: &[String]) -> Res
     }
     crate::log::log(&format!("[sync] record_deleted_ids: recorded {} deletes for {}", ids.len(), table));
     Ok(())
+}
+
+/// Tables whose rows can reference users(id) in the CLOUD schema (see
+/// docs/generated_cloud_schema.sql FK block and SUPABASE_SETUP.sql). Before a
+/// central DELETE FROM users can succeed, every referencing value must be
+/// nulled — the local purge already does exactly this (commands.rs purge_user),
+/// but those updates were never pushed, so Postgres rejected the delete with
+/// "violates foreign key constraint trips_officer_id_fkey" on every cycle and
+/// the user survived in Supabase (CONTINUITY.md Finding 3).
+const USER_FK_DEPENDENT_TABLES: &[(&str, &str)] = &[
+    // (table, referencing column)
+    ("user_permissions", "user_id"),
+    ("user_permissions", "granted_by"),
+    ("audit_log", "actor_id"),
+    ("trips", "officer_id"),
+    ("system_health_events", "acknowledged_by"),
+    ("integrations", "connected_by"),
+    ("anpr_config", "updated_by"),
+    ("model_versions", "deployed_by"),
+    ("users", "revoked_by"),
+    ("company_config", "updated_by"),
+];
+
+/// Centrally purge a user: clear every cloud FK dependency, then DELETE the
+/// users row, retrying once after the clears if the FK still rejects.
+///
+/// The dependency columns are set to NULL via `exec_central_sql` — a strict
+/// channel that never falls back to the PAT-gated SQL API (rest-postgres:
+/// PostgREST PATCH; pgbouncer: plain SQL). If a dependent row was never
+/// pushed (e.g. its table isn't synced) it simply doesn't exist centrally and
+/// the NULL-update affects nothing.
+///
+/// Err = the row still exists centrally and could not be deleted (stays in
+/// pending_deletes and retried next cycle). Ok = gone (or was never there).
+pub fn purge_user_from_cloud(pg: &dyn PostgresAdapter, user_id: &str) -> Result<(), String> {
+    let quoted = pg_literal_string(user_id);
+    let mut clear_failures: Vec<String> = Vec::new();
+    for (table, col) in USER_FK_DEPENDENT_TABLES {
+        let sql = format!(
+            "UPDATE {} SET {} = NULL WHERE {} = {};",
+            pg_quote_ident(table),
+            pg_quote_ident(col),
+            pg_quote_ident(col),
+            quoted
+        );
+        if let Err(e) = pg.exec_central_sql(&sql) {
+            crate::log::log(&format!("[sync] purge {user_id}: clear {table}.{col} failed: {e}"));
+            clear_failures.push(format!("{table}.{col}: {e}"));
+        }
+    }
+
+    let del = format!("DELETE FROM {} WHERE id = {};", pg_quote_ident("users"), quoted);
+    match pg.exec_central_sql(&del) {
+        Ok(()) => {
+            crate::log::log(&format!("[sync] purge {user_id}: deleted from central DB"));
+            Ok(())
+        }
+        Err(del_err) => {
+            let fk_like = del_err.contains("foreign key") || del_err.contains("fk_") || del_err.contains("_fkey");
+            if fk_like {
+                // FK still blocking: some referencing row kept its value (a
+                // clear failed, or a column not in our list references the
+                // user). Retry the clears once and attempt the delete again —
+                // clears are idempotent and cheap relative to leaving the
+                // row stuck in pending_deletes forever.
+                let mut retry_failures: Vec<String> = Vec::new();
+                for (table, col) in USER_FK_DEPENDENT_TABLES {
+                    let sql = format!(
+                        "UPDATE {} SET {} = NULL WHERE {} = {};",
+                        pg_quote_ident(table),
+                        pg_quote_ident(col),
+                        pg_quote_ident(col),
+                        quoted
+                    );
+                    if let Err(e) = pg.exec_central_sql(&sql) {
+                        retry_failures.push(format!("{table}.{col}: {e}"));
+                    }
+                }
+                match pg.exec_central_sql(&del) {
+                    Ok(()) => {
+                        crate::log::log(&format!("[sync] purge {user_id}: deleted from central DB after FK-clear retry"));
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Last resort: directly DELETE referencing rows in the most
+                        // common blocking table (trips) so the user DELETE can proceed.
+                        let _ = pg.exec_central_sql(&format!(
+                            "DELETE FROM {} WHERE {} = {};",
+                            pg_quote_ident("trips"), pg_quote_ident("officer_id"), quoted
+                        ));
+                        let _ = pg.exec_central_sql(&format!(
+                            "DELETE FROM {} WHERE {} = {};",
+                            pg_quote_ident("user_permissions"), pg_quote_ident("user_id"), quoted
+                        ));
+                        let _ = pg.exec_central_sql(&format!(
+                            "DELETE FROM {} WHERE {} = {};",
+                            pg_quote_ident("user_permissions"), pg_quote_ident("granted_by"), quoted
+                        ));
+                        match pg.exec_central_sql(&del) {
+                            Ok(()) => {
+                                crate::log::log(&format!("[sync] purge {user_id}: deleted from central DB after direct FK row deletion"));
+                                Ok(())
+                            }
+                            Err(final_err) => Err(format!(
+                                "user {user_id} still referenced in central DB — dependency clears failed (first attempt: {}; retry: {}); final: {final_err}",
+                                clear_failures.join("; "),
+                                retry_failures.join("; ")
+                            )),
+                        }
+                    }
+                }
+            } else {
+                Err(del_err)
+            }
+        }
+    }
 }
 
 /// Get all pending deletes for a specific table.
@@ -1006,6 +1235,12 @@ pub fn upsert_central_rows(conn: &Connection, table: &str, central_rows: &[serde
             }
         }
         upsert_row_from_central(conn, table, obj)?;
+        // Rows pulled from the cloud are already synced there — mark them
+        // locally so the poller doesn't wastefully re-push them next cycle.
+        let _ = conn.execute(
+            &format!("UPDATE {table} SET synced = 1 WHERE id = ?1"),
+            params![id],
+        );
         pulled += 1;
     }
     Ok(pulled)
@@ -1084,13 +1319,33 @@ pub fn pull_reference_data(conn: &Connection, pg: &dyn PostgresAdapter) -> Resul
     let mut tables = Vec::new();
 
     for &table in REFERENCE_TABLES {
-        // Query central for rows newer than our last pull
-        let sql = format!(
-            "SELECT * FROM {} WHERE updated_at > $1 ORDER BY updated_at ASC",
-            pg_quote_ident(table)
-        );
-        let central_rows = pg.query_rows(&sql, &[last_pull.clone()])
-            .map_err(|e| format!("{table} pull failed: {e}"))?;
+        // Query central for rows newer than our last pull. Empty watermark
+        // (first pull / fresh PC) fetches everything — upserts are idempotent.
+        // Routed through query_rows_rest so rest-postgres machines resolve the
+        // watermark query PAT-free via PostgREST: the `> $1` form previously
+        // fell through to the Management SQL API, whose dead PAT returned 401
+        // on every cycle, silently killing the entire background pull
+        // (CONTINUITY.md Finding 0). PgBouncer/mock adapters return None here
+        // and use the native query_rows path, which binds $1 natively.
+        let (sql, params): (String, Vec<String>) = if last_pull.is_empty() {
+            (
+                format!("SELECT * FROM {} ORDER BY updated_at ASC", pg_quote_ident(table)),
+                vec![],
+            )
+        } else {
+            (
+                format!(
+                    "SELECT * FROM {} WHERE updated_at > $1 ORDER BY updated_at ASC",
+                    pg_quote_ident(table)
+                ),
+                vec![last_pull.clone()],
+            )
+        };
+        let central_rows = (match pg.query_rows_rest(&sql, &params) {
+            Some(result) => result,
+            None => pg.query_rows(&sql, &params),
+        })
+        .map_err(|e| format!("{table} pull failed: {e}"))?;
 
         if central_rows.is_empty() {
             tables.push(TablePending { table: table.to_string(), display: table.to_string(), pending: 0 });
@@ -1199,19 +1454,55 @@ pub fn pg_sync_state_impl(conn: &Connection, pg: &dyn PostgresAdapter) -> Result
             pending: pending_for_table(conn, name)?,
         });
     }
-    // company_config is cloud-only (no local synced column), show its status
+    // company_config is cloud-only (no local synced column), show its status.
+    // Cache the result for 60s to avoid a network call on every 5-second poll.
     let company_config_pending = if pg.configured() && pg.connected() {
-        let company_id: String = conn.query_row(
-            "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+        // Check cache first
+        let cached = conn.query_row(
+            "SELECT value FROM app_settings WHERE key = 'company_config_pending_cache'",
             [],
-            |r| r.get(0),
-        ).unwrap_or_default();
-        if company_id.is_empty() { 0 } else {
-            match pg.query_rows(&format!("SELECT * FROM company_config WHERE company_id = '{}' LIMIT 1", pg_literal_string(&company_id)), &[]) {
-                Ok(rows) if rows.is_empty() => 1, // missing in cloud = needs push
-                Err(_) => 1, // query error = needs push
-                _ => 0,
+            |r| r.get::<_, String>(0),
+        ).ok();
+        let cache_ts = conn.query_row(
+            "SELECT value FROM app_settings WHERE key = 'company_config_pending_cache_at'",
+            [],
+            |r| r.get::<_, String>(0),
+        ).ok();
+        let cache_valid = match (&cached, &cache_ts) {
+            (Some(_), Some(ts)) => {
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .map(|dt| chrono::Utc::now().signed_duration_since(dt).num_seconds() < 60)
+                    .unwrap_or(false)
             }
+            _ => false,
+        };
+        if cache_valid {
+            cached.unwrap_or_default().parse::<i64>().unwrap_or(0)
+        } else {
+            let company_id: String = conn.query_row(
+                "SELECT COALESCE(organization_id, company_id) FROM users LIMIT 1",
+                [],
+                |r| r.get(0),
+            ).unwrap_or_default();
+            let result = if company_id.is_empty() { 0 } else {
+                match pg.query_rows(&format!("SELECT * FROM company_config WHERE company_id = '{}' LIMIT 1", pg_literal_string(&company_id)), &[]) {
+                    Ok(rows) if rows.is_empty() => 1,
+                    Err(_) => 1,
+                    _ => 0,
+                }
+            };
+            // Write cache
+            let _ = conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('company_config_pending_cache', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![result.to_string()],
+            );
+            let _ = conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('company_config_pending_cache_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![crate::db::now_iso()],
+            );
+            result
         }
     } else { 0 };
     tables.push(TablePending {
@@ -1794,6 +2085,22 @@ pub fn sync_now_pg<R: tauri::Runtime>(state: State<AppState>, actor_id: String, 
                         by_table.entry(table).or_default().push(id);
                     }
                     for (table, ids) in by_table {
+                        if table == "users" {
+                            // users rows have FK dependents in the cloud (trips.officer_id,
+                            // user_permissions.user_id, …) — clear those first or Postgres
+                            // rejects the DELETE forever (CONTINUITY.md Finding 3).
+                            for id in &ids {
+                                match purge_user_from_cloud(pg.as_ref(), id) {
+                                    Ok(()) => {
+                                        let _ = clear_pending_deletes(&conn, &table, std::slice::from_ref(id));
+                                    }
+                                    Err(e) => {
+                                        crate::log::log(&format!("[sync] manual sync purge_user {id} failed, retrying next cycle: {e}"));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         match pg.delete_rows(&table, &ids) {
                             Ok(()) => {
                                 crate::log::log(&format!("[sync] manual sync delete_rows {table}: deleted {} from central", ids.len()));
@@ -3117,6 +3424,9 @@ enum PgCommand {
     PushRows(String, Vec<serde_json::Value>, Sender<Result<Vec<String>, String>>),
     QueryRows(String, Vec<String>, Sender<Result<Vec<serde_json::Value>, String>>),
     DeleteRows(String, Vec<String>, Sender<Result<(), String>>),
+    /// Run one non-read statement (purge dependency clears) directly on the
+    /// worker's connection — see PostgresAdapter::exec_central_sql.
+    Execute(String, Sender<Result<(), String>>),
     Stop,
 }
 
@@ -3388,6 +3698,18 @@ impl PostgresWorker {
                 })();
                 let _ = tx.send(result);
             }
+            PgCommand::Execute(sql, tx) => {
+                let result = (|| -> Result<(), String> {
+                    self.ensure_client()?;
+                    let client = self.client.as_mut().ok_or("no client")?;
+                    client.batch_execute(&sql)
+                        .map_err(|e| format!("execute failed: {}", error_chain(&e)))
+                })();
+                if let Err(ref e) = result {
+                    self.last_err = Some(e.clone());
+                }
+                let _ = tx.send(result);
+            }
             PgCommand::Stop => {}
         }
     }
@@ -3617,6 +3939,17 @@ impl PostgresAdapter for RealPostgres {
                 self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
                 Err(format!("{table} delete deferred — worker busy"))
+            }
+        }
+    }
+    fn exec_central_sql(&self, sql: &str) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.send_timeout(PgCommand::Execute(sql.to_string(), tx), rx, std::time::Duration::from_secs(15)) {
+            Some(result) => result,
+            None => {
+                self.is_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut bs) = self.busy_since.lock() { *bs = None; }
+                Err("execute deferred — worker busy".to_string())
             }
         }
     }
@@ -4708,9 +5041,16 @@ pub fn generate_schema_from_local(conn: &Connection) -> Result<String, String> {
 
         for (from_col, ref_table, ref_col) in fks {
             if syncable.contains(ref_table.as_str()) || infra_tables.contains(&ref_table.as_str()) {
+                // FKs pointing at users(id) get ON DELETE SET NULL: purge_user
+                // deletes the cloud row, and without the action Postgres
+                // rejected the DELETE forever (trips_officer_id_fkey error —
+                // CONTINUITY.md Finding 3). SET NULL keeps the referencing row
+                // (trips keep their data, attribution dropped — same semantics
+                // as the local purge in commands.rs purge_user).
+                let on_delete = if ref_table == "users" { " ON DELETE SET NULL" } else { "" };
                 fk_ddl.push(format!(
-                    "ALTER TABLE public.\"{}\" ADD CONSTRAINT {}_{}_fkey FOREIGN KEY (\"{}\") REFERENCES public.\"{}\" (\"{}\") DEFERRABLE INITIALLY DEFERRED;",
-                    table_name, table_name, from_col, from_col, ref_table, ref_col
+                    "ALTER TABLE public.\"{}\" ADD CONSTRAINT {}_{}_fkey FOREIGN KEY (\"{}\") REFERENCES public.\"{}\" (\"{}\") DEFERRABLE INITIALLY DEFERRED{};",
+                    table_name, table_name, from_col, from_col, ref_table, ref_col, on_delete
                 ));
             }
         }
@@ -5006,6 +5346,20 @@ impl RestPostgres {
                             std::thread::sleep(delay);
                             crate::log::log(&format!("[sync] REST {table} batch retry {}/{}: {}", retries, max_retries, e));
                         } else {
+                            // Whole batch failed after retries. A single bad row
+                            // (FK violation, constraint, bad value) would otherwise
+                            // poison the batch FOREVER — every cycle re-fails the
+                            // same up-to-100 rows and none of them sync, which is
+                            // exactly the "phantom pending trips" bug (CONTINUITY.md
+                            // Finding 2). Fall back to one row per request so the
+                            // good rows land now and only true poison rows stay
+                            // pending. If even that lands nothing, give up this
+                            // cycle (connectivity problem, not data problem).
+                            let acked = self.push_rows_one_by_one(&url, table, batch, &service_role_key);
+                            if !acked.is_empty() {
+                                all_acked.extend(acked);
+                                break;
+                            }
                             self.set_error(&e);
                             return Err(format!("{table} REST push failed after {} retries: {e}", max_retries));
                         }
@@ -5015,6 +5369,35 @@ impl RestPostgres {
         }
 
         Ok(all_acked)
+    }
+
+    /// Last-resort recovery: push each row of a failed batch individually.
+    /// Returns the ids that landed. Poison rows (FK violation, constraint,
+    /// value error) fail alone and stay pending; everything else syncs this
+    /// cycle instead of being held hostage by one bad row.
+    fn push_rows_one_by_one(&self, base_url: &str, table: &str, batch: &[serde_json::Value], service_role_key: &str) -> Vec<String> {
+        let mut acked = Vec::new();
+        for row in batch {
+            match self.do_push_batch(base_url, table, std::slice::from_ref(row), service_role_key) {
+                Ok(mut ids) => {
+                    acked.append(&mut ids);
+                }
+                Err(e) => {
+                    crate::log::log(&format!(
+                        "[sync] REST {table}: per-row fallback — row rejected (stays pending): {}",
+                        &e[..e.len().min(200)]
+                    ));
+                }
+            }
+        }
+        if !acked.is_empty() {
+            crate::log::log(&format!(
+                "[sync] REST {table}: per-row fallback landed {}/{} row(s) from failed batch",
+                acked.len(),
+                batch.len()
+            ));
+        }
+        acked
     }
 
     /// Ensure table exists in Supabase. If not, create it based on the data structure.
@@ -5653,108 +6036,147 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n")
     /// Translate a simple `SELECT * FROM <table> [WHERE col = 'v'] [ORDER BY
     /// col [ASC|DESC]] [LIMIT n]` into a PostgREST GET. Returns None when the
     /// SQL is not expressible (joins, functions, multiple conditions, etc.).
-    fn try_postgrest_select(&self, sql: &str) -> Option<Result<Vec<serde_json::Value>, String>> {
+    fn try_postgrest_select(&self, sql: &str, params: Option<&[String]>) -> Option<Result<Vec<serde_json::Value>, String>> {
         let config = self.config.lock().ok()?;
         let config = config.as_ref()?;
         let base_url = config.url.trim_end_matches('/').to_string();
         let key = config.service_role_key.clone();
         drop(config);
 
-        let trimmed = sql.trim().trim_end_matches(';').trim();
-        let lower = trimmed.to_lowercase();
+        let parsed = translate_select_to_postgrest(sql, params)?;
 
-        // Only plain SELECT * statements — no column lists, joins, aggregates.
-        if !lower.starts_with("select * from") {
-            return None;
+        let mut url = format!("{}/{}?select=*", base_url, parsed.table);
+        for (k, v) in &parsed.query_pairs {
+            url.push_str(&format!("&{}={}", k, urlencode(v)));
         }
-        let rest = &trimmed["SELECT * FROM".len()..];
-        let mut parts = rest.trim().split_whitespace();
-        let table_tok = parts.next()?;
-        let table = table_tok.trim().trim_matches('"').to_string();
-        if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return None;
-        }
-
-        // Parse the remaining clauses (WHERE / ORDER BY / LIMIT only).
-        let remainder = rest.trim()[table_tok.len()..].trim();
-        if remainder.contains("JOIN") || remainder.contains(",") {
-            return None;
-        }
-        let mut query_pairs: Vec<(String, String)> = Vec::new();
-        let mut order_by: Option<String> = None;
-        let mut limit: Option<String> = None;
-        let mut tokens = remainder.split_whitespace().peekable();
-        while let Some(tok) = tokens.next() {
-            let upper = tok.to_uppercase();
-            match upper.as_str() {
-                "WHERE" => {
-                    // Expect: col = 'value' (single equality only)
-                    let col = tokens.next()?;
-                    if col.contains('(') || col.contains('*') { return None; }
-                    let op = tokens.next()?;
-                    if op != "=" { return None; }
-                    let val_tok = tokens.next()?;
-                    let val = val_tok.trim_matches('\'').to_string();
-                    // Any additional token must be a clause keyword, not AND/OR
-                    if let Some(next) = tokens.peek() {
-                        let nu = next.to_uppercase();
-                        if nu != "ORDER" && nu != "LIMIT" { return None; }
-                    }
-                    query_pairs.push((col.trim_matches('"').to_string(), format!("eq.{}", val)));
-                }
-                "ORDER" => {
-                    if tokens.next()?.to_uppercase() != "BY" { return None; }
-                    let col = tokens.next()?;
-                    let mut spec = col.trim_matches('"').to_string();
-                    if let Some(dir) = tokens.peek() {
-                        let du = dir.to_uppercase();
-                        if du == "ASC" || du == "DESC" {
-                            spec = format!("{}{}", if du == "DESC" { "-" } else { "" }, spec);
-                            tokens.next();
-                        }
-                    }
-                    order_by = Some(spec);
-                }
-                "LIMIT" => {
-                    limit = Some(tokens.next()?.to_string());
-                }
-                _ => return None,
-            }
-        }
-
-        let mut url = format!("{}/{}?select=*", base_url, table);
-        for (k, v) in &query_pairs {
-            url.push_str(&format!("&{}={}", k, urlencode(&v)));
-        }
-        if let Some(ob) = &order_by {
+        if let Some(ob) = &parsed.order_by {
             url.push_str(&format!("&order={}", urlencode(ob)));
         }
-        if let Some(l) = &limit {
+        if let Some(l) = &parsed.limit {
             url.push_str(&format!("&limit={}", l));
         }
 
         let client = self.client.clone();
         Some((|| {
+            // 15s cap: the pull loop runs 17 tables serially — one hung host
+            // must not stall the whole sync cycle.
             let resp = client.get(&url)
                 .header("apikey", &key)
                 .header("Authorization", format!("Bearer {}", key))
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(15))
                 .send()
-                .map_err(|e| format!("PostgREST select {table} failed: {e}"))?;
+                .map_err(|e| format!("PostgREST select {} failed: {e}", parsed.table))?;
             let status = resp.status();
-            let body = resp.text().map_err(|e| format!("PostgREST select {table}: read failed: {e}"))?;
+            let body = resp.text().map_err(|e| format!("PostgREST select {}: read failed: {e}", parsed.table))?;
             if !status.is_success() {
                 if body.contains("PGRST205") || body.contains("Could not find the table") {
                     return Err(format!(
-                        "Table '{table}' is INVISIBLE to PostgREST (PGRST205) — usually a missing GRANT for service_role. Fix: GRANT SELECT, INSERT, UPDATE, DELETE ON public.{table} TO service_role; then reload the schema cache."
+                        "Table '{}' is INVISIBLE to PostgREST (PGRST205) — usually a missing GRANT for service_role. Fix: GRANT SELECT, INSERT, UPDATE, DELETE ON public.{0} TO service_role; then reload the schema cache.",
+                        parsed.table
                     ));
                 }
-                return Err(format!("PostgREST select {table}: {status} {body}"));
+                return Err(format!("PostgREST select {}: {status} {body}", parsed.table));
             }
             serde_json::from_str(&body)
-                .map_err(|e| format!("PostgREST select {table}: parse error: {e}"))
+                .map_err(|e| format!("PostgREST select {}: parse error: {e}", parsed.table))
         })())
     }
+}
+
+/// One SQL SELECT translated into PostgREST query parameters.
+struct ParsedSelect {
+    table: String,
+    query_pairs: Vec<(String, String)>,
+    order_by: Option<String>,
+    limit: Option<String>,
+}
+
+/// Translate a narrow subset of SQL SELECTs into PostgREST parameters so the
+/// rest-postgres adapter can serve reads without a Personal Access Token.
+///
+/// Grammar: SELECT * FROM table [WHERE col OP value] [ORDER BY col [ASC|DESC]] [LIMIT n]
+/// with OP ∈ {=, !=, <>, >, >=, <, <=} and value a quoted literal or a $N
+/// parameter bound from `params`. `updated_at > $1` — the background pull's
+/// incremental watermark query — is the motivating case: it previously fell
+/// through to the Management SQL API, whose dead PAT returned 401 on every
+/// cycle (CONTINUITY.md Finding 0). Returns None for anything it can't
+/// express; callers must fall back to the SQL API.
+fn translate_select_to_postgrest(sql: &str, params: Option<&[String]>) -> Option<ParsedSelect> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_lowercase();
+
+    // Only plain SELECT * statements — no column lists, joins, aggregates.
+    if !lower.starts_with("select * from") {
+        return None;
+    }
+    let rest = &trimmed["SELECT * FROM".len()..];
+    let mut parts = rest.trim().split_whitespace();
+    let table_tok = parts.next()?;
+    let table = table_tok.trim().trim_matches('"').to_string();
+    if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    // Parse the remaining clauses (WHERE / ORDER BY / LIMIT only).
+    let remainder = rest.trim()[table_tok.len()..].trim();
+    if remainder.contains("JOIN") || remainder.contains(",") {
+        return None;
+    }
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
+    let mut order_by: Option<String> = None;
+    let mut limit: Option<String> = None;
+    let mut tokens = remainder.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        match tok.to_uppercase().as_str() {
+            "WHERE" => {
+                // Expect: col OP value (single condition — AND/OR falls back)
+                let col = tokens.next()?;
+                if col.contains('(') || col.contains('*') { return None; }
+                let op_tok = tokens.next()?;
+                let pg_op = match op_tok {
+                    "=" => "eq",
+                    "!=" | "<>" => "neq",
+                    ">" => "gt",
+                    ">=" => "gte",
+                    "<" => "lt",
+                    "<=" => "lte",
+                    _ => return None,
+                };
+                let val_tok = tokens.next()?;
+                let val: &str = if let Some(stripped) = val_tok.strip_prefix('$') {
+                    // Bind $N from params; unbound parameters can't be inlined.
+                    let idx: usize = stripped.parse().ok()?;
+                    params?.get(idx.checked_sub(1)?)?
+                } else {
+                    val_tok.trim_matches('\'')
+                };
+                // Any additional token must be a clause keyword, not AND/OR
+                if let Some(next) = tokens.peek() {
+                    let nu = next.to_uppercase();
+                    if nu != "ORDER" && nu != "LIMIT" { return None; }
+                }
+                query_pairs.push((col.trim_matches('"').to_string(), format!("{pg_op}.{val}")));
+            }
+            "ORDER" => {
+                if tokens.next()?.to_uppercase() != "BY" { return None; }
+                let col = tokens.next()?;
+                let mut spec = col.trim_matches('"').to_string();
+                if let Some(dir) = tokens.peek() {
+                    let du = dir.to_uppercase();
+                    if du == "ASC" || du == "DESC" {
+                        spec = format!("{}{}", if du == "DESC" { "-" } else { "" }, spec);
+                        tokens.next();
+                    }
+                }
+                order_by = Some(spec);
+            }
+            "LIMIT" => {
+                limit = Some(tokens.next()?.to_string());
+            }
+            _ => return None,
+        }
+    }
+    Some(ParsedSelect { table, query_pairs, order_by, limit })
 }
 
 impl PostgresAdapter for RestPostgres {
@@ -5893,7 +6315,7 @@ impl PostgresAdapter for RestPostgres {
         self.delete_rows_impl(table, ids)
     }
 
-    fn query_rows(&self, sql: &str, _params: &[String]) -> Result<Vec<serde_json::Value>, String> {
+    fn query_rows(&self, sql: &str, params: &[String]) -> Result<Vec<serde_json::Value>, String> {
         if !self.configured() {
             return Err("REST adapter not configured".to_string());
         }
@@ -5903,10 +6325,36 @@ impl PostgresAdapter for RestPostgres {
         // 401 whenever the PAT expired, even though PostgREST itself was fine
         // with the service_role key. Simple SELECTs translate 1:1; anything the
         // translator can't express falls back to the SQL API.
-        if let Some(result) = self.try_postgrest_select(sql) {
+        if let Some(result) = self.try_postgrest_select(sql, Some(params)) {
             return result;
         }
         self.query_rows_sql_api(sql)
+    }
+
+    fn query_rows_rest(&self, sql: &str, params: &[String]) -> Option<Result<Vec<serde_json::Value>, String>> {
+        if !self.configured() {
+            return None;
+        }
+        // Strictly PostgREST — never the PAT-gated SQL API. Callers use this
+        // for per-cycle background reads (pull) that must not depend on a PAT.
+        self.try_postgrest_select(sql, Some(params))
+    }
+
+    fn exec_central_sql(&self, sql: &str) -> Result<(), String> {
+        if !self.configured() {
+            return Err("REST adapter not configured".to_string());
+        }
+        self.clear_error();
+        let result = self.exec_central_sql_impl(sql);
+        match &result {
+            Ok(()) => {}
+            Err(e) => self.set_error(e),
+        }
+        result
+    }
+
+    fn ack_all_rows(&self, table: &str, rows: &[serde_json::Value]) -> Vec<String> {
+        self.ack_all_rows_impl(table, rows)
     }
 
 
@@ -5928,6 +6376,180 @@ impl PostgresAdapter for RestPostgres {
                 crate::log::log("[sync] RestPostgres: PAT stored in config");
             }
         }
+    }
+}
+
+impl RestPostgres {
+    /// Execute one narrow non-read SQL statement via PostgREST — NO PAT.
+    /// Supported shapes (everything the user-purge dependency clearing needs):
+    ///   UPDATE table SET col = NULL [WHERE key = 'value']
+    ///   DELETE FROM table WHERE key = 'value'
+    /// UPDATE … SET NULL becomes a PATCH with {"col": null}; DELETE becomes an
+    /// HTTP DELETE with an eq. filter. Returns Err for anything else — callers
+    /// must never silently no-op a dependency clear. The old path for these
+    /// statements was the Management SQL API, whose dead PAT made every purge
+    /// fail with a foreign-key violation forever (CONTINUITY.md Finding 3).
+    fn exec_central_sql_impl(&self, sql: &str) -> Result<(), String> {
+        let (base_url, key) = {
+            let guard = self.config.lock().map_err(|e| e.to_string())?;
+            let cfg = guard.as_ref().ok_or("REST not configured")?;
+            (cfg.url.trim_end_matches('/').to_string(), cfg.service_role_key.clone())
+        };
+
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+
+        if upper.starts_with("UPDATE ") {
+            // UPDATE table SET col = NULL [WHERE key = 'value']
+            let body = &trimmed["UPDATE ".len()..];
+            let mut parts = body.split_whitespace();
+            let table = parts.next().ok_or("exec_central_sql: missing table")?.trim_matches('"').to_string();
+            if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!("exec_central_sql: bad table name '{table}'"));
+            }
+            let remainder = body[table.len()..].trim();
+            let set_upper = remainder.to_uppercase();
+            if !set_upper.starts_with("SET ") {
+                return Err("exec_central_sql: only UPDATE … SET … supported".to_string());
+            }
+            let set_body = remainder[4..].trim();
+            let (set_clause, where_clause) = match set_body.to_uppercase().find("WHERE ") {
+                Some(idx) => {
+                    let s = &set_body[..idx];
+                    let w = &set_body[idx + 6..];
+                    (s.trim(), Some(w.trim()))
+                }
+                None => (set_body, None),
+            };
+            // Parse SET: col = NULL (optionally several comma-separated)
+            let mut payload = serde_json::Map::new();
+            for assignment in set_clause.split(',') {
+                let assignment = assignment.trim();
+                let mut kv = assignment.splitn(2, '=');
+                let col = kv.next().unwrap_or("").trim().trim_matches('"').to_string();
+                let val_raw = kv.next().unwrap_or("").trim();
+                if col.is_empty() || !col.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Err(format!("exec_central_sql: bad column in SET: '{assignment}'"));
+                }
+                let v_upper = val_raw.to_uppercase();
+                if v_upper == "NULL" {
+                    payload.insert(col, serde_json::Value::Null);
+                } else if val_raw.len() >= 2 && val_raw.starts_with('\'') && val_raw.ends_with('\'') {
+                    payload.insert(col, serde_json::Value::String(val_raw[1..val_raw.len() - 1].replace("''", "'")));
+                } else {
+                    return Err(format!("exec_central_sql: only NULL and 'literal' values supported, got '{val_raw}'"));
+                }
+            }
+            if payload.is_empty() {
+                return Err("exec_central_sql: empty SET clause".to_string());
+            }
+            // WHERE key = 'value' (single equality, literal only)
+            let mut filter = String::new();
+            if let Some(w) = where_clause {
+                let tokens: Vec<&str> = w.split_whitespace().collect();
+                if tokens.len() != 3 || tokens[1] != "=" {
+                    return Err("exec_central_sql: only WHERE col = 'value' supported".to_string());
+                }
+                let col = tokens[0].trim_matches('"');
+                let val = tokens[2].trim_matches('\'');
+                filter = format!("{}=eq.{}", col, urlencode(val));
+            }
+            let url = if filter.is_empty() {
+                format!("{base_url}/{table}")
+            } else {
+                format!("{base_url}/{table}?{filter}")
+            };
+            let resp = self.client.patch(&url)
+                .header("apikey", &key)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("Content-Type", "application/json")
+                .header("Prefer", "return=minimal")
+                .json(&serde_json::Value::Object(payload))
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .map_err(|e| format!("exec_central_sql PATCH {table} failed: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().unwrap_or_default();
+                return Err(format!("exec_central_sql PATCH {table}: {status} {body}"));
+            }
+            return Ok(());
+        }
+
+        if upper.starts_with("DELETE FROM ") {
+            // DELETE FROM table WHERE key = 'value'
+            let body = &trimmed["DELETE FROM ".len()..];
+            let mut parts = body.splitn(2, " WHERE ");
+            let table_part = parts.next().unwrap_or("").trim();
+            let where_part = parts.next();
+            // Case-insensitive WHERE split
+            let (table, where_clause) = if where_part.is_none() {
+                let lower_body = body.to_lowercase();
+                match lower_body.find(" where ") {
+                    Some(idx) => (
+                        body[..idx].trim().trim_matches('"').to_string(),
+                        Some(body[idx + 7..].trim().to_string()),
+                    ),
+                    None => (body.trim().trim_matches('"').to_string(), None),
+                }
+            } else {
+                (table_part.trim_matches('"').to_string(), where_part.map(|w| w.trim().to_string()))
+            };
+            if table.is_empty() || !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!("exec_central_sql: bad table name '{table}'"));
+            }
+            let Some(w) = where_clause else {
+                return Err("exec_central_sql: DELETE without WHERE is not allowed".to_string());
+            };
+            let tokens: Vec<&str> = w.split_whitespace().collect();
+            if tokens.len() != 3 || tokens[1].to_uppercase() != "=" {
+                return Err("exec_central_sql: only WHERE col = 'value' supported".to_string());
+            }
+            let col = tokens[0].trim_matches('"');
+            let val = tokens[2].trim_matches('\'');
+            let url = format!("{base_url}/{table}?{}=eq.{}", urlencode(col), urlencode(val));
+            let resp = self.client.delete(&url)
+                .header("apikey", &key)
+                .header("Authorization", format!("Bearer {key}"))
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .map_err(|e| format!("exec_central_sql DELETE {table} failed: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() && status.as_u16() != 404 {
+                let body = resp.text().unwrap_or_default();
+                return Err(format!("exec_central_sql DELETE {table}: {status} {body}"));
+            }
+            return Ok(());
+        }
+
+        Err(format!("exec_central_sql: unsupported statement: {}", &trimmed[..trimmed.len().min(120)]))
+    }
+
+    /// Ack reconciliation for REST rows: acknowledge by `id`, or by the table's
+    /// alternate key shape (company_config → company_id, user_permissions →
+    /// "user_id:permission_id" composite), mirroring do_push_batch's acks so
+    /// mark_rows_synced can resolve every confirmed id.
+    fn ack_all_rows_impl(&self, table: &str, rows: &[serde_json::Value]) -> Vec<String> {
+        let _ = table;
+        rows.iter()
+            .filter_map(|r| {
+                if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+                let uid = r.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+                let pid = r.get("permission_id").and_then(|v| v.as_str()).unwrap_or("");
+                if !uid.is_empty() && !pid.is_empty() {
+                    return Some(format!("{uid}:{pid}"));
+                }
+                let cid = r.get("company_id").and_then(|v| v.as_str()).unwrap_or("");
+                if !cid.is_empty() {
+                    return Some(cid.to_string());
+                }
+                None
+            })
+            .collect()
     }
 }
 
@@ -6680,6 +7302,94 @@ pub fn run_background_sync(conn: &Connection, pg: &dyn PostgresAdapter, sheets: 
 mod tests {
     use super::*;
 
+    // ── PostgREST SELECT translator (Finding 0: PAT-free background pull) ──
+
+    #[test]
+    fn select_translates_gt_with_bound_param() {
+        let parsed = translate_select_to_postgrest(
+            "SELECT * FROM trips WHERE updated_at > $1 ORDER BY updated_at ASC",
+            Some(&["2026-09-11T13:14:08Z".to_string()]),
+        )
+        .expect("gt filter with bound param must translate");
+        assert_eq!(parsed.table, "trips");
+        assert_eq!(
+            parsed.query_pairs,
+            vec![("updated_at".to_string(), "gt.2026-09-11T13:14:08Z".to_string())]
+        );
+        assert_eq!(parsed.order_by.as_deref(), Some("updated_at")); // PostgREST default = ASC
+    }
+
+    #[test]
+    fn select_translates_unfiltered_first_pull() {
+        let parsed = translate_select_to_postgrest(
+            "SELECT * FROM users ORDER BY updated_at ASC",
+            Some(&[]),
+        )
+        .expect("plain SELECT * with ORDER BY must translate");
+        assert_eq!(parsed.table, "users");
+        assert!(parsed.query_pairs.is_empty());
+        assert_eq!(parsed.order_by.as_deref(), Some("updated_at")); // PostgREST default = ASC
+    }
+
+    #[test]
+    fn select_translates_all_comparison_ops() {
+        let cases = [
+            ("=", "eq"),
+            (">", "gt"),
+            (">=", "gte"),
+            ("<", "lt"),
+            ("<=", "lte"),
+            ("!=", "neq"),
+        ];
+        for (op, rest_op) in cases {
+            let sql = format!("SELECT * FROM trips WHERE status {op} $1");
+            let parsed = translate_select_to_postgrest(&sql, Some(&["logged".to_string()]))
+                .unwrap_or_else(|| panic!("op {op} must translate"));
+            assert_eq!(
+                parsed.query_pairs,
+                vec![("status".to_string(), format!("{rest_op}.logged"))]
+            );
+        }
+    }
+
+    #[test]
+    fn select_rejects_unbound_param() {
+        // A $N parameter with no bindings can't be inlined — must fall back
+        // to the SQL API rather than sending a literal "$1" to PostgREST.
+        assert!(translate_select_to_postgrest(
+            "SELECT * FROM trips WHERE updated_at > $1",
+            None,
+        )
+        .is_none());
+        assert!(translate_select_to_postgrest(
+            "SELECT * FROM trips WHERE updated_at > $2",
+            Some(&["x".to_string()]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn select_rejects_non_translatable_sql() {
+        // Column list (SELECT 1 ...) — the company_config status-check shape.
+        assert!(translate_select_to_postgrest(
+            "SELECT 1 FROM trips WHERE id = 'a'",
+            Some(&[]),
+        )
+        .is_none());
+        // AND chains (archive fetch) — not supported, falls back.
+        assert!(translate_select_to_postgrest(
+            "SELECT * FROM trips WHERE time_in >= $1 AND time_in <= $2",
+            Some(&["a".to_string(), "b".to_string()]),
+        )
+        .is_none());
+        // JOIN — not supported.
+        assert!(translate_select_to_postgrest(
+            "SELECT * FROM trips JOIN users ON x = y",
+            Some(&[]),
+        )
+        .is_none());
+    }
+
     /// Extract anpr_enabled from a cloud company_config row that may store it
     /// as a JSON bool or a Postgres INTEGER (0/1).
     #[test]
@@ -6710,6 +7420,88 @@ mod tests {
         // A row with neither id nor company_id stays invalid
         let bad = serde_json::json!({ "pg_connection_string": "x" });
         assert!(bad.get("company_id").and_then(|v| v.as_str()).unwrap_or("").is_empty());
+    }    /// Finding 1 regression: login previously stamped the local users row with
+    /// updated_at = now, which made the pull skip every later cloud edit
+    /// (theme/accent/status changes never reached a second PC). The correct
+    /// behavior — implemented by stamping the CLOUD timestamp at login — is
+    /// that a strictly newer central row is applied. This test pins the
+    /// timestamp-comparison half of that contract (upsert_central_rows).
+    #[test]
+    fn pull_applies_central_row_newer_than_local() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                theme_mode TEXT,
+                theme_accent TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                synced INTEGER DEFAULT 1
+            );
+            INSERT INTO users (id, name, theme_mode, theme_accent, created_at, updated_at)
+            VALUES ('u1', 'Alice', 'light', 'blue', '2026-09-01T00:00:00Z', '2026-09-10T00:00:00Z');"
+        ).unwrap();
+        // Cloud row is NEWER than local and carries a theme change.
+        let cloud = vec![serde_json::json!({
+            "id": "u1",
+            "name": "Alice",
+            "theme_mode": "dark",
+            "theme_accent": "purple",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-12T00:00:00Z",
+        })];
+        let pulled = upsert_central_rows(&conn, "users", &cloud).unwrap();
+        assert_eq!(pulled, 1, "newer central row must be applied");
+        let (mode, accent): (String, String) = conn
+            .query_row(
+                "SELECT theme_mode, theme_accent FROM users WHERE id = 'u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "dark");
+        assert_eq!(accent, "purple");
+
+        // And the reverse direction: an OLDER central row must NOT clobber a
+        // newer local edit (last-edit-wins preserved).
+        let older = vec![serde_json::json!({
+            "id": "u1",
+            "name": "Alice",
+            "theme_mode": "light",
+            "theme_accent": "blue",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-11T00:00:00Z",
+        })];
+        let pulled = upsert_central_rows(&conn, "users", &older).unwrap();
+        assert_eq!(pulled, 0, "older central row must be skipped");
+    }
+
+    /// Finding 2: the trait-default ack_all_rows must collect non-empty `id`s
+    /// only — rows keyed by company_id (no id) or with null ids are excluded so
+    /// reconciliation never marks un-pushable rows as synced.
+    #[test]
+    fn ack_all_rows_default_collects_ids() {
+        let rows = vec![
+            serde_json::json!({ "id": "a" }),
+            serde_json::json!({ "id": "" }),
+            serde_json::json!({ "company_id": "org-1" }),
+            serde_json::json!({ "id": null }),
+        ];
+        let mock = MockPostgres::new();
+        let ids = mock.ack_all_rows("users", &rows);
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
+
+    /// Finding 3: purge_user_from_cloud must fail cleanly (Err, no panic) when
+    /// the adapter cannot execute statements. With the mock, every clear AND
+    /// the DELETE fail with a non-FK error, so the raw delete error surfaces
+    /// (the FK-retry branch only fires on actual foreign-key rejections).
+    #[test]
+    fn purge_user_fails_cleanly_when_adapter_cannot_execute() {
+        let pg = MockPostgres::new();
+        let err = purge_user_from_cloud(&pg, "user-1").expect_err("mock can't execute SQL");
+        assert!(err.contains("not supported"), "unexpected error: {err}");
     }
 
     #[test]

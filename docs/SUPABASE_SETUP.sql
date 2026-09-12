@@ -381,10 +381,10 @@ BEGIN
   -- Recreate as DEFERRABLE
   ALTER TABLE public.trips ADD CONSTRAINT trips_vehicle_id_fkey FOREIGN KEY (vehicle_id) REFERENCES public.vehicles(id) DEFERRABLE INITIALLY DEFERRED;
   ALTER TABLE public.trips ADD CONSTRAINT trips_driver_id_fkey FOREIGN KEY (driver_id) REFERENCES public.drivers(id) DEFERRABLE INITIALLY DEFERRED;
-  ALTER TABLE public.trips ADD CONSTRAINT trips_officer_id_fkey FOREIGN KEY (officer_id) REFERENCES public.users(id) DEFERRABLE INITIALLY DEFERRED;
+  ALTER TABLE public.trips ADD CONSTRAINT trips_officer_id_fkey FOREIGN KEY (officer_id) REFERENCES public.users(id) DEFERRABLE INITIALLY DEFERRED ON DELETE SET NULL;
   ALTER TABLE public.vehicles ADD CONSTRAINT vehicles_company_id_fkey FOREIGN KEY (company_id) REFERENCES public.companies(id) DEFERRABLE INITIALLY DEFERRED;
   ALTER TABLE public.vehicles ADD CONSTRAINT vehicles_default_driver_id_fkey FOREIGN KEY (default_driver_id) REFERENCES public.drivers(id) DEFERRABLE INITIALLY DEFERRED;
-  ALTER TABLE public.user_permissions ADD CONSTRAINT user_permissions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) DEFERRABLE INITIALLY DEFERRED;
+  ALTER TABLE public.user_permissions ADD CONSTRAINT user_permissions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) DEFERRABLE INITIALLY DEFERRED ON DELETE SET NULL;
   ALTER TABLE public.user_permissions ADD CONSTRAINT user_permissions_permission_id_fkey FOREIGN KEY (permission_id) REFERENCES public.permissions(id) DEFERRABLE INITIALLY DEFERRED;
 END $$;
 

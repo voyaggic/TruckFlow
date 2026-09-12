@@ -11,7 +11,7 @@ interface CloudConfig {
   sheets_service_account_json: string;
 }
 
-export default function SyncPanel({ user }: { user: SessionUser }) {
+export default function SyncPanel({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
   const [cloudConfig, setCloudConfig] = useState<CloudConfig | null>(null);
   const { fire, isPending, getError, getSuccess } = useAsyncAction();
@@ -25,6 +25,7 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
 
   // Fetch cloud config on mount (only if local fields are empty)
   useEffect(() => {
+    if (!isActive) return;
     api
       .getCloudConfig()
       .then((cfg) => {
@@ -34,13 +35,13 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
         }
       })
       .catch(() => {});
-  }, []);
+  }, [isActive]);
 
   useEffect(() => {
+    if (!isActive) return;
     refresh();
     // Auto-refresh every 5 seconds so pending counts update as the
-    // background poller pushes rows. Pure read-only call — no I/O beyond
-    // a single SQLite query, so no lag or freeze.
+    // background poller pushes rows.
     const id = setInterval(refresh, 5000);
 
     // Listen for tables-created event and trigger sync automatically
@@ -53,7 +54,7 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
       clearInterval(id);
       unlisten.then((fn) => fn());
     };
-  }, [refresh]);
+  }, [refresh, isActive]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
 

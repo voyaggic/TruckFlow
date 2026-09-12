@@ -2763,7 +2763,7 @@ pub fn check_anpr_ready(_state: State<AppState>) -> Result<AnprSetupStatus, Stri
 }
 
 /// Check if pip dependencies from requirements.txt are installed.
-fn check_pip_deps_installed(python_path: &str, anpr_dir: &std::path::Path) -> bool {
+pub fn check_pip_deps_installed(python_path: &str, anpr_dir: &std::path::Path) -> bool {
     let req_file = anpr_dir.join("requirements.txt");
     if !req_file.exists() {
         return false;

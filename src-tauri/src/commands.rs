@@ -1487,20 +1487,41 @@ fn validate_cloud_user(
         )
         .unwrap_or(false);
 
+    let now = crate::db::now_iso();
     if local_exists {
-        // Update local user with cloud data
-        let now = crate::db::now_iso();
+        // Update local user with cloud data.
+        //
+        // Sets `updated_at` to the CLOUD row's timestamp, not `now`: login must
+        // refresh local identity (name/status/permissions) WITHOUT making the
+        // local row look newer than the cloud. The background pull applies a
+        // central row only when its updated_at is strictly greater than local
+        // (upsert_central_rows) — stamping `now` here shadowed every later cloud
+        // edit (theme, accent, status) forever, so PC-B never saw PC-A's changes
+        // (CONTINUITY.md Finding 1). synced stays untouched: identity fields are
+        // cloud-sourced, not a local edit to push.
+        let cloud_updated = cloud_user.updated_at.as_deref().filter(|s| !s.is_empty());
         conn.execute(
             "UPDATE users SET name = ?1, status = ?2, credential_hash = ?3, updated_at = ?4, organization_id = ?5 WHERE id = ?6",
-            params![cloud_user.name, cloud_user.status, cloud_user.credential_hash, now, cloud_user.organization_id, cloud_user.id],
-        ).map_err(|e| format!("Failed to update local user: {}", e))?;
+            params![
+                cloud_user.name,
+                cloud_user.status,
+                cloud_user.credential_hash,
+                cloud_updated.unwrap_or(&now),
+                cloud_user.organization_id,
+                cloud_user.id
+            ],
+        )
+        .map_err(|e| format!("Failed to update local user: {}", e))?;
     } else {
-        // Insert new local user (only use columns that exist in local schema)
-        let now = crate::db::now_iso();
+        // Insert new local user (only use columns that exist in local schema).
+        // Stamp the CLOUD timestamp (same reason as the update branch): a fresh
+        // PC must not look newer than the cloud, or the pull would skip the
+        // cloud row that carries theme/accent/profile fields.
+        let cloud_updated = cloud_user.updated_at.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| now.clone());
         conn.execute(
             "INSERT INTO users (id, name, auth_type, credential_hash, status, organization_id, created_at, updated_at)
              VALUES (?1, ?2, 'password', ?3, ?4, ?5, ?6, ?7)",
-            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, cloud_user.organization_id, now, now],
+            params![cloud_user.id, cloud_user.name, cloud_user.credential_hash, cloud_user.status, cloud_user.organization_id, cloud_updated, cloud_updated],
         ).map_err(|e| format!("Failed to create local user: {}", e))?;
     }
 
@@ -1771,6 +1792,10 @@ struct CloudUserData {
     credential_hash: String,
     status: String,
     organization_id: Option<String>,
+    /// Cloud updated_at, carried through so the login-time local refresh can
+    /// stamp the cloud timestamp instead of `now` (prevents the login shadow
+    /// that blocked every later cloud edit from being pulled on this PC).
+    updated_at: Option<String>,
 }
 
 /// Cloud permission entry from Supabase
@@ -1790,7 +1815,7 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
     // normalize here to guarantee exactly one /rest/v1 prefix.
     let base_url = crate::sync::normalize_supabase_rest_url(supabase_url);
     let encoded_username = username.replace('%', "%25").replace('=', "%3D").replace('&', "%26");
-    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status,organization_id",
+    let url = format!("{}/users?name=eq.{}&select=id,name,credential_hash,status,organization_id,updated_at",
         base_url, encoded_username);
 
     crate::log::log(&format!("[query_user_from_supabase] URL: {}", url));
@@ -1839,6 +1864,7 @@ fn query_user_from_supabase(supabase_url: &str, api_key: &str, username: &str) -
         credential_hash: user.get("credential_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         status: user.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
         organization_id: user.get("organization_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        updated_at: user.get("updated_at").and_then(|v| v.as_str()).map(|s| s.to_string()),
     })
 }
 
@@ -3039,7 +3065,7 @@ pub fn set_user_theme(
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let n = conn
         .execute(
-            "UPDATE users SET theme_mode = ?1, theme_accent = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE users SET theme_mode = ?1, theme_accent = ?2, updated_at = ?3, synced = 0 WHERE id = ?4",
             params![theme_mode, theme_accent, now_iso(), user_id],
         )
         .map_err(|e| format!("theme update failed: {e}"))?;
@@ -3079,7 +3105,7 @@ pub fn update_own_profile(
     let n = conn
         .execute(
             "UPDATE users SET phone_number = ?1, language_preference = ?2,
-                    notification_sound = ?3, updated_at = ?4 WHERE id = ?5",
+                    notification_sound = ?3, updated_at = ?4, synced = 0 WHERE id = ?5",
             params![phone, lang, notification_sound.map(|b| if b { 1 } else { 0 }), now_iso(), user_id],
         )
         .map_err(|e| format!("profile update failed: {e}"))?;
@@ -3139,7 +3165,7 @@ pub fn set_profile_photo(
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE users SET profile_photo_ref = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE users SET profile_photo_ref = ?1, updated_at = ?2, synced = 0 WHERE id = ?3",
         params![if had_image { Some(ref_name.as_str()) } else { None }, now_iso(), user_id],
     )
     .map_err(|e| format!("photo ref update failed: {e}"))?;

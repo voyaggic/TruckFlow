@@ -34,7 +34,7 @@ const TABS: { id: AnprTabId; label: string }[] = [
   { id: "diagnostics", label: "Diagnostics" },
 ];
 
-export default function AnprConfig({ user }: { user: SessionUser }) {
+export default function AnprConfig({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const [config, setConfig] = useState<AnprConfigView | null>(null);
   const [cameras, setCameras] = useState<CameraSourceView[]>([]);
   const [versions, setVersions] = useState<ModelVersionView[]>([]);
@@ -81,6 +81,7 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
   }, [activeTab]);
 
   useEffect(() => {
+    if (!isActive) return;
     refreshCore();
     // Fetch diagnostics immediately when live/diagnostics tab activates,
     // then poll every 10s. Without the immediate fetch, the UI shows
@@ -93,7 +94,7 @@ export default function AnprConfig({ user }: { user: SessionUser }) {
       }, 10000);
     }
     return () => { if (t) clearInterval(t); };
-  }, [refreshCore]);
+  }, [refreshCore, isActive]);
 
   // Re-sync cameras after every ANPR (re)start. Pause/Resume triggers a
   // BACKGROUND service restart (5-8s) — an immediate refresh would keep the

@@ -31,7 +31,7 @@ function reasonLabel(reason: string, entityLabel: string): string {
   }
 }
 
-export default function GateOfficer({ user, canResolve, canRegisterVehicle, canEditTrip }: { user: SessionUser; canResolve: boolean; canRegisterVehicle: boolean; canEditTrip: boolean }) {
+export default function GateOfficer({ user, canResolve, canRegisterVehicle, canEditTrip, isActive = true }: { user: SessionUser; canResolve: boolean; canRegisterVehicle: boolean; canEditTrip: boolean; isActive?: boolean }) {
   const { label, entityLabel } = useReferenceFields();
   const [today, setToday] = useState<TripView[]>([]);
   const [queued, setQueued] = useState<TripView[]>([]);
@@ -69,6 +69,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
   const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
 
   useEffect(() => {
+    if (!isActive) return;
     refreshBg();
     const unlisten = listen("capture-updated", () => {
       refreshBg();
@@ -76,7 +77,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [refreshBg]);
+  }, [refreshBg, isActive]);
 
   const now = new Date();
   const sessionMinutes = Math.round((now.getTime() - mountedAt.current) / 60000);

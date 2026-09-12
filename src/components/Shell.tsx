@@ -154,6 +154,7 @@ export default function Shell({
                 canEditTrip={hasPerm(user, PERM.editTrip)}
                 onThemeChanged={onThemeChanged}
                 onPermissionsApplied={onPermissionsApplied}
+                isActive={t.id === active.id}
               />
             </div>
           ) : null
@@ -170,6 +171,8 @@ const TabContent = memo(function TabContent({
   canRegisterVehicle,
   canEditTrip,
   onThemeChanged,
+  onPermissionsApplied: _onPermissionsApplied,
+  isActive,
 }: {
   tabId: TabId;
   user: SessionUser;
@@ -178,18 +181,19 @@ const TabContent = memo(function TabContent({
   canEditTrip: boolean;
   onThemeChanged?: (themeMode: string, themeAccent: string) => void;
   onPermissionsApplied?: () => void;
+  isActive: boolean;
 }) {
   switch (tabId) {
     case "gate":
-      return <GateOfficer user={user} canResolve={canResolve} canRegisterVehicle={canRegisterVehicle} canEditTrip={canEditTrip} />;
+      return <GateOfficer user={user} canResolve={canResolve} canRegisterVehicle={canRegisterVehicle} canEditTrip={canEditTrip} isActive={isActive} />;
     case "reporting":
-      return <Reporting user={user} />;
+      return <Reporting user={user} isActive={isActive} />;
     case "admin":
-      return <AdminPanel user={user} />;
+      return <AdminPanel user={user} isActive={isActive} />;
     case "monitor":
-      return <SystemMonitor user={user} />;
+      return <SystemMonitor user={user} isActive={isActive} />;
     case "anpr":
-      return <AnprConfig user={user} />;
+      return <AnprConfig user={user} isActive={isActive} />;
     case "settings":
       return <Settings user={user} onThemeChanged={onThemeChanged} />;
   }

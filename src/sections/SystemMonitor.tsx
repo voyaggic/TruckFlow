@@ -37,7 +37,7 @@ const SORT_OPTIONS: { key: SortKey; label: string }[] = [
   { key: "status", label: "By status" },
 ];
 
-export default function SystemMonitor({ user }: { user: SessionUser }) {
+export default function SystemMonitor({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const [dash, setDash] = useState<HealthDashboard | null>(null);
   const [trend, setTrend] = useState<ConfidenceTrendPoint[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -108,10 +108,11 @@ export default function SystemMonitor({ user }: { user: SessionUser }) {
   const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
 
   useEffect(() => {
+    if (!isActive) return;
     refreshBg();
     const t = setInterval(refreshBg, 15000);
     return () => clearInterval(t);
-  }, [refreshBg]);
+  }, [refreshBg, isActive]);
 
   const acknowledge = async (id: string) => {
     setError(null);
