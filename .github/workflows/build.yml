@@ -45,9 +45,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Upload artifacts
+      - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
-          name: TruckFlow
-          path: src-tauri/target/release/bundle/**/*.{msi,nsis.exe}
+          name: TruckFlow-NSIS
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: warn
+
+      - name: Upload MSI installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: TruckFlow-MSI
+          path: src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: warn
