@@ -122,6 +122,25 @@ export function useAsyncAction() {
         listen(options.successEvent, (event) => {
           // Event arrived — cancel the safety-net timeout.
           clearSafetyTimeout(key);
+
+          // Check if the backend reported an error in the payload.
+          // e.g. pg-sync-done may carry { pushed: 0, error: "worker busy" }
+          const payload = event.payload as Record<string, unknown> | null;
+          const backendError = payload?.error;
+          const pushed = typeof payload?.pushed === "number" ? payload.pushed : undefined;
+          if (backendError && (pushed === undefined || pushed === 0)) {
+            updateAction(key, { state: "error", error: String(backendError) });
+            options?.onError?.(String(backendError));
+            options?.refresh?.();
+            const unlisten = listenersRef.current.get(key);
+            if (unlisten) {
+              unlisten();
+              listenersRef.current.delete(key);
+            }
+            setTimeout(() => updateAction(key, { state: "idle" }), 6000);
+            return;
+          }
+
           updateAction(key, { state: "success", successMsg: options.successMsg });
           options.onSuccess?.(event.payload);
           options.refresh?.();
@@ -137,6 +156,34 @@ export function useAsyncAction() {
           listenersRef.current.set(key, unlisten);
         });
 
+        // Listen for a dedicated error event from the backend (e.g. "pg-config-error").
+        // This covers cases where the backend emits a separate error event instead
+        // of piggybacking on the success event.
+        if (options?.errorEvent) {
+          const errorEventKey = `${key}__error`;
+          const prevErr = listenersRef.current.get(errorEventKey);
+          if (prevErr) {
+            prevErr();
+            listenersRef.current.delete(errorEventKey);
+          }
+          listen(options.errorEvent, (event) => {
+            clearSafetyTimeout(key);
+            const payload = event.payload as Record<string, unknown> | null;
+            const errMsg = payload?.error ? String(payload.error) : "Operation failed";
+            updateAction(key, { state: "error", error: errMsg });
+            options?.onError?.(errMsg);
+            options?.refresh?.();
+            // Clean up both listeners
+            for (const k of [key, errorEventKey]) {
+              const ul = listenersRef.current.get(k);
+              if (ul) { ul(); listenersRef.current.delete(k); }
+            }
+            setTimeout(() => updateAction(key, { state: "idle" }), 6000);
+          }).then((unlisten) => {
+            listenersRef.current.set(errorEventKey, unlisten);
+          });
+        }
+
         // Safety-net timeout: if the backend event never fires (thread
         // crashed, emit missed, etc.), resolve the action so the button
         // doesn't stay stuck "Syncing…" forever.
@@ -148,6 +195,10 @@ export function useAsyncAction() {
               unlisten();
               listenersRef.current.delete(key);
             }
+            // Also clean up any error event listener
+            const errKey = `${key}__error`;
+            const errUl = listenersRef.current.get(errKey);
+            if (errUl) { errUl(); listenersRef.current.delete(errKey); }
             timeoutsRef.current.delete(key);
             updateAction(key, {
               state: "error",

@@ -58,7 +58,7 @@ fn parse_dt(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
 /// because `'2025-08-15T...' > '2025-08-15'` lexicographically. To fix this,
 /// any bare-date `to` value is extended to `YYYY-MM-DDT23:59:59Z` so the
 /// entire calendar day is covered.
-fn extend_bare_date_to_end_of_day(s: &str) -> String {
+pub fn extend_bare_date_to_end_of_day(s: &str) -> String {
     // Bare YYYY-MM-DD → append end-of-day time
     if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
         format!("{s}T23:59:59Z")

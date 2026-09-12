@@ -53,7 +53,7 @@ function toEndOfDay(d: Date): string {
   return toLocalIso(end);
 }
 
-export default function Reporting({ user }: { user: SessionUser }) {
+export default function Reporting({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const { label, entityLabel } = useReferenceFields();
   const [preset, setPreset] = useState<PresetKey>("7d");
   const [customFrom, setCustomFrom] = useState("");
@@ -99,8 +99,9 @@ export default function Reporting({ user }: { user: SessionUser }) {
   const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
 
   useEffect(() => {
+    if (!isActive) return;
     refreshBg();
-  }, [refreshBg]);
+  }, [refreshBg, isActive]);
 
   const pickPreset = (p: PresetKey) => {
     setPreset(p);

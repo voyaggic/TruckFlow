@@ -8,6 +8,7 @@
 //! - `manage_integrations` gating, audit entries, frequency validation, and
 //!   dev-only connectivity simulation.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +55,7 @@ impl Drop for TempDb {
 struct TestCtx {
     _tmp: TempDb,
     app: App<tauri::test::MockRuntime>,
+    company_id: RefCell<String>,
 }
 
 impl TestCtx {
@@ -62,18 +64,26 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
+        let db_path = tmp.db_path();
         let app = mock_app();
+        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Mutex::new(conn),
+            db: Arc::new(Mutex::new(conn)),
+            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
+            anpr_processes: Arc::new(Mutex::new(Vec::new())),
+            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+            sync_notify: sync_tx,
         });
-        Self { _tmp: tmp, app }
+        Self { _tmp: tmp, app, company_id: RefCell::new(String::new()) }
     }
 
     fn state(&self) -> State<'_, AppState> {
@@ -89,20 +99,40 @@ impl TestCtx {
     }
 
     fn create_admin(&self) -> SessionUser {
-        commands::create_first_admin(self.state(), "Boss".to_string(), ADMIN_PASS.to_string())
-            .expect("create first admin")
-            .user
+        let result = commands::create_first_admin_for_company(self.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
+            .expect("create first admin");
+        if let Some(ref cid) = result.user.company_id {
+            *self.company_id.borrow_mut() = cid.clone();
+        }
+        result.user
+    }
+
+    fn company_id(&self) -> String {
+        self.company_id.borrow().clone()
     }
 
     fn create_gate_user(&self, admin: &SessionUser) -> truckflow_lib::models::UserView {
+        // create_user signature: (state, actor_id, name, password, permission_keys)
         commands::create_user(
             self.state(),
             admin.id.clone(),
             "Officer".to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            "GatePass!2024".to_string(),
         )
         .expect("create gate user")
+    }
+
+    fn create_user_with_password(&self, admin: &SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
+        // The admin sets the initial password directly at creation time.
+        commands::create_user(
+            self.state(),
+            admin.id.clone(),
+            name.to_string(),
+            password.to_string(),
+            permissions,
+        )
+        .expect("create user")
     }
 }
 
@@ -160,6 +190,21 @@ fn queue_trip(ctx: &TestCtx, plate: &str) -> truckflow_lib::models::TripView {
     res.queued.expect("unknown plate with confirm-required mode must queue")
 }
 
+/// Log a trip AND close it with a matching exit read. The Postgres sync engine
+/// only pushes COMPLETED trips (entry AND exit — an open trip is still in
+/// progress), so sync assertions need a closed trip.
+fn complete_trip(ctx: &TestCtx, admin: &SessionUser, plate: &str) -> truckflow_lib::models::TripView {
+    let entry = log_trip(ctx, admin, plate);
+    let res = ingest_read(&ctx.conn(), None, &read(plate, 0.95, &now_iso()), "auto", &ctx.frames_dir()).unwrap();
+    assert!(res.trip.is_some(), "second read must resolve the open trip");
+    let exit_time: Option<String> = ctx
+        .conn()
+        .query_row("SELECT exit_time FROM trips WHERE id = ?1", rusqlite::params![entry.id], |r| r.get(0))
+        .unwrap();
+    assert!(exit_time.is_some(), "trip must be closed by the exit read");
+    entry
+}
+
 fn synced_flag(conn: &rusqlite::Connection, table: &str, id: &str) -> i64 {
     conn.query_row(&format!("SELECT synced FROM {table} WHERE id = ?1"), rusqlite::params![id], |r| r.get(0))
         .unwrap()
@@ -187,7 +232,7 @@ fn offline_first_capture_then_reconnect_no_loss_no_duplicates() {
     let pg = MockPostgres::new();
     pg.simulate_connectivity(false).unwrap();
 
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
     let trip_id = trip.id.clone();
 
     // Offline pass: nothing pushed, trip still unsynced — no error surfaced.
@@ -233,7 +278,7 @@ fn sheets_and_postgres_sync_fail_independently() {
     sheets.simulate_connectivity(false).unwrap();
     let pg = MockPostgres::new();
 
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
     let trip_id = trip.id.clone();
 
     let s = run_sheets_sync_impl(&conn, &sheets).expect("sheets sync must not error while down");
@@ -333,8 +378,13 @@ fn sheets_pushes_auto_matches_but_only_discharge_confirmed_manual() {
     assert_eq!(second.pushed, 0, "non-discharge manual entry never reaches the sheet");
     assert_eq!(pushed_to_sheets_flag(&conn, &manual.id), 0);
 
-    // Another manual entry classified as discharge (Yes) → exported.
-    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A123AB", &ctx.frames_dir(), None)
+    // Another manual entry classified as discharge (Yes) → exported. A third
+    // vehicle avoids entry/exit matching with the still-open trips above.
+    reference::create_vehicle(
+        ctx.state(), admin.id.clone(), "A323AB".into(),
+        None, Some(20.0), "litres".into(), None, None,
+    ).unwrap();
+    let discharge = manual_entry_impl(&ctx.conn(), &admin.id, "A323AB", &ctx.frames_dir(), None)
         .unwrap()
         .trip
         .expect("manual exact match logs");
@@ -360,7 +410,7 @@ fn sync_commands_are_permission_gated_and_audited() {
         .expect_err("gate officer must not connect sheets");
     assert!(err.contains("permission"));
 
-    let err2 = sync_now_pg(ctx.state(), gate.id.clone()).expect_err("gate officer must not trigger pg sync");
+    let err2 = sync_now_pg(ctx.state(), gate.id.clone(), ctx.app.handle().clone()).expect_err("gate officer must not trigger pg sync");
     assert!(err2.contains("permission"));
 
     let err3 = set_google_sheets_frequency(ctx.state(), gate.id.clone(), "every_15_min".into())
@@ -429,7 +479,7 @@ fn connectivity_simulation_toggles_status_and_sync() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
     seed_reference(&ctx, &admin);
-    let trip = log_trip(&ctx, &admin, "A123AB");
+    let trip = complete_trip(&ctx, &admin, "A123AB");
 
     // Connect sheets so its integration state is genuinely "connected".
     connect_google_sheets(ctx.state(), admin.id.clone(), None, None, "realtime".into()).unwrap();
@@ -446,10 +496,10 @@ fn connectivity_simulation_toggles_status_and_sync() {
     assert!(!st1.online);
     assert!(!st1.sheets.connected, "adapter offline overrides connected integration");
 
-    let pg_off = sync_now_pg(ctx.state(), admin.id.clone()).expect("offline pg sync is best-effort, never an error");
-    assert_eq!(pg_off.pushed, 0);
-    let sh_off = sync_now_sheets(ctx.state(), admin.id.clone()).expect("offline sheets sync is best-effort, never an error");
-    assert_eq!(sh_off.pushed, 0);
+    let pg_off = sync_now_pg(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("offline pg sync is best-effort, never an error");
+    assert_eq!(pg_off, "syncing");
+    let sh_off = sync_now_sheets(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("offline sheets sync is best-effort, never an error");
+    assert_eq!(sh_off, "syncing");
 
     // Reconnect: everything flows again.
     simulate_connectivity(ctx.state(), true, true).unwrap();
@@ -457,10 +507,13 @@ fn connectivity_simulation_toggles_status_and_sync() {
     assert!(st2.online);
     assert!(st2.sheets.connected);
 
-    let pg_on = sync_now_pg(ctx.state(), admin.id.clone()).expect("reconnected pg sync succeeds");
-    assert!(pg_on.pushed >= 1);
-    let sh_on = sync_now_sheets(ctx.state(), admin.id.clone()).expect("reconnected sheets sync succeeds");
-    assert_eq!(sh_on.pushed, 1, "logged trip exported on reconnect");
+    let pg_on = sync_now_pg(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("reconnected pg sync succeeds");
+    assert_eq!(pg_on, "syncing");
+    let sh_on = sync_now_sheets(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("reconnected sheets sync succeeds");
+    assert_eq!(sh_on, "syncing");
+
+    // Background threads spawned by sync_now_pg/sheets need time to finish.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     let conn = ctx.conn();
     assert_eq!(synced_flag(&conn, "trips", &trip.id), 1);
@@ -496,13 +549,14 @@ fn postgres_configuration_persists_and_audits() {
     let admin = ctx.create_admin();
     let gate = ctx.create_gate_user(&admin);
 
-    let err = configure_postgres(ctx.state(), gate.id.clone(), "postgresql://x".into())
+    let err = configure_postgres(ctx.state(), gate.id.clone(), "postgresql://x".into(), ctx.app.handle().clone())
         .expect_err("gate officer must not configure postgres");
     assert!(err.contains("permission"));
 
-    let st = configure_postgres(ctx.state(), admin.id.clone(), "postgresql://postgres@127.0.0.1:5432/truckflow_central".into())
+    let st = configure_postgres(ctx.state(), admin.id.clone(), "postgresql://postgres@127.0.0.1:5432/truckflow_central".into(), ctx.app.handle().clone())
         .expect("admin configures postgres");
-    assert!(st.configured, "adapter reports configured after connect");
+    assert_eq!(st, "testing");
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     let conn = ctx.conn();
     let saved: String = conn
@@ -510,8 +564,10 @@ fn postgres_configuration_persists_and_audits() {
         .unwrap();
     assert_eq!(saved, "postgresql://postgres@127.0.0.1:5432/truckflow_central");
 
-    let st2 = disconnect_postgres(ctx.state(), admin.id.clone()).expect("admin disconnects");
-    assert!(!st2.configured);
+    let st2 = disconnect_postgres(ctx.state(), admin.id.clone(), ctx.app.handle().clone()).expect("admin disconnects");
+    assert_eq!(st2, "disconnecting");
+    // Background thread needs time to clear the setting.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM app_settings WHERE key = 'pg_connection_string'", [], |r| r.get(0))
         .unwrap();
@@ -542,6 +598,7 @@ fn sheets_configuration_persists_and_audits() {
         "sheet-1".into(),
         None,
         "realtime".into(),
+        ctx.app.handle().clone(),
     )
     .expect_err("gate officer must not configure sheets");
     assert!(err.contains("permission"));
@@ -553,6 +610,7 @@ fn sheets_configuration_persists_and_audits() {
         "".into(),
         None,
         "realtime".into(),
+        ctx.app.handle().clone(),
     )
     .expect_err("empty sheet id must be rejected");
     assert!(err2.contains("sheet"));
@@ -564,11 +622,11 @@ fn sheets_configuration_persists_and_audits() {
         "sheet-1".into(),
         Some("ops@acme".into()),
         "every_15_min".into(),
+        ctx.app.handle().clone(),
     )
     .expect("admin configures sheets");
-    assert!(st.configured);
-    assert_eq!(st.service_account_email.as_deref(), Some("svc@acme.iam.gserviceaccount.com"));
-    assert_eq!(st.frequency, "every_15_min");
+    assert_eq!(st, "testing");
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     let conn = ctx.conn();
     let saved: String = conn
@@ -603,6 +661,8 @@ fn live_local_postgres_sync_roundtrip() {
         eprintln!("SKIP live postgres test — no reachable local server: {e}");
         return;
     }
+    // Worker thread needs time to finish initial schema setup after configure().
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 
     // Push a reference row and a trip row; both must be acked and upserted.
     let company = json!({ "id": "c-1", "name": "Acme", "status": "active", "extra_fields": null, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z", "synced": 0 });
@@ -620,6 +680,7 @@ fn live_local_postgres_sync_roundtrip() {
     // Verify the central rows directly.
     let pg2 = RealPostgres::new();
     pg2.configure(Some(conn_string.clone())).expect("reconnect");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
     assert!(pg2.connected());
     let check = pg2.push_rows("companies", &[]).expect("empty push ok");
     assert!(check.is_empty());

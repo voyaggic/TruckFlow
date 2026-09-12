@@ -342,6 +342,24 @@ def plate_priority(plate: str) -> int:
 
 _yolo_model = None  # lazy-loaded singleton
 
+# Detection method settings
+_detection_method = 'contour'  # 'contour', 'paddleocr', or 'consecutive'
+_consecutive_required = 3  # Number of matching reads required for consecutive method
+_consecutive_matches = {}  # track_id -> list of (plate, count) for consecutive detection
+
+def set_detection_method(method: str) -> None:
+    """Set the plate detection method."""
+    global _detection_method
+    method = method.lower().strip()
+    if method in ('contour', 'paddleocr', 'consecutive'):
+        _detection_method = method
+        print(f'[DETECT] Detection method set to: {_detection_method}')
+    else:
+        print(f'[DETECT] Unknown detection method: {method}')
+
+def get_detection_method() -> str:
+    return _detection_method
+
 def _load_yolo():
     """Load the fine-tuned YOLO license plate detector (lazy, once)."""
     global _yolo_model
@@ -377,14 +395,10 @@ def _load_yolo():
         return None
 
 
-def detect_plate_boxes(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Return (x1, y1, x2, y2) candidate plate boxes.
+# ── Detection Methods ───────────────────────────────────────────────────
 
-    Uses contour heuristics — fast (~5ms), finds plates at any distance,
-    and works in any lighting.  YOLO is disabled: it was trained on
-    close-up plates and filters out real plates at CCTV distances.
-    """
-    # ── Contour detection (primary — fast, accurate, distance-agnostic) ──
+def detect_contour(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Contour-based detection - fast, works at CCTV distances."""
     try:
         import cv2  # type: ignore
     except Exception:
@@ -416,6 +430,104 @@ def detect_plate_boxes(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         if 1.4 < aspect < 7.0 and 8 < bh < h * 0.70:
             boxes.append((x, y, x + bw, y + bh))
     return boxes
+
+
+def detect_paddleocr(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """PaddleOCR-based detection - uses AI to find plate regions."""
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError:
+        print('[DETECT] PaddleOCR not available, falling back to contour')
+        return detect_contour(frame)
+
+    try:
+        import cv2
+        result = PaddleOCR(use_angle_cls=False, lang='en', show_log=False).ocr(frame, cls=False)
+        boxes = []
+        if result and result[0]:
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    bbox = line[0]
+                    if bbox:
+                        x1 = int(min(p[0] for p in bbox))
+                        y1 = int(min(p[1] for p in bbox))
+                        x2 = int(max(p[0] for p in bbox))
+                        y2 = int(max(p[1] for p in bbox))
+                        boxes.append((x1, y1, x2, y2))
+        return boxes
+    except Exception as e:
+        print(f'[DETECT] PaddleOCR detection failed: {e}, falling back to contour')
+        return detect_contour(frame)
+
+
+def reset_consecutive_state():
+    """Reset consecutive detection state (call when starting new video/session)."""
+    global _consecutive_matches
+    _consecutive_matches = {}
+
+
+def detect_consecutive(frame: np.ndarray, track_id: int = None, plate_read: str = None) -> tuple[list[tuple[int, int, int, int]], bool]:
+    """Consecutive reads detection - requires multiple matching reads.
+
+    Returns (boxes, accepted) where accepted is True if this read matches the pattern.
+    For use with tracking - returns current boxes and whether to accept this reading.
+    """
+    global _consecutive_matches
+
+    # First pass: use contour to find candidates
+    boxes = detect_contour(frame)
+
+    # If no plate_read provided, just return boxes (initial detection)
+    if plate_read is None or track_id is None:
+        return boxes, False
+
+    # Check if this read matches consecutive pattern
+    if track_id not in _consecutive_matches:
+        _consecutive_matches[track_id] = []
+
+    # Add current read
+    _consecutive_matches[track_id].append(plate_read)
+
+    # Keep only recent reads for this track
+    max_stored = _consecutive_required * 3
+    _consecutive_matches[track_id] = _consecutive_matches[track_id][-max_stored:]
+
+    # Check if we have enough consecutive matching reads
+    reads = _consecutive_matches[track_id]
+    if len(reads) >= _consecutive_required:
+        # Count consecutive matches
+        consecutive_count = 1
+        for i in range(len(reads) - 1, 0, -1):
+            if reads[i] == reads[i-1]:
+                consecutive_count += 1
+            else:
+                break
+
+        if consecutive_count >= _consecutive_required:
+            return boxes, True
+
+    return boxes, False
+
+
+def detect_plate_boxes(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Return (x1, y1, x2, y2) candidate plate boxes.
+
+    Dispatches to the configured detection method:
+    - 'contour': Fast, works at CCTV distances (default)
+    - 'paddleocr': Uses PaddleOCR's AI detection
+    - 'consecutive': Uses contour + requires matching reads
+    """
+    if _detection_method == 'paddleocr':
+        return detect_paddleocr(frame)
+    else:
+        # contour and consecutive both use contour detection initially
+        return detect_contour(frame)
+
+
+# Legacy function kept for compatibility
+def detect_plate_boxes_contour(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Legacy contour detection - use detect_contour() directly instead."""
+    return detect_contour(frame)
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1361,46 @@ def serve(pipeline: Pipeline, port: int) -> None:
                 self._stream_mjpeg()
             else:
                 self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            """Handle configuration updates via POST."""
+            path = self.path.split("?")[0]
+            if path != "/config":
+                self._json({"error": "not found"}, 404)
+                return
+
+            # Read request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b''
+
+            try:
+                config = json.loads(body.decode()) if body else {}
+            except json.JSONDecodeError:
+                self._json({"error": "invalid JSON"}, 400)
+                return
+
+            # Apply configuration changes
+            changes = []
+
+            if 'detection_method' in config:
+                method = config['detection_method'].lower().strip()
+                if method in ('contour', 'paddleocr', 'consecutive'):
+                    set_detection_method(method)
+                    changes.append(f"detection_method={method}")
+                else:
+                    self._json({"error": f"unknown detection method: {method}"}, 400)
+                    return
+
+            if 'ocr_plate_mode' in config:
+                mode = config['ocr_plate_mode'].lower().strip()
+                if mode in ('universal', 'kenyan'):
+                    set_ocr_plate_mode(mode)
+                    changes.append(f"ocr_plate_mode={mode}")
+                else:
+                    self._json({"error": f"unknown plate mode: {mode}"}, 400)
+                    return
+
+            self._json({"status": "ok", "changes": changes})
 
         def _stream_mjpeg(self):
             # Support per-camera MJPEG: /preview?camera=N streams that camera's

@@ -2,9 +2,18 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useAsyncAction } from "../lib/useAsyncAction";
 import type { SheetColumnEntry, SessionUser, SyncStatusView } from "../lib/types";
+import { listen } from "@tauri-apps/api/event";
 
-export default function SyncPanel({ user }: { user: SessionUser }) {
+interface CloudConfig {
+  pg_connection_string: string;
+  sheets_id: string;
+  sheets_frequency: string;
+  sheets_service_account_json: string;
+}
+
+export default function SyncPanel({ user, isActive = true }: { user: SessionUser; isActive?: boolean }) {
   const [status, setStatus] = useState<SyncStatusView | null>(null);
+  const [cloudConfig, setCloudConfig] = useState<CloudConfig | null>(null);
   const { fire, isPending, getError, getSuccess } = useAsyncAction();
 
   const refresh = useCallback(() => {
@@ -14,20 +23,44 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
       .catch(() => {});
   }, []);
 
+  // Fetch cloud config on mount (only if local fields are empty)
   useEffect(() => {
+    if (!isActive) return;
+    api
+      .getCloudConfig()
+      .then((cfg) => {
+        // Only use cloud config if it has actual values
+        if (cfg.pg_connection_string || cfg.sheets_id || cfg.sheets_service_account_json) {
+          setCloudConfig(cfg);
+        }
+      })
+      .catch(() => {});
+  }, [isActive]);
+
+  useEffect(() => {
+    if (!isActive) return;
     refresh();
     // Auto-refresh every 5 seconds so pending counts update as the
-    // background poller pushes rows. Pure read-only call — no I/O beyond
-    // a single SQLite query, so no lag or freeze.
+    // background poller pushes rows.
     const id = setInterval(refresh, 5000);
-    return () => clearInterval(id);
-  }, [refresh]);
+
+    // Listen for tables-created event and trigger sync automatically
+    const unlisten = listen("pg-tables-created", () => {
+      console.log("[SyncPanel] pg-tables-created received, triggering sync...");
+      fire("pg-auto-sync", () => api.syncNowPg(user.id), { successEvent: "pg-sync-done" });
+    });
+
+    return () => {
+      clearInterval(id);
+      unlisten.then((fn) => fn());
+    };
+  }, [refresh, isActive]);
 
   const totalPending = (status?.pg.tables ?? []).reduce((sum, t) => sum + t.pending, 0);
 
   // Non-blocking run: fires action, shows pending on that item, never freezes UI
-  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => {
-    fire(key, fn, { successMsg: okMsg, successEvent: event, refresh });
+  const run = (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => {
+    fire(key, fn, { successMsg: okMsg, successEvent: event, errorEvent, refresh });
   };
 
   return (
@@ -42,8 +75,8 @@ export default function SyncPanel({ user }: { user: SessionUser }) {
       {getError("pg-connect") && <div className="error-banner">{getError("pg-connect")}</div>}
       {getSuccess("pg-connect") && <div className="success-banner">{getSuccess("pg-connect")}</div>}
 
-      <PostgresPanel status={status} totalPending={totalPending} actor={user} run={run} isPending={isPending} getError={getError} />
-      <SheetsPanel status={status} actor={user} run={run} isPending={isPending} getError={getError} />
+      <PostgresPanel status={status} totalPending={totalPending} actor={user} run={run} isPending={isPending} getError={getError} cloudConfig={cloudConfig} />
+      <SheetsPanel status={status} actor={user} run={run} isPending={isPending} getError={getError} cloudConfig={cloudConfig} />
       {status?.sheets?.configured && <ColumnMappingPanel actor={user} run={run} isPending={isPending} />}
     </div>
   );
@@ -69,17 +102,32 @@ function PostgresPanel({
   run,
   isPending,
   getError,
+  cloudConfig,
 }: {
   status: SyncStatusView | null;
   totalPending: number;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
+  cloudConfig: CloudConfig | null;
 }) {
   const [connString, setConnString] = useState("");
+  const [pat, setPat] = useState("");
+  const [connType, setConnType] = useState<"pgbouncer" | "rest">("pgbouncer");
   const [tripRetention, setTripRetention] = useState("");
+  const [schemaSql, setSchemaSql] = useState<string | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [schemaLoading, setSchemaLoading] = useState(false);
+  const [copySuccess, setCopySuccess] = useState(false);
   const pg = status?.pg;
+
+  // Pre-populate connection string from cloud config if local is empty
+  useEffect(() => {
+    if (cloudConfig?.pg_connection_string && !connString) {
+      setConnString(cloudConfig.pg_connection_string);
+    }
+  }, [cloudConfig, connString]);
 
   // Track the pending count when sync starts so we can show incremental
   // progress ("3 of 120 rows synced") as the background poller pushes.
@@ -93,6 +141,38 @@ function PostgresPanel({
     }
   }, [totalPending]);
   const pgSynced = pgBaseline > 0 ? pgBaseline - totalPending : 0;
+
+  const generateSchema = async () => {
+    setSchemaLoading(true);
+    setSchemaError(null);
+    try {
+      const sql = await api.generateCloudSchema(actor.id);
+      setSchemaSql(sql);
+    } catch (e) {
+      setSchemaError(String(e));
+    } finally {
+      setSchemaLoading(false);
+    }
+  };
+
+  const copySchema = async () => {
+    if (!schemaSql) return;
+    try {
+      await navigator.clipboard.writeText(schemaSql);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    } catch {
+      // Fallback: select text for manual copy
+      const el = document.getElementById("schema-output");
+      if (el) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      }
+    }
+  };
 
   const saveTripRetention = () => {
     const v = tripRetention.trim();
@@ -109,7 +189,37 @@ function PostgresPanel({
   };
 
   const connect = () => {
-    run("pg-connect", () => api.configurePostgres(actor.id, connString.trim()), "PostgreSQL connected — central database ready.", "pg-configured");
+    let finalConnString = connString.trim();
+    if (connType === "rest") {
+      // User provides only the service_role key (eyJ...)
+      // Extract project_ref from JWT payload, build 3-part format: REST|URL|service_role_key
+      const apiKey = finalConnString;
+
+      try {
+        const parts = apiKey.split('.');
+        if (parts.length !== 3) {
+          window.alert("Invalid service_role key format. Should be a JWT like: eyJ...");
+          return;
+        }
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        const projectRef = payload?.ref;
+        if (!projectRef) {
+          window.alert("Could not extract project reference from service_role key.");
+          return;
+        }
+        // 3-part format: REST|URL|service_role_key
+        finalConnString = `REST|https://${projectRef}.supabase.co/rest/v1|${apiKey}`;
+      } catch (e) {
+        window.alert("Failed to parse service_role key. Make sure you copied the full key starting with eyJ...");
+        return;
+      }
+    }
+    run("pg-connect", async () => {
+      await api.configurePostgres(actor.id, finalConnString);
+      if (connType === "rest" && pat.trim()) {
+        await api.createPostgresTables(actor.id, pat.trim());
+      }
+    }, "PostgreSQL connected — central database ready.", "pg-configured", "pg-config-error");
   };
 
   const disconnect = () => {
@@ -145,17 +255,63 @@ function PostgresPanel({
         <div className="stack">
           <p className="muted small">
             Connect to a PostgreSQL server by pasting its connection string. The first connect <b>creates the database
-            and its tables automatically</b>, so setup is paste-and-go. On this machine your local server accepts:
+            and its tables automatically</b>, so setup is paste-and-go.
           </p>
+          <div className="row" style={{ gap: 8, alignItems: "center" }}>
+            <span className="muted small">Connection type:</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "pgbouncer"}
+                onChange={() => setConnType("pgbouncer")}
+              />
+              <span className="small">PgBouncer (fast, recommended)</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="connType"
+                checked={connType === "rest"}
+                onChange={() => setConnType("rest")}
+              />
+              <span className="small">REST API (more resilient for unstable connections)</span>
+            </label>
+          </div>
           <div className="row">
             <div className="field grow">
               <label>Connection string</label>
               <input
+                type="password"
+                autoComplete="off"
                 value={connString}
                 onChange={(e) => setConnString(e.target.value)}
-                placeholder="postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                placeholder={connType === "pgbouncer"
+                  ? "postgresql://postgres@127.0.0.1:5432/truckflow_central"
+                  : "Paste your Supabase service_role key (eyJ...)"}
                 spellCheck={false}
               />
+              {connType === "rest" && (
+                <p className="muted small" style={{ marginTop: 4 }}>
+                  Paste the <b>service_role</b> key from Supabase Dashboard → Settings → API.
+                </p>
+              )}
+              {connType === "rest" && (
+                <div className="field" style={{ marginTop: 8 }}>
+                  <label>Personal Access Token (for table creation)</label>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={pat}
+                    onChange={(e) => setPat(e.target.value)}
+                    placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                    spellCheck={false}
+                  />
+                  <p className="muted small" style={{ marginTop: 4 }}>
+                    Generate at Supabase Dashboard → Settings → API → Personal Tokens → "Create a new token"
+                  </p>
+                </div>
+              )}
             </div>
             <div className="field">
               <label>&nbsp;</label>
@@ -166,6 +322,47 @@ function PostgresPanel({
             </div>
           </div>
           <AdapterError message={pg?.last_error} />
+          <div className="row" style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+            <button
+              className="ghost small"
+              onClick={generateSchema}
+              disabled={schemaLoading}
+            >
+              {schemaLoading ? "Generating…" : "Generate Schema"}
+            </button>
+            <span className="muted small" style={{ alignSelf: "center" }}>
+              Generate PostgreSQL schema from local data — paste into Supabase SQL Editor before connecting.
+            </span>
+          </div>
+          {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
+          {schemaSql && (
+            <div className="stack" style={{ marginTop: 8 }}>
+              <div className="row between" style={{ alignItems: "center" }}>
+                <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
+                <button className="ghost small" onClick={copySchema}>
+                  {copySuccess ? "Copied!" : "Copy to clipboard"}
+                </button>
+              </div>
+              <pre
+                id="schema-output"
+                style={{
+                  background: "var(--card-muted, #f5f5f5)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: 12,
+                  fontSize: 11,
+                  fontFamily: "monospace",
+                  maxHeight: 300,
+                  overflow: "auto",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                  margin: 0,
+                }}
+              >
+                {schemaSql}
+              </pre>
+            </div>
+          )}
         </div>
       ) : (
         <div className="stack">
@@ -246,6 +443,51 @@ function PostgresPanel({
           </div>
 
           <AdapterError message={pg?.last_error} />
+
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <button
+                className="ghost small"
+                onClick={generateSchema}
+                disabled={schemaLoading}
+              >
+                {schemaLoading ? "Generating…" : "Generate Schema"}
+              </button>
+              <span className="muted small">
+                Regenerate after adding/editing tables or columns.
+              </span>
+            </div>
+            {schemaError && <p className="small" style={{ color: "var(--danger, #d32f2f)" }}>{schemaError}</p>}
+            {schemaSql && (
+              <div className="stack" style={{ marginTop: 8 }}>
+                <div className="row between" style={{ alignItems: "center" }}>
+                  <span className="muted small">Generated schema — copy and paste into Supabase SQL Editor:</span>
+                  <button className="ghost small" onClick={copySchema}>
+                    {copySuccess ? "Copied!" : "Copy to clipboard"}
+                  </button>
+                </div>
+                <pre
+                  id="schema-output"
+                  style={{
+                    background: "var(--card-muted, #f5f5f5)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: 12,
+                    fontSize: 11,
+                    fontFamily: "monospace",
+                    maxHeight: 300,
+                    overflow: "auto",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                    margin: 0,
+                  }}
+                >
+                  {schemaSql}
+                </pre>
+              </div>
+            )}
+          </div>
+
           <div className="row">
             <button className="danger small" onClick={disconnect} disabled={isPending("pg-disconnect")}>
               {isPending("pg-disconnect") ? "Disconnecting…" : "Disconnect"}
@@ -267,7 +509,7 @@ function ColumnMappingPanel({
   isPending: _isPending,
 }: {
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
 }) {
   const [mapping, setMapping] = useState<SheetColumnEntry[]>([]);
@@ -417,12 +659,14 @@ function SheetsPanel({
   run,
   isPending,
   getError,
+  cloudConfig,
 }: {
   status: SyncStatusView | null;
   actor: SessionUser;
-  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string) => void;
+  run: (key: string, fn: () => Promise<unknown>, okMsg: string, event?: string, errorEvent?: string) => void;
   isPending: (key: string) => boolean;
   getError: (key: string) => string | undefined;
+  cloudConfig: CloudConfig | null;
 }) {
   const sheets = status?.sheets;
   const [saJson, setSaJson] = useState("");
@@ -431,8 +675,6 @@ function SheetsPanel({
   const [frequency, setFrequency] = useState<string>("realtime");
   const [retention, setRetention] = useState<string>("");
 
-  // Track the pending count when export starts so we can show incremental
-  // progress as the background poller pushes trips to the sheet.
   const sheetsPending = sheets?.pending ?? 0;
   const [sheetsBaseline, setSheetsBaseline] = useState(0);
   useEffect(() => {
@@ -443,6 +685,19 @@ function SheetsPanel({
     }
   }, [sheetsPending]);
   const sheetsSynced = sheetsBaseline > 0 ? sheetsBaseline - sheetsPending : 0;
+
+  // Pre-populate from cloud config if local is empty
+  useEffect(() => {
+    if (cloudConfig?.sheets_service_account_json && !saJson) {
+      setSaJson(cloudConfig.sheets_service_account_json);
+    }
+    if (cloudConfig?.sheets_id && !sheetId) {
+      setSheetId(cloudConfig.sheets_id);
+    }
+    if (cloudConfig?.sheets_frequency && frequency === "realtime") {
+      setFrequency(cloudConfig.sheets_frequency);
+    }
+  }, [cloudConfig, saJson, sheetId, frequency]);
 
   const saveRetention = () => {
     const v = retention.trim();
@@ -460,6 +715,8 @@ function SheetsPanel({
     run("sheets-connect",
       () => api.configureGoogleSheets(actor.id, saJson.trim(), sheetId.trim(), sharedGroup.trim() || null, frequency),
       "Google Sheets connected — logged trips will now export.",
+      "sheets-configured",
+      "sheets-config-error",
     );
   };
 

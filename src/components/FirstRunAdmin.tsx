@@ -3,8 +3,14 @@ import { api } from "../lib/api";
 import type { SessionUser } from "../lib/types";
 import PasswordChecklist from "./PasswordChecklist";
 
+type View = "choice" | "signup" | "signin";
+
 export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) => void }) {
-  const [name, setName] = useState("");
+  const [view, setView] = useState<View>("choice");
+
+  // Sign Up state
+  const [companyName, setCompanyName] = useState("");
+  const [adminName, setAdminName] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -12,7 +18,15 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
   const [created, setCreated] = useState<{ user: SessionUser; recoveryCode: string | null; filePath: string | null } | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const submit = async () => {
+  // Sign In state
+  const [signInUser, setSignInUser] = useState("");
+  const [signInPass, setSignInPass] = useState("");
+  const [signInError, setSignInError] = useState<string | null>(null);
+  const [signInBusy, setSignInBusy] = useState(false);
+  const [supabaseUrl, setSupabaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+
+  const submitSignUp = async () => {
     setError(null);
     if (password !== confirm) {
       setError("Passwords do not match.");
@@ -20,7 +34,8 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
     }
     setBusy(true);
     try {
-      const res = await api.createFirstAdmin(name, password);
+      // Local-only signup — cloud connection is configured later via the Sync panel
+      const res = await api.createCompanyAndAdmin(companyName, adminName, password);
       let filePath: string | null = null;
       try {
         const info = await api.getRecoveryCode(res.user.id);
@@ -36,6 +51,19 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
     }
   };
 
+  const submitSignIn = async () => {
+    setSignInError(null);
+    setSignInBusy(true);
+    try {
+      const res = await api.loginPassword(signInUser, signInPass, supabaseUrl, apiKey);
+      onDone(res.user);
+    } catch (e) {
+      setSignInError(String(e));
+    } finally {
+      setSignInBusy(false);
+    }
+  };
+
   const copyCode = async () => {
     if (!created?.recoveryCode) return;
     try {
@@ -46,6 +74,209 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
     }
   };
 
+  // --- Choice screen ---
+  if (view === "choice") {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <div className="brand">
+            <div className="brand-mark">TF</div>
+            <div>
+              <div className="brand-name">TruckFlow</div>
+              <div className="brand-sub">Gate trip management</div>
+            </div>
+          </div>
+
+          <div className="auth-title">Welcome to TruckFlow</div>
+          <div className="auth-hint">
+            This is a fresh installation. Choose how to get started:
+          </div>
+
+          <button
+            className="primary"
+            style={{ width: "100%", padding: "11px", marginBottom: 10 }}
+            onClick={() => setView("signup")}
+          >
+            Sign Up — Create a new account
+          </button>
+
+          <button
+            className="ghost"
+            style={{ width: "100%", padding: "11px" }}
+            onClick={() => setView("signin")}
+          >
+            Sign In — I already have an account
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Sign In screen ---
+  if (view === "signin") {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <div className="brand">
+            <div className="brand-mark">TF</div>
+            <div>
+              <div className="brand-name">TruckFlow</div>
+              <div className="brand-sub">Gate trip management</div>
+            </div>
+          </div>
+
+          <div className="auth-title">Sign in</div>
+          <div className="auth-hint">Enter your existing account credentials.</div>
+
+          {signInError && <div className="error-banner">{signInError}</div>}
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitSignIn();
+            }}
+          >
+            <div className="field">
+              <label>Username</label>
+              <input
+                value={signInUser}
+                onChange={(e) => setSignInUser(e.target.value)}
+                autoFocus
+                placeholder="e.g. andreah"
+                autoComplete="username"
+              />
+            </div>
+            <div className="field">
+              <label>Password</label>
+              <input
+                type="password"
+                value={signInPass}
+                onChange={(e) => setSignInPass(e.target.value)}
+                autoComplete="current-password"
+                placeholder="••••••••"
+              />
+            </div>
+
+            {/* Supabase fields */}
+            <div style={{ marginTop: 12, padding: 12, background: "var(--bg-secondary)", borderRadius: "var(--radius)" }}>
+              <div className="small muted" style={{ marginBottom: 8, fontWeight: 600 }}>
+                Supabase Connection
+              </div>
+              <div className="field" style={{ marginBottom: 8 }}>
+                <label>Supabase URL</label>
+                <input
+                  value={supabaseUrl}
+                  onChange={(e) => setSupabaseUrl(e.target.value)}
+                  placeholder="https://xxx.supabase.co"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="field" style={{ marginBottom: 0 }}>
+                <label>API Key</label>
+                <input
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="eyJhbGciOiJIUzI1NiIs..."
+                  autoComplete="off"
+                  type="password"
+                />
+              </div>
+            </div>
+
+            <button
+              className="primary"
+              style={{ width: "100%", padding: "11px" }}
+              type="submit"
+              disabled={signInBusy || !signInUser || !signInPass}
+            >
+              {signInBusy ? "Signing in…" : "Sign in"}
+            </button>
+          </form>
+
+          <div style={{ textAlign: "center", marginTop: 16 }}>
+            <button
+              className="ghost small"
+              onClick={() => { setView("choice"); setSignInError(null); }}
+              disabled={signInBusy}
+            >
+              Back
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Sign Up screen ---
+  if (created) {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <div className="brand">
+            <div className="brand-mark">TF</div>
+            <div>
+              <div className="brand-name">TruckFlow</div>
+              <div className="brand-sub">Gate trip management</div>
+            </div>
+          </div>
+
+          <div className="auth-title">Admin account created!</div>
+
+          {created.recoveryCode && (
+            <div className="auth-hint">
+              Save this recovery code somewhere safe. You'll need it if no other admin can reset your password.
+            </div>
+          )}
+
+          {created.recoveryCode && (
+            <div
+              className="stack"
+              style={{
+                background: "var(--surface-2)",
+                borderRadius: "var(--radius)",
+                padding: 14,
+                margin: "16px 0",
+                fontFamily: "monospace",
+                fontSize: 16,
+                textAlign: "center",
+                letterSpacing: "0.05em",
+                userSelect: "all",
+              }}
+            >
+              {created.recoveryCode}
+            </div>
+          )}
+
+          {created.recoveryCode && (
+            <button
+              className="ghost"
+              style={{ width: "100%", marginBottom: 10 }}
+              onClick={copyCode}
+            >
+              {copied ? "Copied!" : "Copy to clipboard"}
+            </button>
+          )}
+
+          {created.filePath && (
+            <p className="muted small" style={{ margin: "0 0 16px" }}>
+              Also saved to: <br />
+              <span style={{ fontFamily: "monospace", fontSize: 11 }}>{created.filePath}</span>
+            </p>
+          )}
+
+          <button
+            className="primary"
+            style={{ width: "100%", padding: "11px" }}
+            onClick={() => onDone(created.user)}
+          >
+            Continue to TruckFlow
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Sign Up form ---
   return (
     <div className="auth-wrap">
       <div className="auth-card">
@@ -57,85 +288,88 @@ export default function FirstRunAdmin({ onDone }: { onDone: (user: SessionUser) 
           </div>
         </div>
 
-        {created ? (
-          <>
-            <div className="auth-title">Admin account created</div>
-            <p className="muted small">
-              Your account <b>{created.user.name}</b> is ready. The recovery code below is also saved in a file on this
-              computer — open it anytime to copy the code:
-            </p>
+          <div className="auth-title">Set up your account</div>
+          <div className="auth-hint">
+            Creates your account and syncs everything to the cloud.
+          </div>
 
-            <div
-              className="card"
-              style={{
-                margin: "14px 0",
-                textAlign: "center",
-                borderColor: "color-mix(in srgb, var(--warning) 45%, transparent)",
-              }}
-            >
-              <div className="section-title" style={{ fontSize: 20, letterSpacing: 3, fontFamily: "monospace" }}>
-                {created.recoveryCode ?? "—"}
-              </div>
-              <button className="ghost small" onClick={copyCode} style={{ marginTop: 8 }}>
-                {copied ? "Copied ✓" : "Copy code"}
-              </button>
-              {created.filePath && (
-                <div className="muted small" style={{ marginTop: 8, wordBreak: "break-all" }}>
-                  Saved in: <code>{created.filePath}</code>
-                </div>
-              )}
-            </div>
+        {error && <div className="error-banner">{error}</div>}
 
-            <div className="error-banner" style={{ background: "color-mix(in srgb, var(--warning) 12%, transparent)" }}>
-              <b>This code is only for admins who are locked out.</b> If you ever forget your password and no other
-              admin can reset you, this code (or the file) is the only way back in. Anyone with it can reset an admin
-              password — keep the file private. You can regenerate it anytime in Settings → Recovery code.
-            </div>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitSignUp();
+          }}
+        >
+          <div className="field">
+            <label>Company name</label>
+            <input
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+              placeholder="e.g. Acme Exhauster Services"
+              autoFocus
+            />
+          </div>
+          <div className="field">
+            <label>Username</label>
+            <input
+              value={adminName}
+              onChange={(e) => setAdminName(e.target.value)}
+              placeholder="e.g. andreah"
+              autoComplete="username"
+            />
+          </div>
+          <div className="field">
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="new-password"
+              placeholder="••••••••"
+            />
+            <PasswordChecklist password={password} />
+          </div>
+          <div className="field">
+            <label>Confirm password</label>
+            <input
+              type="password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              autoComplete="new-password"
+              placeholder="••••••••"
+            />
+          </div>
 
-            <button className="primary" style={{ width: "100%", padding: "11px", marginTop: 14 }} onClick={() => onDone(created.user)}>
-              Continue
-            </button>
-          </>
-        ) : (
-          <>
-            <div className="auth-title">Create your first Admin account</div>
-            <div className="auth-hint">
-              This happens once on a fresh installation. This account manages all other users.
-            </div>
+          <p className="small muted" style={{ marginTop: 12 }}>
+            Cloud connection is configured later in the Sync panel.
+          </p>
 
-            {error && <div className="error-banner">{error}</div>}
+          <button
+            className="primary"
+            style={{ width: "100%", padding: "11px" }}
+            type="submit"
+            disabled={
+              busy ||
+              !companyName.trim() ||
+              !adminName.trim() ||
+              password.length < 8 ||
+              password !== confirm
+            }
+          >
+            {busy ? "Setting up…" : "Create account"}
+          </button>
+        </form>
 
-            <div className="field">
-              <label>Full name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Jane Mwangi" autoFocus />
-            </div>
-
-            <div className="field">
-              <label>Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="At least 8 characters"
-              />
-              <PasswordChecklist password={password} />
-            </div>
-
-            <div className="field">
-              <label>Confirm password</label>
-              <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
-            </div>
-
-            <button
-              className="primary"
-              style={{ width: "100%", padding: "11px" }}
-              onClick={submit}
-              disabled={busy || !name || !password || password !== confirm}
-            >
-              {busy ? "Creating account…" : "Create account"}
-            </button>
-          </>
-        )}
+        <div style={{ textAlign: "center", marginTop: 16 }}>
+          <button
+            className="ghost small"
+            onClick={() => setView("choice")}
+            disabled={busy}
+          >
+            Back
+          </button>
+        </div>
       </div>
     </div>
   );

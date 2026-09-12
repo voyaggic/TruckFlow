@@ -361,8 +361,7 @@ label {
   color: var(--text-dim);
 }
 
-/* Data tables: never squish when columns/data expand — grow to content
-   width and let the section scroll horizontally instead. */
+/* Data tables: shrink to fit container, scroll horizontally if needed */
 .table-scroll {
   overflow-x: auto;
   max-width: 100%;
@@ -371,7 +370,7 @@ label {
 }
 .table {
   width: 100%;
-  min-width: max-content;
+  min-width: 0;
   border-collapse: collapse;
 }
 .table th,
@@ -398,7 +397,8 @@ label {
   background: var(--surface-2);
 }
 .table td {
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .badge {
@@ -408,6 +408,7 @@ label {
   padding: 2px 9px;
   border-radius: 999px;
   font-size: 11px;
+  white-space: nowrap;
   font-weight: 600;
   border: 1px solid var(--border);
   color: var(--text-dim);

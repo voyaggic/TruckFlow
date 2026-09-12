@@ -31,7 +31,7 @@ function reasonLabel(reason: string, entityLabel: string): string {
   }
 }
 
-export default function GateOfficer({ user, canResolve, canRegisterVehicle, canEditTrip }: { user: SessionUser; canResolve: boolean; canRegisterVehicle: boolean; canEditTrip: boolean }) {
+export default function GateOfficer({ user, canResolve, canRegisterVehicle, canEditTrip, isActive = true }: { user: SessionUser; canResolve: boolean; canRegisterVehicle: boolean; canEditTrip: boolean; isActive?: boolean }) {
   const { label, entityLabel } = useReferenceFields();
   const [today, setToday] = useState<TripView[]>([]);
   const [queued, setQueued] = useState<TripView[]>([]);
@@ -69,6 +69,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
   const refreshBg = useCallback(() => { refresh().catch(() => {}); }, [refresh]);
 
   useEffect(() => {
+    if (!isActive) return;
     refreshBg();
     const unlisten = listen("capture-updated", () => {
       refreshBg();
@@ -76,7 +77,7 @@ export default function GateOfficer({ user, canResolve, canRegisterVehicle, canE
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [refreshBg]);
+  }, [refreshBg, isActive]);
 
   const now = new Date();
   const sessionMinutes = Math.round((now.getTime() - mountedAt.current) / 60000);
@@ -811,6 +812,29 @@ function ResolveScreen({
     }
   };
 
+  const logTripManually = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const cap = capacity.trim() === "" ? null : Number(capacity);
+      const logged = await api.resolveQueuedManual(
+        trip.id,
+        officerId,
+        companyId || null,
+        driverId || null,
+        Number.isFinite(cap as number) ? (cap as number) : null,
+        capacityUnit,
+        receipt.trim() || null,
+      );
+      await onDone(`Trip ${logged.plate_number} logged.`, logged);
+    } catch (e) {
+      setError(String(e));
+      setTimeout(() => setError(null), 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const discard = async () => {
     setBusy(true);
     setError(null);
@@ -988,6 +1012,11 @@ function ResolveScreen({
                   New vehicle
                 </button>
               )}
+              {canEditTrip && !selectedVehicleId ? (
+                <button className="ghost" onClick={logTripManually} disabled={busy}>
+                  Log trip anyway
+                </button>
+              ) : null}
               {canEditTrip ? (
                 <button className="danger" onClick={() => setConfirmingDiscard(true)} disabled={busy}>
                   Discard

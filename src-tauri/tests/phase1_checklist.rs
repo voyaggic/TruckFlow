@@ -2,6 +2,7 @@
 //! and 03-auth-permissions.md §12). Drives the real tauri commands through a mock app
 //! against a fresh temp database.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +42,7 @@ impl Drop for TempDb {
 struct TestCtx {
     _tmp: TempDb,
     app: App<MockRuntime>,
+    company_id: RefCell<String>,
 }
 
 impl TestCtx {
@@ -49,18 +51,26 @@ impl TestCtx {
         let frames_dir = tmp.dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let conn = open_db(&tmp.db_path()).expect("open temp db");
+        let db_path = tmp.db_path();
         let app = mock_app();
+        let (sync_tx, _sync_rx) = std::sync::mpsc::sync_channel(1);
         app.manage(AppState {
-            db: Mutex::new(conn),
+            db: Arc::new(Mutex::new(conn)),
+            sync_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
+            anpr_db: Arc::new(Mutex::new(open_db(&db_path).unwrap())),
             session: Mutex::new(None),
             simulator: Arc::new(SimulatorSource::new()),
             anpr_last: Mutex::new(None),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            anpr_starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frames_dir,
-            pg: Arc::new(MockPostgres::new()),
+            pg: Arc::new(truckflow_lib::sync::SharedPg::new(Arc::new(MockPostgres::new()))),
             sheets: Arc::new(MockSheets::new()),
+            anpr_processes: Arc::new(Mutex::new(Vec::new())),
+            pending_sync_marks: Arc::new(Mutex::new(Vec::new())),
+            sync_notify: sync_tx,
         });
-        Self { _tmp: tmp, app }
+        Self { _tmp: tmp, app, company_id: RefCell::new(String::new()) }
     }
 
     fn state(&self) -> State<'_, AppState> {
@@ -73,20 +83,42 @@ impl TestCtx {
     }
 
     fn create_admin(&self) -> truckflow_lib::models::SessionUser {
-        commands::create_first_admin(self.state(), "Boss".to_string(), ADMIN_PASS.to_string())
-            .expect("create first admin")
-            .user
+        let result = commands::create_first_admin_for_company(self.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
+            .expect("create first admin");
+        if let Some(ref cid) = result.user.company_id {
+            *self.company_id.borrow_mut() = cid.clone();
+        }
+        result.user
+    }
+
+    fn company_id(&self) -> String {
+        self.company_id.borrow().clone()
     }
 
     fn create_gate_user(&self, admin: &truckflow_lib::models::SessionUser, name: &str) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
         commands::create_user(
             self.state(),
             admin.id.clone(),
             name.to_string(),
+            "Str0ng!Pass".to_string(),
             vec!["view_gate_entries".to_string(), "resolve_queue".to_string()],
-            "GatePass!2024".to_string(),
+            
         )
         .expect("create gate user")
+    }
+
+    fn create_user_with_password(&self, admin: &truckflow_lib::models::SessionUser, name: &str, permissions: Vec<String>, password: &str) -> truckflow_lib::models::UserView {
+        let company_id = admin.company_id.clone().unwrap_or_else(|| "default".to_string());
+        let user = commands::create_user(
+            self.state(),
+            admin.id.clone(),
+            name.to_string(),
+            password.to_string(),
+            permissions,
+        )
+        .expect("create user");
+        user
     }
 }
 
@@ -296,7 +328,7 @@ fn permission_changes_are_staged_until_the_account_confirms() {
 fn role_change_confirmation_requires_the_current_password() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let gate = ctx.create_gate_user(&admin, "Gate A");
+    let gate = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
 
     commands::set_user_permissions(
         ctx.state(),
@@ -320,7 +352,7 @@ fn role_change_confirmation_requires_the_current_password() {
     assert!(keys.contains(&"manage_users".to_string()));
 
     // The account's password is unchanged — confirmation only, no new credential.
-    let pw_login = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string())
+    let pw_login = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("password login still works");
     assert_eq!(pw_login.user.auth_type, "password");
 }
@@ -333,10 +365,10 @@ fn role_change_confirmation_requires_the_current_password() {
 fn disabling_active_user_does_not_interrupt_session_but_blocks_next_login() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let gate = ctx.create_gate_user(&admin, "Gate A");
+    let gate = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
 
     commands::logout(ctx.state()).ok();
-    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string()).expect("gate login");
+    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect("gate login");
 
     // Admin disables the user while they hold the active session.
     commands::set_user_status(ctx.state(), admin.id.clone(), gate.id.clone(), "disabled".to_string())
@@ -350,9 +382,9 @@ fn disabling_active_user_does_not_interrupt_session_but_blocks_next_login() {
 
     commands::logout(ctx.state()).expect("logout");
 
-    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string()).expect_err("disabled user must be blocked");
+    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect_err("disabled user must be blocked");
     assert!(err.contains("disabled"), "unexpected: {err}");
-    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "whatever".to_string()).expect_err("disabled user must be blocked");
+    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "whatever".to_string(), ctx.company_id(), String::new(), String::new()).expect_err("disabled user must be blocked");
     assert!(err.contains("disabled"), "unexpected: {err}");
 }
 
@@ -360,11 +392,11 @@ fn disabling_active_user_does_not_interrupt_session_but_blocks_next_login() {
 fn disabling_one_user_has_zero_effect_on_others() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let _a = ctx.create_gate_user(&admin, "Gate A");
-    let b = ctx.create_gate_user(&admin, "Gate B");
+    let _a = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
+    let b = ctx.create_user_with_password(&admin, "Gate B", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
 
     commands::logout(ctx.state()).ok();
-    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string()).expect("A login");
+    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect("A login");
 
     commands::set_user_status(ctx.state(), admin.id.clone(), b.id.clone(), "disabled".to_string())
         .expect("disable B");
@@ -372,20 +404,21 @@ fn disabling_one_user_has_zero_effect_on_others() {
     let cur = commands::get_current_user(ctx.state()).expect("current user");
     assert_eq!(cur.expect("A session intact").name, "Gate A");
 
-    let list = commands::list_users(ctx.state()).expect("list users");
+    let list = commands::list_users(ctx.state(), false).expect("list users");
     let b_row = list.iter().find(|u| u.name == "Gate B").expect("B present");
     assert_eq!(b_row.status, "disabled");
 
     commands::logout(ctx.state()).ok();
-    commands::login_password(ctx.state(), "Gate B".to_string(), "GatePass!2024".to_string()).expect_err("B blocked");
-    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string()).expect("A still logs in");
+    commands::login_password(ctx.state(), "Gate B".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect_err("B blocked");
+    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect("A still logs in");
 }
 
 #[test]
 fn reenabling_restores_full_history_and_permissions() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let gate = ctx.create_gate_user(&admin, "Gate A");
+    let gate = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
+
     let before = commands::get_user_permissions(ctx.state(), gate.id.clone()).expect("perms before");
 
     commands::set_user_status(ctx.state(), admin.id.clone(), gate.id.clone(), "disabled".to_string())
@@ -398,7 +431,7 @@ fn reenabling_restores_full_history_and_permissions() {
     let a: Vec<String> = after.iter().map(|p| p.key.clone()).collect();
     assert_eq!(a, b, "re-enabled account must keep its full permission set");
 
-    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string()).expect("re-enabled user logs in");
+    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new()).expect("re-enabled user logs in");
 }
 
 #[test]
@@ -413,14 +446,7 @@ fn password_strength_rules_enforced() {
 fn downgrade_requires_only_current_password_confirmation() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let deputy = commands::create_user(
-        ctx.state(),
-        admin.id.clone(),
-        "Deputy".to_string(),
-        vec!["manage_reference_database".to_string()],
-        "DeputyPass!2024".to_string(),
-    )
-    .expect("create user");
+    let deputy = ctx.create_user_with_password(&admin, "Deputy", vec!["manage_reference_database".to_string()], "DeputyPass!2024");
     assert_eq!(deputy.auth_type, "password");
 
     // The acting admin must confirm their own password before any change.
@@ -478,7 +504,7 @@ fn downgrade_requires_only_current_password_confirmation() {
     assert!(pending_after.is_none(), "confirmation must clear the staged change");
 
     // The account still signs in with the unchanged password.
-    let pw_login = commands::login_password(ctx.state(), "Deputy".to_string(), "DeputyPass!2024".to_string())
+    let pw_login = commands::login_password(ctx.state(), "Deputy".to_string(), "DeputyPass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("password login still works");
     assert_eq!(pw_login.user.auth_type, "password");
 }
@@ -487,7 +513,7 @@ fn downgrade_requires_only_current_password_confirmation() {
 fn admin_can_soft_delete_and_restore_a_user() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let gate = ctx.create_gate_user(&admin, "Gate A");
+    let gate = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
 
     // Wrong admin password blocks the delete.
     let blocked = commands::delete_user(ctx.state(), admin.id.clone(), gate.id.clone(), "WrongPass!".to_string())
@@ -498,18 +524,18 @@ fn admin_can_soft_delete_and_restore_a_user() {
         .expect("delete the user");
 
     // Deleted accounts cannot sign in.
-    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string())
+    let err = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect_err("deleted account must be blocked from login");
     assert!(err.contains("deleted"), "unexpected: {err}");
 
     // The account stays listed with status 'deleted' — history is intact.
-    let users = commands::list_users(ctx.state()).expect("list users");
+    let users = commands::list_users(ctx.state(), true).expect("list users");
     let deleted = users.iter().find(|u| u.id == gate.id).expect("deleted user still listed");
     assert_eq!(deleted.status, "deleted");
 
     // Restore brings it back to full sign-in.
     commands::restore_user(ctx.state(), admin.id.clone(), gate.id.clone()).expect("restore");
-    let login = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string())
+    let login = commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("restored account can sign in");
     assert_eq!(login.user.id, gate.id);
 }
@@ -526,12 +552,12 @@ fn cannot_delete_self_or_the_last_admin() {
 
     // A second admin: deleting them is fine — the actor remains.
     let second = commands::create_user(
-        ctx.state(),
-        admin.id.clone(),
-        "Second Admin".to_string(),
-        vec!["manage_users".to_string()],
-        "SecondPass!2024".to_string(),
-    )
+            ctx.state(),
+            admin.id.clone(),
+            "Second Admin".to_string(),
+            "Str0ng!Pass".to_string(),
+            vec!["manage_users".to_string()],
+        )
     .expect("create second admin");
     commands::delete_user(ctx.state(), admin.id.clone(), second.id.clone(), ADMIN_PASS.to_string())
         .expect("deleting a second admin is allowed while one remains");
@@ -539,12 +565,12 @@ fn cannot_delete_self_or_the_last_admin() {
     // Edge case the guard protects: a disabled admin with a live session tries
     // to delete the only remaining active admin — blocked, no lockout possible.
     let third = commands::create_user(
-        ctx.state(),
-        admin.id.clone(),
-        "Third Admin".to_string(),
-        vec!["manage_users".to_string()],
-        "ThirdPass!2024".to_string(),
-    )
+            ctx.state(),
+            admin.id.clone(),
+            "Third Admin".to_string(),
+            "Str0ng!Pass".to_string(),
+            vec!["manage_users".to_string()],
+        )
     .expect("create third admin");
     commands::set_user_status(ctx.state(), third.id.clone(), admin.id.clone(), "disabled".to_string())
         .expect("disable the original admin");
@@ -569,7 +595,7 @@ fn purge_removes_the_account_and_its_references() {
     commands::purge_user(ctx.state(), admin.id.clone(), gate_id.clone(), ADMIN_PASS.to_string())
         .expect("purge the deleted account");
 
-    let users = commands::list_users(ctx.state()).expect("list users");
+    let users = commands::list_users(ctx.state(), false).expect("list users");
     assert!(
         users.iter().all(|u| u.id != gate_id),
         "purged account must be gone from the user list"
@@ -615,9 +641,9 @@ fn admin_password_reset_forces_a_new_password() {
     .expect("admin resets the password");
 
     // Old password stops working; the temporary one works but flags a forced change.
-    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string())
+    commands::login_password(ctx.state(), "Gate A".to_string(), "GatePass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect_err("old password must stop working");
-    let login = commands::login_password(ctx.state(), "Gate A".to_string(), "TempPass!2024".to_string())
+    let login = commands::login_password(ctx.state(), "Gate A".to_string(), "TempPass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("temporary password works");
     assert!(login.must_change_password, "reset must force a password change");
 
@@ -629,7 +655,7 @@ fn admin_password_reset_forces_a_new_password() {
         "FreshPass!2024".to_string(),
     )
     .expect("user sets their own password");
-    let again = commands::login_password(ctx.state(), "Gate A".to_string(), "FreshPass!2024".to_string())
+    let again = commands::login_password(ctx.state(), "Gate A".to_string(), "FreshPass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("new password works");
     assert!(!again.must_change_password, "flag cleared after the user changes the password");
 }
@@ -637,10 +663,13 @@ fn admin_password_reset_forces_a_new_password() {
 #[test]
 fn recovery_code_resets_the_admin_password() {
     let ctx = TestCtx::new();
-    let created = commands::create_first_admin(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string())
+    let created = commands::create_first_admin_for_company(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
         .expect("create first admin");
     let code = created.recovery_code.expect("first-run shows the recovery code");
     let admin_id = created.user.id.clone();
+    if let Some(ref cid) = created.user.company_id {
+        *ctx.company_id.borrow_mut() = cid.clone();
+    }
 
     // A non-admin account cannot use the recovery code.
     ctx.create_gate_user(&created.user, "Gate A");
@@ -671,9 +700,9 @@ fn recovery_code_resets_the_admin_password() {
     .expect("recovery resets the admin password");
     assert_eq!(recovered.user.id, admin_id);
 
-    commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string())
+    commands::login_password(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), ctx.company_id(), String::new(), String::new())
         .expect_err("old password no longer works");
-    let login = commands::login_password(ctx.state(), "Boss".to_string(), "NewAdminPass!2024".to_string())
+    let login = commands::login_password(ctx.state(), "Boss".to_string(), "NewAdminPass!2024".to_string(), ctx.company_id(), String::new(), String::new())
         .expect("new password works");
     assert!(!login.must_change_password);
 }
@@ -682,7 +711,7 @@ fn recovery_code_resets_the_admin_password() {
 fn staff_can_request_a_password_reset_and_the_admin_resolves_it() {
     let ctx = TestCtx::new();
     let admin = ctx.create_admin();
-    let gate = ctx.create_gate_user(&admin, "Gate A");
+    let gate = ctx.create_user_with_password(&admin, "Gate A", vec!["view_gate_entries".to_string(), "resolve_queue".to_string()], "GatePass!2024");
 
     // A staff account requests a reset (no auth — login screen).
     commands::create_password_reset_request(ctx.state(), "Gate A".to_string())
@@ -731,7 +760,7 @@ fn staff_can_request_a_password_reset_and_the_admin_resolves_it() {
 #[test]
 fn recovery_code_lives_in_a_file_and_can_be_regenerated() {
     let ctx = TestCtx::new();
-    let created = commands::create_first_admin(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string())
+    let created = commands::create_first_admin_for_company(ctx.state(), "Boss".to_string(), ADMIN_PASS.to_string(), "Default Company".to_string())
         .expect("create first admin");
     let code = created.recovery_code.expect("code generated at first-run");
 
