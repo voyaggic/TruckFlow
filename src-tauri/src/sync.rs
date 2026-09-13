@@ -1040,20 +1040,14 @@ pub fn purge_user_from_cloud(pg: &dyn PostgresAdapter, user_id: &str) -> Result<
                         Ok(())
                     }
                     Err(_) => {
-                        // Last resort: directly DELETE referencing rows in the most
-                        // common blocking table (trips) so the user DELETE can proceed.
-                        let _ = pg.exec_central_sql(&format!(
-                            "DELETE FROM {} WHERE {} = {};",
-                            pg_quote_ident("trips"), pg_quote_ident("officer_id"), quoted
-                        ));
-                        let _ = pg.exec_central_sql(&format!(
-                            "DELETE FROM {} WHERE {} = {};",
-                            pg_quote_ident("user_permissions"), pg_quote_ident("user_id"), quoted
-                        ));
-                        let _ = pg.exec_central_sql(&format!(
-                            "DELETE FROM {} WHERE {} = {};",
-                            pg_quote_ident("user_permissions"), pg_quote_ident("granted_by"), quoted
-                        ));
+                        // Last resort: directly DELETE referencing rows in every
+                        // FK-dependent table so the user DELETE can proceed.
+                        for (del_table, del_col) in USER_FK_DEPENDENT_TABLES {
+                            let _ = pg.exec_central_sql(&format!(
+                                "DELETE FROM {} WHERE {} = {};",
+                                pg_quote_ident(del_table), pg_quote_ident(del_col), quoted
+                            ));
+                        }
                         match pg.exec_central_sql(&del) {
                             Ok(()) => {
                                 crate::log::log(&format!("[sync] purge {user_id}: deleted from central DB after direct FK row deletion"));
@@ -3139,22 +3133,31 @@ fn ensure_schema_for(client: &mut postgres::Client) -> Result<(), String> {
     }
     for table in tables {
         let pk = if table == "company_config" { "company_id" } else { "id" };
+        let is_composite_pk = table == "user_permissions";
         let defs: Vec<String> = base_columns(table)
             .iter()
             .map(|c| {
-                if *c == pk {
+                if is_composite_pk && (*c == "user_id" || *c == "permission_id") {
+                    format!("{} {}", pg_quote_ident(c), pg_column_type(table, c))
+                } else if *c == pk {
                     format!("{} {} PRIMARY KEY", pg_quote_ident(c), pg_column_type(table, c))
                 } else {
                     format!("{} {}", pg_quote_ident(c), pg_column_type(table, c))
                 }
             })
             .collect();
+        let pk_clause = if is_composite_pk {
+            ", PRIMARY KEY (\"user_id\", \"permission_id\")"
+        } else {
+            ""
+        };
         sql.push_str(&format!(
-            "CREATE TABLE IF NOT EXISTS {} ({}); ",
+            "CREATE TABLE IF NOT EXISTS {} ({}{}); ",
             pg_quote_ident(table),
-            defs.join(", ")
+            defs.join(", "),
+            pk_clause
         ));
-        // Tables without an id column (company_config) get no id unique index.
+        // Tables without an id column (company_config, user_permissions) get no id unique index.
         if base_columns(table).contains(&"id") {
             sql.push_str(&format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {}(\"id\"); ",
@@ -3395,14 +3398,18 @@ fn push_rows_impl(
                         }).collect();
                         Some(format!("({})", vals.join(", ")))
                     }).collect();
-                    if sub_rows_sql.is_empty() { continue; }                    let sub_update_set: String = sub_cols.iter().filter(|c| c.as_str() != pk_col)
+                    if sub_rows_sql.is_empty() { continue; }                    let sub_update_set: String = sub_cols.iter().filter(|c| {
+                        if table == "user_permissions" { c.as_str() != "user_id" && c.as_str() != "permission_id" }
+                        else if table == "company_config" { c.as_str() != "company_id" }
+                        else { c.as_str() != "id" }
+                    })
                         .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sub_sql = format!(
                         "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
                         pg_quote_ident(table), sub_col_list,
-                        sub_rows_sql.join(", "), pg_quote_ident(pk_col), sub_update_set
+                        sub_rows_sql.join(", "), conflict_clause, sub_update_set
                     );
                     if client.batch_execute(&sub_sql).is_ok() {
                         for r in sub {
@@ -3410,6 +3417,13 @@ fn push_rows_impl(
                                 all_acked.push(id.to_string());
                             } else if let Some(cid) = r.get("company_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                                 all_acked.push(cid.to_string());
+                            } else if let (Some(uid), Some(pid)) = (
+                                r.get("user_id").and_then(|v| v.as_str()),
+                                r.get("permission_id").and_then(|v| v.as_str()),
+                            ) {
+                                if !uid.is_empty() && !pid.is_empty() {
+                                    all_acked.push(format!("{}:{}", uid, pid));
+                                }
                             }
                         }
                     }
@@ -5949,24 +5963,30 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon;\n")
 
     /// Generate CREATE TABLE IF NOT EXISTS SQL for a single table.
     fn generate_create_table_sql(&self, table: &str) -> String {
+        let is_composite_pk = table == "user_permissions";
         let defs: Vec<String> = base_columns(table)
             .iter()
             .map(|c| {
-                if *c == "id" {
+                if is_composite_pk && (*c == "user_id" || *c == "permission_id") {
+                    format!("\"{}\" {}", c, pg_column_type(table, c))
+                } else if *c == "id" {
                     format!("\"{}\" {} PRIMARY KEY", c, pg_column_type(table, c))
                 } else {
                     format!("\"{}\" {}", c, pg_column_type(table, c))
                 }
             })
             .collect();
-        // Grants ride along: a table created outside the full-schema batch must
-        // include service_role or PostgREST excludes it from the schema cache
-        // (PGRST205 "could not find the table" despite it existing).
+        let pk_clause = if is_composite_pk {
+            ", PRIMARY KEY (\"user_id\", \"permission_id\")"
+        } else {
+            ""
+        };
         format!(
-            "CREATE TABLE IF NOT EXISTS public.\"{}\" ({});\n\
+            "CREATE TABLE IF NOT EXISTS public.\"{}\" ({}{});\n\
              GRANT SELECT, INSERT, UPDATE, DELETE ON public.\"{}\" TO service_role, anon, authenticated;\n",
             table,
             defs.join(", "),
+            pk_clause,
             table
         )
     }
