@@ -2971,6 +2971,9 @@ fn base_columns(table: &str) -> Vec<&'static str> {
             "company_id", "pg_connection_string", "sheets_id", "sheets_frequency",
             "anpr_enabled", "sheets_service_account_json", "updated_at", "updated_by",
         ],
+        "user_permissions" => vec![
+            "user_id", "permission_id", "granted_by", "granted_at", "synced", "updated_at",
+        ],
         _ => vec!["id"],
     }
 }
@@ -3238,8 +3241,8 @@ fn push_rows_impl(
     let mut all_cols: Vec<String> = Vec::new();
     {
         let mut seen = std::collections::HashSet::new();
-        // id first (company_config has no id column — company_id leads instead)
-        if table != "company_config" {
+        // id first (company_config and user_permissions have no id column)
+        if table != "company_config" && table != "user_permissions" {
             all_cols.push("id".to_string());
             seen.insert("id".to_string());
         }
@@ -3263,7 +3266,14 @@ fn push_rows_impl(
     let col_count = all_cols.len();
     let quoted_cols: Vec<String> = all_cols.iter().map(|c| pg_quote_ident(c)).collect();
     // company_config's primary key is company_id, not id.
-    let pk_col: &str = if table == "company_config" { "company_id" } else { "id" };
+    // user_permissions has composite PK (user_id, permission_id).
+    let (pk_col, conflict_clause): (&str, String) = if table == "company_config" {
+        ("company_id", "company_id".to_string())
+    } else if table == "user_permissions" {
+        ("user_id", "user_id, permission_id".to_string())
+    } else {
+        ("id", "id".to_string())
+    };
     let update_set: String = all_cols.iter()
         .filter(|c| c.as_str() != pk_col)
         .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
@@ -3296,12 +3306,15 @@ fn push_rows_impl(
             }
         }
         let values_clause = placeholders.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join(", ");
-        // Determine conflict key: company_config uses company_id, user_permissions
-        // has composite key handled elsewhere, everything else uses id.
-        let conflict_col = if table == "company_config" { "company_id" } else { "id" };
         let update_set_final = if table == "company_config" {
             all_cols.iter()
                 .filter(|c| c.as_str() != "company_id")
+                .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if table == "user_permissions" {
+            all_cols.iter()
+                .filter(|c| c.as_str() != "user_id" && c.as_str() != "permission_id")
                 .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -3310,7 +3323,7 @@ fn push_rows_impl(
         };
         let sql = format!(
             "INSERT INTO {} ({}) VALUES {values_clause} ON CONFLICT ({}) DO UPDATE SET {update_set_final}",
-            pg_quote_ident(table), col_list, pg_quote_ident(conflict_col)
+            pg_quote_ident(table), col_list, conflict_clause
         );
         let param_refs: Vec<&(dyn ToSql + Sync)> = flat_params.iter().map(|b| b.as_ref()).collect();
 
@@ -3336,7 +3349,7 @@ fn push_rows_impl(
         let simple_sql = format!(
             "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
             pg_quote_ident(table), col_list,
-            value_rows.join(", "), pg_quote_ident(pk_col), update_set
+            value_rows.join(", "), conflict_clause, update_set_final
         );
 
         match client.batch_execute(&simple_sql) {
@@ -3346,6 +3359,13 @@ fn push_rows_impl(
                         all_acked.push(id.to_string());
                     } else if let Some(cid) = row.get("company_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                         all_acked.push(cid.to_string());
+                    } else if let (Some(uid), Some(pid)) = (
+                        row.get("user_id").and_then(|v| v.as_str()),
+                        row.get("permission_id").and_then(|v| v.as_str()),
+                    ) {
+                        if !uid.is_empty() && !pid.is_empty() {
+                            all_acked.push(format!("{}:{}", uid, pid));
+                        }
                     }
                 }
             }
@@ -5595,6 +5615,9 @@ impl RestPostgres {
         }
         if table == "company_config" {
             url = format!("{}?on_conflict=company_id", url);
+        }
+        if table == "user_permissions" {
+            url = format!("{}?on_conflict=user_id,permission_id", url);
         }
 
         let mut request = self.client.post(&url);

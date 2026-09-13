@@ -571,6 +571,11 @@ pub fn enumerate_cameras() -> Result<Vec<DetectedCamera>, String> {
             .to_string(),
         );
     }
+    // Ensure pip dependencies (numpy, opencv) are installed before spawning Python.
+    // Without this, _enum_cameras.py crashes at `import cv2` with ModuleNotFoundError.
+    if !crate::capture::check_pip_deps_installed(&python, &anpr_dir) {
+        return Err("anpr_not_ready".to_string());
+    }
     // Use the bundled enumeration script that probes camera indices 0-9
     let script = anpr_dir.join("_enum_cameras.py");
     if !script.exists() {

@@ -490,17 +490,28 @@ fn auto_start_anpr(state: &AppState) -> Result<(), String> {
     if capture::find_python().is_empty() {
         if let Err(e) = capture::ensure_anpr_deps(&anpr_dir, None) {
             crate::log::log(&format!("[ANPR] Could not set up Python: {e}"));
+            return Ok(());
         }
     }
     // Even if Python exists, check that pip dependencies are installed.
     // On a fresh PC with system Python but no numpy/opencv/paddleocr,
     // main.py would crash immediately at `import numpy`.
     let effective_python = capture::find_python();
-    if !effective_python.is_empty() && !capture::check_pip_deps_installed(&effective_python, &anpr_dir) {
+    if effective_python.is_empty() {
+        crate::log::log("[ANPR] Python not found after setup attempt — skipping auto-start");
+        return Ok(());
+    }
+    if !capture::check_pip_deps_installed(&effective_python, &anpr_dir) {
         crate::log::log("[ANPR] Python found but pip deps missing — installing...");
         if let Err(e) = capture::ensure_anpr_deps(&anpr_dir, None) {
             crate::log::log(&format!("[ANPR] Could not install pip deps: {e}"));
+            return Ok(());
         }
+    }
+    // Final verification: deps must be installed before spawning.
+    if !capture::check_pip_deps_installed(&effective_python, &anpr_dir) {
+        crate::log::log("[ANPR] Pip deps still missing after installation attempt — skipping auto-start");
+        return Ok(());
     }
 
     let main_py = anpr_dir.join("main.py");
