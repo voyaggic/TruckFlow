@@ -671,8 +671,8 @@ function ServiceStatusBar({ cameras, actor, serviceRunning, lastPlate, onStopped
         setShowSetup(true);
       }
     } catch {
-      // If check fails, try to start anyway (will show wizard on error)
-      doStart();
+      // If check fails (e.g. backend error), show setup wizard
+      setShowSetup(true);
     }
   }, [trackedActive, setupComplete, doStart]);
 
@@ -985,6 +985,28 @@ function DetectCamerasPanel({ onAdd, configured }: { onAdd: (index: number, name
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+  const [depsInstalling, setDepsInstalling] = useState(false);
+  const [depsMessage, setDepsMessage] = useState<string | null>(null);
+
+  const installDepsAndRetry = async () => {
+    setDepsInstalling(true);
+    setDepsMessage("Installing ANPR packages...");
+    try {
+      await api.ensureAnprSetup();
+      setDepsMessage("Packages installed — scanning...");
+      setDepsInstalling(false);
+      // Retry the scan after deps are installed
+      const found = await api.enumerateCameras();
+      setCameras(found);
+      if (found.length === 0) setError("No cameras detected.");
+      setDepsMessage(null);
+    } catch (e) {
+      setDepsMessage(null);
+      setDepsInstalling(false);
+      setError(`Setup failed: ${e}`);
+      setTimeout(() => setError(null), 6000);
+    }
+  };
 
   const scan = async () => {
     setScanning(true);
@@ -994,7 +1016,12 @@ function DetectCamerasPanel({ onAdd, configured }: { onAdd: (index: number, name
       setCameras(found);
       if (found.length === 0) setError("No cameras detected.");
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      if (msg.includes("anpr_not_ready")) {
+        installDepsAndRetry();
+        return;
+      }
+      setError(msg);
       setTimeout(() => setError(null), 6000);
     } finally {
       setScanning(false);
@@ -1009,13 +1036,14 @@ function DetectCamerasPanel({ onAdd, configured }: { onAdd: (index: number, name
     <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 14, background: "var(--surface-2)", marginTop: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
         <div style={{ fontWeight: 600, fontSize: 13 }}>Detect Cameras</div>
-        <button className="ghost small" onClick={scan} disabled={scanning}>
-          {scanning ? "Scanning…" : "Scan for cameras"}
+        <button className="ghost small" onClick={scan} disabled={scanning || depsInstalling}>
+          {depsInstalling ? "Installing packages…" : scanning ? "Scanning…" : "Scan for cameras"}
         </button>
       </div>
       <p className="muted small" style={{ marginTop: -4 }}>
         Detects real camera hardware connected to this PC. Only cameras with a live feed (frames actually changing) can be added.
       </p>
+      {depsMessage && <div className="small" style={{ color: "var(--primary)", marginTop: 4 }}>{depsMessage}</div>}
       {error && <div className="small" style={{ color: "var(--danger)", marginTop: 4 }}>{error}</div>}
       {/* Configured network sources — no probing needed, they're already known */}
       {configured && configured.some((c) => !["usb", "video_file"].includes(c.source_type)) && (

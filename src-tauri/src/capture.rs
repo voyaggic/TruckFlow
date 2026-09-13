@@ -2730,28 +2730,6 @@ pub fn check_anpr_ready(_state: State<AppState>) -> Result<AnprSetupStatus, Stri
 
     let ready = has_exe || (has_main_py && has_python && deps_installed);
 
-    if !ready {
-        let mut issues = Vec::new();
-        if !has_main_py && !has_exe {
-            issues.push("ANPR service files not found. Reinstall the application.".to_string());
-        }
-        if !has_python {
-            issues.push(
-                "Python is not installed or not found. Install Python 3.8+ from python.org \
-                 and ensure it's in your PATH, or use the embedded setup from Settings → ANPR → Setup."
-                .to_string(),
-            );
-        } else if !deps_installed {
-            issues.push(
-                "Python packages (numpy, opencv, paddleocr) are missing. \
-                 Install them by running: pip install numpy opencv-python paddleocr \
-                 Or use the embedded setup from Settings → ANPR → Setup."
-                .to_string(),
-            );
-        }
-        return Err(issues.join("\n"));
-    }
-
     Ok(AnprSetupStatus {
         ready,
         has_python,
